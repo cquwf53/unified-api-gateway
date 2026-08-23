@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 	"unified-api-gateway/internal/config"
@@ -428,6 +430,118 @@ func TestQuickSwitchPersistsNewSnapshot(t *testing.T) {
 	version, err := db.GetVersion(context.Background(), gateway.Snapshot().ID)
 	if err != nil || len(version.YAML) == 0 {
 		t.Fatalf("quick switch did not persist YAML: %v", err)
+	}
+}
+
+func TestTranslatedStreamingIsIncremental(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\n")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first \"}}\n\n")
+		flusher.Flush()
+		<-release
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"second\"}}\n\n")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: true}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServer := httptest.NewServer(http.HandlerFunc(gateway.ServeDataHTTP))
+	defer gatewayServer.Close()
+
+	request, _ := http.NewRequest(http.MethodPost, gatewayServer.URL+"/v1/chat/completions", strings.NewReader(`{"model":"claude","stream":true,"messages":[{"role":"user","content":"ping"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if !strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("content-type=%s", response.Header.Get("Content-Type"))
+	}
+	reader := bufio.NewReader(response.Body)
+	readLine := func() string {
+		if deadliner, ok := response.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadliner.SetReadDeadline(time.Now().Add(5 * time.Second))
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read line: %v", err)
+		}
+		return strings.TrimRight(line, "\r\n")
+	}
+	var collected strings.Builder
+	for {
+		line := readLine()
+		collected.WriteString(line)
+		if strings.Contains(line, "first ") {
+			break
+		}
+		if !strings.Contains(collected.String(), "chat.completion.chunk") && line == "" {
+			t.Fatalf("stream ended before first frame: %s", collected.String())
+		}
+	}
+	// The first frame must arrive while the upstream is still holding the
+	// second half of the response; if it were buffered this select hangs.
+	select {
+	case <-release:
+		t.Fatal("upstream released early; test setup is wrong")
+	default:
+	}
+	close(release)
+	var full strings.Builder
+	full.WriteString(collected.String())
+	if deadliner, ok := response.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = deadliner.SetReadDeadline(time.Now().Add(5 * time.Second))
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full.Write(rest)
+	if !strings.Contains(full.String(), "second") || !strings.Contains(full.String(), "chat.completion.chunk") {
+		t.Fatalf("stream body=%s", full.String())
+	}
+}
+
+func TestTranslatedStreamingFallsBackOnUpstreamError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`)
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: true}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude","stream":true,"messages":[{"role":"user","content":"ping"}]}`))
+	gateway.ServeDataHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Header().Get("Content-Type"), "event-stream") {
+		t.Fatalf("error fallback should not be a stream: %s", recorder.Header().Get("Content-Type"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("fallback body is not JSON: %s", recorder.Body.String())
 	}
 }
 

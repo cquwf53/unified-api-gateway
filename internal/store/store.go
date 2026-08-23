@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/glebarez/sqlite"
@@ -58,6 +59,22 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// pragma statements applied right after opening. WAL keeps readers and the
+// single writer from blocking each other; busy_timeout avoids spurious
+// "database is locked" errors under concurrent access.
+func (s *Store) pragmas(ctx context.Context) error {
+	for _, statement := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA busy_timeout=5000",
+		"PRAGMA synchronous=NORMAL",
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("sqlite %s: %w", statement, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS config_versions (
@@ -94,7 +111,20 @@ CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC)
 	if err != nil {
 		return fmt.Errorf("migrate sqlite store: %w", err)
 	}
-	return nil
+	// Additive migrations for databases created before replay matching stored
+	// the request method and path. Duplicate-column errors mean the column is
+	// already present and are ignored.
+	for _, statement := range []string{
+		`ALTER TABLE recordings ADD COLUMN method TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE recordings ADD COLUMN path TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate sqlite store: %w", err)
+			}
+		}
+	}
+	return s.pragmas(ctx)
 }
 
 func (s *Store) Close() error {
@@ -232,6 +262,8 @@ FROM audit_events ORDER BY created_at DESC LIMIT ?`, limit)
 type Recording struct {
 	Key         string              `json:"key"`
 	ProfileID   string              `json:"profile_id"`
+	Method      string              `json:"method,omitempty"`
+	Path        string              `json:"path,omitempty"`
 	StatusCode  int                 `json:"status_code"`
 	ContentType string              `json:"content_type,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
@@ -254,18 +286,38 @@ func (s *Store) SaveRecording(ctx context.Context, recording Recording) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO recordings
- (key, profile_id, status_code, content_type, headers_json, body, created_at)
- VALUES (?, ?, ?, ?, ?, ?, ?)`, recording.Key, recording.ProfileID, recording.StatusCode,
-		recording.ContentType, string(headers), recording.Body, recording.CreatedAt)
+ (key, profile_id, method, path, status_code, content_type, headers_json, body, created_at)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, recording.Key, recording.ProfileID, recording.Method, recording.Path,
+		recording.StatusCode, recording.ContentType, string(headers), recording.Body, recording.CreatedAt)
 	return err
 }
 
 func (s *Store) GetRecording(ctx context.Context, key string) (Recording, error) {
 	var recording Recording
 	var headers string
-	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, status_code, content_type, headers_json, body, created_at
-FROM recordings WHERE key = ?`, key).Scan(&recording.Key, &recording.ProfileID, &recording.StatusCode,
-		&recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, status_code, content_type, headers_json, body, created_at
+FROM recordings WHERE key = ?`, key).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+		&recording.StatusCode, &recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
+	if err != nil {
+		return Recording{}, err
+	}
+	if err := json.Unmarshal([]byte(headers), &recording.Headers); err != nil {
+		return Recording{}, err
+	}
+	return recording, nil
+}
+
+// LatestRecordingForProfile returns the most recent recording of a given
+// method and path for a profile. It backs the fuzzy replay fallback: exact
+// request hashes rarely match twice for chat workloads where the body
+// changes on every call.
+func (s *Store) LatestRecordingForProfile(ctx context.Context, profileID, method, path string) (Recording, error) {
+	var recording Recording
+	var headers string
+	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, status_code, content_type, headers_json, body, created_at
+FROM recordings WHERE profile_id = ? AND method = ? AND path = ?
+ORDER BY created_at DESC LIMIT 1`, profileID, method, path).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+		&recording.StatusCode, &recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
 	if err != nil {
 		return Recording{}, err
 	}
@@ -279,7 +331,7 @@ func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, err
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT key, profile_id, status_code, content_type, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT key, profile_id, method, path, status_code, content_type, created_at
 FROM recordings ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -288,7 +340,7 @@ FROM recordings ORDER BY created_at DESC LIMIT ?`, limit)
 	var result []Recording
 	for rows.Next() {
 		var recording Recording
-		if err := rows.Scan(&recording.Key, &recording.ProfileID, &recording.StatusCode, &recording.ContentType, &recording.CreatedAt); err != nil {
+		if err := rows.Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path, &recording.StatusCode, &recording.ContentType, &recording.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, recording)

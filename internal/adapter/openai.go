@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"unified-api-gateway/internal/config"
 )
@@ -74,6 +75,13 @@ func (OpenAIChatToAnthropic) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 				role = "user"
 			}
 			content := convertOpenAIContent(message["content"], role)
+			if role == "user" {
+				if text, ok := content.(string); ok && text != "" {
+					// Anthropic's canonical representation for user turns is
+					// an array of content blocks.
+					content = []any{map[string]any{"type": "text", "text": text}}
+				}
+			}
 			if calls, ok := message["tool_calls"].([]any); ok && len(calls) > 0 {
 				contentItems, isList := content.([]any)
 				if !isList {
@@ -129,15 +137,15 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 		return Envelope{}, err
 	}
 	out := map[string]any{
-		"id":      body["id"],
+		"id":      openAIResponseID(asString(body["id"])),
 		"object":  "chat.completion",
 		"created": body["created"],
 		"model":   body["model"],
 	}
-	if out["id"] == nil {
-		out["id"] = "gateway-response"
+	if out["created"] == nil {
+		out["created"] = time.Now().Unix()
 	}
-	choice := map[string]any{"index": 0, "finish_reason": body["stop_reason"]}
+	choice := map[string]any{"index": 0, "finish_reason": openAIFinishReason(asString(body["stop_reason"]))}
 	message := map[string]any{"role": "assistant", "content": ""}
 	if content, ok := body["content"].([]any); ok {
 		var text strings.Builder
@@ -324,6 +332,35 @@ func appendSystem(out map[string]any, text string) {
 		return
 	}
 	out["system"] = text
+}
+
+// openAIResponseID rebrands Anthropic message ids (msg_*) as chat completion
+// ids so OpenAI clients see identifiers from their own vocabulary.
+func openAIResponseID(id string) string {
+	if id == "" {
+		return "chatcmpl-gateway"
+	}
+	if strings.HasPrefix(id, "msg_") {
+		return "chatcmpl_" + strings.TrimPrefix(id, "msg_")
+	}
+	return id
+}
+
+// openAIFinishReason maps Anthropic stop reasons onto the OpenAI
+// finish_reason vocabulary; unknown values pass through unchanged.
+func openAIFinishReason(reason string) string {
+	switch reason {
+	case "", "end_turn", "stop_sequence":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use", "tool_calls":
+		return "tool_calls"
+	case "refusal":
+		return "content_filter"
+	default:
+		return reason
+	}
 }
 
 func convertOpenAIContent(value any, role string) any {

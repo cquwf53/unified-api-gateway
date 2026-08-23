@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -420,6 +421,14 @@ func applyHeaders(headers http.Header, spec HeaderSpec) {
 }
 
 func headerValues(h http.Header, key string) []string {
+	// Fast paths first: net/http canonicalises header keys on insertion, so
+	// the exact and canonical lookups hit without scanning.
+	if values, ok := h[key]; ok {
+		return values
+	}
+	if values, ok := h[textproto.CanonicalMIMEHeaderKey(key)]; ok {
+		return values
+	}
 	for k, v := range h {
 		if strings.EqualFold(k, key) {
 			return v

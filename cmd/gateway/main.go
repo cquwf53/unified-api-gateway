@@ -112,6 +112,8 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 		return err
 	}
 	defer storeDB.Close()
+	applyLogLevel(snapshot.Config.Observability.LogLevel)
+	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", snapshot.ID)
 	if err := storeDB.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: "startup", Active: true, SHA256: snapshot.Hash, YAML: data}); err != nil {
 		slog.Warn("save startup version", "error", err)
 	}
@@ -122,11 +124,14 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 	if err != nil {
 		return err
 	}
-	dataServer := &http.Server{Addr: snapshot.Config.Listeners.HTTP, Handler: http.HandlerFunc(gateway.ServeDataHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second}
+	// WriteTimeout stays 0 on the data plane: it also covers streaming
+	// response bodies, and long completions routinely exceed any fixed bound.
+	// The admin plane has no streaming endpoints and keeps a hard cap.
+	dataServer := &http.Server{Addr: snapshot.Config.Listeners.HTTP, Handler: http.HandlerFunc(gateway.ServeDataHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	adminServer := &http.Server{Addr: snapshot.Config.Listeners.Admin, Handler: http.HandlerFunc(gateway.ServeAdminHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second}
 	var grpcServer *http.Server
 	if snapshot.Config.Listeners.GRPC != "" {
-		grpcServer = &http.Server{Addr: snapshot.Config.Listeners.GRPC, Handler: http.HandlerFunc(gateway.ServeGRPCHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 120 * time.Second, IdleTimeout: 120 * time.Second}
+		grpcServer = &http.Server{Addr: snapshot.Config.Listeners.GRPC, Handler: http.HandlerFunc(gateway.ServeGRPCHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	}
 
 	errCh := make(chan error, 3)
@@ -241,7 +246,21 @@ func printStatus(dbPath string) error {
 	if err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(map[string]any{"versions": items}, "", "  ")
+	b, _ := json.MarshalIndent(map[string]any{"gateway_version": server.BuildVersion, "versions": items}, "", "  ")
 	fmt.Println(string(b))
 	return nil
+}
+
+// applyLogLevel maps observability.log_level onto the default logger.
+func applyLogLevel(level string) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	case "warn", "warning":
+		slog.SetLogLoggerLevel(slog.LevelWarn)
+	case "error":
+		slog.SetLogLoggerLevel(slog.LevelError)
+	default:
+		slog.SetLogLoggerLevel(slog.LevelInfo)
+	}
 }

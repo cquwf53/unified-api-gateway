@@ -13,8 +13,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/unified-api-gateway /app/unified-api-gateway
+# Web console assets are embedded in the binary; only the example config and
+# data directory remain on disk.
 COPY --chown=nonroot:nonroot configs /app/configs
-COPY --chown=nonroot:nonroot web /app/web
 COPY --from=build --chown=nonroot:nonroot /src/data /app/data
 
 EXPOSE 8780 8781 8782

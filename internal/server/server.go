@@ -7,18 +7,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,6 +34,7 @@ import (
 	"unified-api-gateway/internal/store"
 	"unified-api-gateway/internal/telemetry"
 	"unified-api-gateway/internal/transform"
+	"unified-api-gateway/web"
 )
 
 const (
@@ -45,6 +51,16 @@ type Server struct {
 	configPath string
 	started    time.Time
 	sequence   atomic.Uint64
+
+	clientMu     sync.Mutex
+	clientsByKey map[clientKey]*http.Client
+
+	runtimes  atomic.Pointer[map[string]*profileRuntime]
+	pipelines atomic.Pointer[map[string]*compiledPipeline]
+	breakerMu sync.Mutex
+	breakers  map[string]*breaker
+	shadowSem chan struct{}
+	auditCh   chan store.AuditEvent
 }
 
 type Options struct {
@@ -69,9 +85,81 @@ func New(options Options) (*Server, error) {
 		store:      options.Store,
 		configPath: options.ConfigPath,
 		started:    time.Now().UTC(),
+		shadowSem:  make(chan struct{}, maxInflightShadow),
+		auditCh:    make(chan store.AuditEvent, 256),
+	}
+	if options.Store != nil {
+		go s.drainAuditEvents()
 	}
 	s.current.Store(options.Snapshot)
+	s.runtimes.Store(&map[string]*profileRuntime{})
+	pipelines := buildPipelines(options.Snapshot.Config)
+	s.pipelines.Store(&pipelines)
+	s.rebuildRuntimes(options.Snapshot.Config)
 	return s, nil
+}
+
+// clientKey identifies a derived HTTP client by the properties that affect
+// its behaviour; derived clients are cached so connection pools are shared.
+type clientKey struct {
+	insecure bool
+	timeout  time.Duration
+	stream   bool
+}
+
+// upstreamClient returns a cached client for one upstream. Streaming clients
+// have no total timeout (long completions must not be cut mid-body) but bound
+// the time until response headers via the transport. Insecure upstreams get a
+// transport that skips TLS verification; the configuration loader warns about
+// every such upstream at activation time.
+func (s *Server) upstreamClient(upstream config.Upstream, stream bool) *http.Client {
+	timeout := upstream.EffectiveTimeout()
+	if stream {
+		timeout = 0
+	}
+	key := clientKey{insecure: upstream.Insecure, timeout: timeout, stream: stream}
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	if s.clientsByKey == nil {
+		s.clientsByKey = map[clientKey]*http.Client{}
+	}
+	if cached, ok := s.clientsByKey[key]; ok {
+		return cached
+	}
+	client := &http.Client{Timeout: timeout}
+	transport := s.clonableTransport()
+	switch {
+	case transport == nil:
+		if !stream {
+			// A custom, non-clonable RoundTripper was injected: reuse the
+			// caller's client verbatim and only override the timeout.
+			copyOf := *s.client
+			copyOf.Timeout = timeout
+			client = &copyOf
+		}
+	case stream || upstream.Insecure:
+		if upstream.Insecure {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in per upstream
+		}
+		if stream {
+			transport.ResponseHeaderTimeout = streamResponseHeaderTimeout
+		}
+		client.Transport = transport
+	}
+	s.clientsByKey[key] = client
+	return client
+}
+
+func (s *Server) clonableTransport() *http.Transport {
+	if t, ok := s.client.Transport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	if s.client.Transport == nil {
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			return t.Clone()
+		}
+	}
+	return nil
 }
 
 func (s *Server) Snapshot() *config.ConfigSnapshot {
@@ -89,6 +177,7 @@ func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
 		return err
 	}
 	s.current.Store(snapshot.Clone())
+	s.rebuildRuntimes(snapshot.Config)
 	if s.store != nil {
 		_ = s.store.AddAudit(context.Background(), store.AuditEvent{
 			Action:    "config.activate",
@@ -98,6 +187,23 @@ func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
 		})
 	}
 	return nil
+}
+
+// rebuildRuntimes recreates admission-control objects and compiled transform
+// pipelines for a newly activated configuration. Breakers are keyed by
+// upstream name and deliberately kept across activations.
+func (s *Server) rebuildRuntimes(cfg *config.Config) {
+	runtimes := s.buildRuntimes(cfg)
+	s.runtimes.Store(&runtimes)
+	pipelines := buildPipelines(cfg)
+	s.pipelines.Store(&pipelines)
+	if cfg != nil {
+		for name, upstream := range cfg.Upstreams {
+			if upstream.Insecure {
+				slog.Warn("upstream TLS verification is disabled", "upstream", name, "base_url", upstream.EffectiveURL())
+			}
+		}
+	}
 }
 
 func (s *Server) Metrics() telemetry.Snapshot {
@@ -198,18 +304,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	finish := s.metrics.Begin()
 	defer finish()
 	started := time.Now()
-	requestID := r.Header.Get("X-Request-Id")
-	if requestID == "" {
-		requestID = s.newRequestID()
-	}
-	w.Header().Set("X-Request-Id", requestID)
-
 	snapshot := s.Snapshot()
 	if snapshot == nil || snapshot.Config == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "config", "not_ready", "no active configuration", requestID)
+		s.writeError(w, http.StatusServiceUnavailable, "config", "not_ready", "no active configuration", "")
 		return
 	}
 	cfg := snapshot.Config
+	requestID := s.inboundRequestID(cfg, r)
+	w.Header().Set("X-Request-Id", requestID)
+	if custom := strings.TrimSpace(cfg.Observability.RequestIDHeader); custom != "" && !strings.EqualFold(custom, "X-Request-Id") {
+		w.Header().Set(custom, requestID)
+	}
 	if isWebSocketUpgrade(r) {
 		s.handleWebSocket(w, r, snapshot, requestID)
 		return
@@ -270,6 +375,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadGateway, "upstream", "upstream_not_found", "selected upstream is not configured", requestID)
 		return
 	}
+	mode := normalizeMode(profile.TrafficMode)
+	if mode == "" {
+		mode = "live"
+	}
+	willCallUpstream := mode == "live" || mode == "shadow" || mode == "record"
+	rt := s.runtimeFor(profile.Name)
+	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, willCallUpstream)
+	if rejection != nil {
+		if rejection.retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(rejection.retryAfter.Seconds()+0.999)))
+		}
+		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, requestID)
+		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, rejection.status, "policy", rejection.code)
+		return
+	}
+	defer release()
 
 	in := transform.Envelope{
 		Method:  r.Method,
@@ -292,10 +413,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := normalizeMode(profile.TrafficMode)
-	if mode == "" {
-		mode = "live"
-	}
 	if mode == "dry-run" {
 		s.writeDryRunResponse(w, requestID, profile, prepared)
 		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, http.StatusOK, "", "")
@@ -318,13 +435,26 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(profile.Name, prepared))
-		if replayErr != nil {
-			s.writeError(w, http.StatusNotFound, "replay", "recording_not_found", "no recording matches this request", requestID)
+		if replayErr == nil {
+			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
+			response.Headers = response.Headers.Clone()
+			response.Headers.Set("X-Gateway-Replay", "exact")
+			s.writeEnvelope(w, response)
+			s.observe(requestID, started, r, selectedRoute, profile, upstreamName, recording.StatusCode, "", "")
 			return
 		}
-		response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
-		s.writeEnvelope(w, response)
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, response.StatusCode, "", "")
+		// Exact hashes rarely match twice for chat traffic, so fall back to
+		// the most recent recording of the same profile, method and path and
+		// label the response so clients can tell.
+		if recording, fuzzyErr := s.store.LatestRecordingForProfile(r.Context(), profile.Name, prepared.Method, prepared.Path); fuzzyErr == nil {
+			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
+			response.Headers = response.Headers.Clone()
+			response.Headers.Set("X-Gateway-Replay", "approximate")
+			s.writeEnvelope(w, response)
+			s.observe(requestID, started, r, selectedRoute, profile, upstreamName, recording.StatusCode, "", "")
+			return
+		}
+		s.writeError(w, http.StatusNotFound, "replay", "recording_not_found", "no recording matches this request", requestID)
 		return
 	}
 	if mode == "record" && !cfg.Observability.RecordBody {
@@ -333,6 +463,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "live" && wantsStreamFromEnvelope(prepared) && canDirectStream(*profile) {
 		status, headersSent, streamErr := s.streamUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
+		recordStreamResult(rt, headersSent, streamErr)
+		if streamErr != nil && !headersSent {
+			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
+		}
+		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, streamErrorStage(headersSent, streamErr), streamErrorCode(streamErr))
+		return
+	}
+	if mode == "live" && wantsStreamFromEnvelope(prepared) && profile.StreamSafe {
+		// Semantic adapters translate frame by frame so the client receives a
+		// live stream instead of a buffered burst.
+		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
+		recordStreamResult(rt, headersSent, streamErr)
 		if streamErr != nil && !headersSent {
 			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
 		}
@@ -340,7 +482,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamEnvelope, err := s.callUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID)
+	upstreamEnvelope, err := s.executeUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, rt, r.Method, r.Header)
 	if err != nil {
 		s.writeError(w, upstreamStatus(err), "upstream", upstreamCode(err), safeError(err), requestID)
 		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, upstreamStatus(err), "upstream", upstreamCode(err))
@@ -348,11 +490,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamEnvelope.Metadata = prepared.Metadata
 	if mode == "shadow" {
-		// Shadow is intentionally opt-in and non-blocking. The primary response
-		// remains the source of truth; the call is still tagged in telemetry.
-		go func() {
-			_, _ = s.callUpstream(context.Background(), cfg, upstream, *profile, prepared, requestID+"-shadow")
-		}()
+		// Shadow is opt-in and never blocks the primary response. When a
+		// shadow_upstream is configured the mirror goes there instead of
+		// double-billing the primary provider.
+		shadowUpstream := upstream
+		if name := profile.ShadowUpstream; name != "" {
+			if configured, ok := cfg.Upstreams[name]; ok {
+				shadowUpstream = configured
+			}
+		}
+		s.dispatchShadow(cfg, shadowUpstream, *profile, prepared, requestID)
 	}
 	response, err := s.prepareResponse(r.Context(), cfg, *profile, upstreamEnvelope)
 	if err != nil {
@@ -361,7 +508,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "record" && s.store != nil {
-		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeaders(response.Headers), Body: response.Body}); saveErr != nil {
+		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, Method: prepared.Method, Path: prepared.Path, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
 			s.writeError(w, http.StatusInternalServerError, "record", "record_save_failed", saveErr.Error(), requestID)
 			return
 		}
@@ -379,6 +526,22 @@ func streamErrorStage(headersSent bool, err error) string {
 		return ""
 	}
 	return "upstream"
+}
+
+// recordStreamResult feeds stream outcomes into the circuit breaker. A
+// client-side write failure after headers were sent is not the upstream's
+// fault and must not trip the breaker.
+func recordStreamResult(rt *profileRuntime, headersSent bool, err error) {
+	if rt == nil {
+		return
+	}
+	if err == nil {
+		rt.recordUpstreamResult(true)
+		return
+	}
+	if !headersSent || upstreamCode(err) != "client_stream_write_failed" {
+		rt.recordUpstreamResult(false)
+	}
 }
 
 func streamErrorCode(err error) string {
@@ -412,13 +575,8 @@ func (s *Server) prepareRequest(ctx context.Context, cfg *config.Config, profile
 	if converted.URL != nil && converted.URL.Path != "" {
 		in.Path = converted.URL.Path
 	}
-	for _, spec := range profile.AllRequestTransforms() {
-		if spec.Name != "" {
-			if reusable, exists := cfg.Transforms[spec.Name]; exists {
-				spec = reusable
-			}
-		}
-		changed, err := transform.Apply(ctx, in, spec)
+	for _, compiled := range s.compiledRequestSteps(cfg, profile) {
+		changed, err := compiled.Apply(ctx, in)
 		if err != nil {
 			return transform.Envelope{}, err
 		}
@@ -465,13 +623,8 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 		return transform.Envelope{}, err
 	}
 	response.Body, response.Headers, response.StatusCode, response.ContentType = converted.Body, converted.Header, converted.StatusCode, converted.ContentType
-	for _, spec := range profile.AllResponseTransforms() {
-		if spec.Name != "" {
-			if reusable, exists := cfg.Transforms[spec.Name]; exists {
-				spec = reusable
-			}
-		}
-		changed, err := transform.Apply(ctx, response, spec)
+	for _, compiled := range s.compiledResponseSteps(cfg, profile) {
+		changed, err := compiled.Apply(ctx, response)
 		if err != nil {
 			return transform.Envelope{}, err
 		}
@@ -487,14 +640,9 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 }
 
 func (s *Server) applyResponseTransforms(ctx context.Context, cfg *config.Config, profile config.Profile, response transform.Envelope) (transform.Envelope, error) {
-	for _, spec := range profile.AllResponseTransforms() {
-		if spec.Name != "" {
-			if reusable, exists := cfg.Transforms[spec.Name]; exists {
-				spec = reusable
-			}
-		}
+	for _, compiled := range s.compiledResponseSteps(cfg, profile) {
 		var err error
-		response, err = transform.Apply(ctx, response, spec)
+		response, err = compiled.Apply(ctx, response)
 		if err != nil {
 			return transform.Envelope{}, err
 		}
@@ -503,59 +651,16 @@ func (s *Server) applyResponseTransforms(ctx context.Context, cfg *config.Config
 }
 
 func (s *Server) callUpstream(ctx context.Context, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string) (transform.Envelope, error) {
-	base, err := url.Parse(upstream.EffectiveURL())
-	if err != nil {
-		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "invalid_upstream_url", err: err}
-	}
-	target := *base
-	target.Path = joinURLPath(base.Path, in.Path)
-	target.RawQuery = in.Query.Encode()
-	request, err := http.NewRequestWithContext(ctx, in.Method, target.String(), bytes.NewReader(in.Body))
+	request, err := buildUpstreamRequest(ctx, cfg, upstream, in, requestID)
 	if err != nil {
 		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "build_upstream_request", err: err}
 	}
-	request.Header = filteredRequestHeaders(in.Headers)
-	for key, value := range upstream.Headers {
-		request.Header.Set(key, resolveSecretValue(value))
-	}
-	if upstream.AuthRef != "" {
-		if credential, ok := cfg.Credentials[upstream.AuthRef]; ok {
-			if value := resolveCredential(credential); value != "" {
-				if strings.EqualFold(credential.Type, "api_key") {
-					request.Header.Set("X-API-Key", value)
-				} else {
-					request.Header.Set("Authorization", "Bearer "+value)
-				}
-			}
-		}
-	}
-	request.Header.Set("X-Gateway-Request-Id", requestID)
-	if len(in.Body) > 0 {
-		request.ContentLength = int64(len(in.Body))
-	}
-	client := s.client
-	if timeout := upstream.EffectiveTimeout(); timeout > 0 {
-		copyClient := *client
-		copyClient.Timeout = timeout
-		client = &copyClient
-	}
-	response, err := client.Do(request)
+	response, err := s.upstreamClient(upstream, false).Do(request)
 	if err != nil {
 		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_request_failed", err: err}
 	}
 	defer response.Body.Close()
-	max := defaultMaxBody * 4
-	if profile.MaxBodyBytes > 0 && profile.MaxBodyBytes*4 < max {
-		max = profile.MaxBodyBytes * 4
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, max+1))
-	if err != nil {
-		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_body_failed", err: err}
-	}
-	if int64(len(body)) > max {
-		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_body_too_large", err: errors.New("upstream response exceeded configured limit")}
-	}
-	return transform.Envelope{Method: response.Request.Method, Path: response.Request.URL.Path, Query: response.Request.URL.Query(), Headers: response.Header.Clone(), Body: body, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type")}, nil
+	return readUpstreamResponse(profile, response)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -609,7 +714,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnprocessableEntity, "transform", "preview_failed", safeError(err), "")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, s.previewPayload("preview", profile, selectedRoute, profile.Upstream, prepared, "preview"))
+	s.writeJSON(w, http.StatusOK, s.previewPayload("preview", profile, selectedRoute, profile.Upstream, prepared, "preview", configuredRedactions(snapshot.Config)))
 }
 
 func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
@@ -815,7 +920,7 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, map[string]any{"versions": []any{}})
 		return
 	}
-	items, err := s.store.ListVersions(r.Context(), 100)
+	items, err := s.store.ListVersions(r.Context(), queryLimit(r, 100))
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "store", "list_versions_failed", err.Error(), "")
 		return
@@ -828,7 +933,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, map[string]any{"events": []any{}})
 		return
 	}
-	items, err := s.store.ListAudit(r.Context(), 100)
+	items, err := s.store.ListAudit(r.Context(), queryLimit(r, 100))
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "store", "list_audit_failed", err.Error(), "")
 		return
@@ -841,12 +946,28 @@ func (s *Server) handleRecordings(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, map[string]any{"recordings": []any{}})
 		return
 	}
-	items, err := s.store.ListRecordings(r.Context(), 100)
+	items, err := s.store.ListRecordings(r.Context(), queryLimit(r, 100))
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "store", "list_recordings_failed", err.Error(), "")
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"recordings": items})
+}
+
+// queryLimit reads an optional ?limit= parameter, clamped to a sane range.
+func queryLimit(r *http.Request, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get("limit"))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	if value > 200 {
+		return 200
+	}
+	return value
 }
 
 func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
@@ -894,12 +1015,15 @@ func (s *Server) callClientKey(cfg *config.Config, r *http.Request) string {
 			key = strings.TrimSpace(auth[7:])
 		}
 	}
+	if key == "" {
+		return ""
+	}
 	for id, client := range cfg.Clients {
-		if value := resolveClientKey(client); value != "" && value == key {
+		if value := resolveClientKey(client); value != "" && secureEqual(value, key) {
 			return id
 		}
 	}
-	if key != "" && os.Getenv("GATEWAY_CLIENT_API_KEY") == key {
+	if secureEqual(os.Getenv("GATEWAY_CLIENT_API_KEY"), key) {
 		return "local"
 	}
 	return ""
@@ -942,7 +1066,13 @@ func (s *Server) authorizeAdmin(r *http.Request) bool {
 	if provided == "" {
 		provided = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	}
-	return provided != "" && provided == token
+	return provided != "" && secureEqual(provided, token)
+}
+
+// secureEqual compares secrets in constant time to avoid leaking content
+// through response-time differences.
+func secureEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func (s *Server) statusPayload() map[string]any {
@@ -951,8 +1081,12 @@ func (s *Server) statusPayload() map[string]any {
 	if snapshot != nil {
 		configInfo = map[string]any{"id": snapshot.ID, "hash": snapshot.Hash, "version": snapshot.Version, "loaded_at": snapshot.LoadedAt, "source": snapshot.Source}
 	}
-	return map[string]any{"started_at": s.started, "config": configInfo, "metrics": s.metrics.Snapshot(), "adapters": s.registry.Names()}
+	return map[string]any{"gateway_version": BuildVersion, "started_at": s.started, "config": configInfo, "metrics": s.metrics.Snapshot(), "adapters": s.registry.Names()}
 }
+
+// BuildVersion mirrors the CLI build version; it is set via -ldflags at
+// build time and defaults to "dev".
+var BuildVersion = "dev"
 
 func (s *Server) profilePayload() []map[string]any {
 	cfg := s.Snapshot().Config
@@ -963,13 +1097,13 @@ func (s *Server) profilePayload() []map[string]any {
 	return result
 }
 
-func (s *Server) previewPayload(requestID string, profile *config.Profile, selectedRoute *config.Route, upstream string, env transform.Envelope, mode string) map[string]any {
+func (s *Server) previewPayload(requestID string, profile *config.Profile, selectedRoute *config.Route, upstream string, env transform.Envelope, mode string, extraRedactions map[string]bool) map[string]any {
 	body := any(string(env.Body))
 	var decoded any
 	if json.Unmarshal(env.Body, &decoded) == nil {
 		body = decoded
 	}
-	return map[string]any{"request_id": requestID, "mode": mode, "profile": profile.Name, "route": selectedRoute, "upstream": upstream, "request": map[string]any{"method": env.Method, "path": env.Path, "query": env.Query, "headers": redactHeaders(env.Headers), "body": body}}
+	return map[string]any{"request_id": requestID, "mode": mode, "profile": profile.Name, "route": selectedRoute, "upstream": upstream, "request": map[string]any{"method": env.Method, "path": env.Path, "query": env.Query, "headers": redactHeadersWith(env.Headers, extraRedactions), "body": body}}
 }
 
 func (s *Server) writeDryRunResponse(w http.ResponseWriter, requestID string, profile *config.Profile, prepared transform.Envelope) {
@@ -1008,7 +1142,92 @@ func (s *Server) observe(requestID string, started time.Time, r *http.Request, s
 	if selectedRoute != nil {
 		routeID = selectedRoute.ID
 	}
-	s.metrics.Observe(telemetry.RequestRecord{RequestID: requestID, StartedAt: started, Duration: time.Since(started), Method: r.Method, Path: r.URL.Path, Route: routeID, Profile: profile.Name, Mode: normalizeMode(profile.TrafficMode), Upstream: upstream, Status: status, ErrorStage: stage, ErrorCode: code})
+	profileName, mode := "", ""
+	if profile != nil {
+		profileName, mode = profile.Name, normalizeMode(profile.TrafficMode)
+	}
+	duration := time.Since(started)
+	s.metrics.Observe(telemetry.RequestRecord{RequestID: requestID, StartedAt: started, Duration: duration, Method: r.Method, Path: r.URL.Path, Route: routeID, Profile: profileName, Mode: mode, Upstream: upstream, Status: status, ErrorStage: stage, ErrorCode: code})
+	if status >= 400 || code != "" {
+		slog.Info("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "route", routeID, "profile", profileName, "mode", mode, "upstream", upstream, "status", status, "duration_ms", duration.Milliseconds(), "error_stage", stage, "error_code", code)
+	} else {
+		slog.Debug("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "route", routeID, "profile", profileName, "mode", mode, "upstream", upstream, "status", status, "duration_ms", duration.Milliseconds())
+	}
+	if snapshot := s.Snapshot(); snapshot != nil && snapshot.Config != nil && auditEnabled(snapshot.Config) {
+		s.submitAudit(store.AuditEvent{
+			Action:    "request",
+			Actor:     "gateway",
+			RequestID: requestID,
+			Details:   map[string]any{"method": r.Method, "path": r.URL.Path, "route": routeID, "profile": profileName, "mode": mode, "upstream": upstream, "status": status, "error_stage": stage, "error_code": code, "duration_ms": duration.Milliseconds()},
+		})
+	}
+}
+
+// drainAuditEvents writes request audit records asynchronously so SQLite
+// inserts never sit in the data-plane hot path; overflow is dropped with a
+// warning rather than blocking requests.
+func (s *Server) drainAuditEvents() {
+	for event := range s.auditCh {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.store.AddAudit(ctx, event); err != nil {
+			slog.Warn("audit write failed", "action", event.Action, "error", err)
+		}
+		cancel()
+	}
+}
+
+func (s *Server) submitAudit(event store.AuditEvent) {
+	if s.store == nil {
+		return
+	}
+	select {
+	case s.auditCh <- event:
+	default:
+		slog.Warn("audit event dropped", "action", event.Action, "reason", "audit_backlog")
+	}
+}
+
+// auditEnabled reports whether policies.audit.enabled requests per-request
+// audit records.
+func auditEnabled(cfg *config.Config) bool {
+	audit, _ := cfg.Policies["audit"].(map[string]any)
+	enabled, _ := audit["enabled"].(bool)
+	return enabled
+}
+
+// configuredRedactions returns extra header names listed under
+// policies.audit.redact, lower-cased for case-insensitive matching.
+func configuredRedactions(cfg *config.Config) map[string]bool {
+	out := map[string]bool{}
+	if cfg == nil {
+		return out
+	}
+	audit, _ := cfg.Policies["audit"].(map[string]any)
+	list, _ := audit["redact"].([]any)
+	for _, item := range list {
+		if text, ok := item.(string); ok {
+			if name := strings.ToLower(strings.TrimSpace(text)); name != "" {
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
+func redactHeaders(headers http.Header) map[string][]string {
+	return redactHeadersWith(headers, nil)
+}
+
+func redactHeadersWith(headers http.Header, extra map[string]bool) map[string][]string {
+	out := map[string][]string{}
+	for key, values := range headers {
+		if isSensitiveHeader(key) || extra[strings.ToLower(key)] {
+			out[key] = []string{"[REDACTED]"}
+		} else {
+			out[key] = append([]string(nil), values...)
+		}
+	}
+	return out
 }
 
 func (s *Server) writeStatic(w http.ResponseWriter, r *http.Request) {
@@ -1016,22 +1235,46 @@ func (s *Server) writeStatic(w http.ResponseWriter, r *http.Request) {
 	if requested == "" || requested == "." {
 		requested = "index.html"
 	}
-	if requested == ".." || strings.HasPrefix(requested, "../") {
-		requested = "index.html"
+	contentType := "text/html; charset=utf-8"
+	switch {
+	case strings.HasSuffix(requested, ".css"):
+		contentType = "text/css; charset=utf-8"
+	case strings.HasSuffix(requested, ".js"):
+		contentType = "text/javascript; charset=utf-8"
 	}
-	file := filepath.Join("web", filepath.FromSlash(requested))
-	data, err := os.ReadFile(file)
+	if requested == "index.html" || requested == "" {
+		// The console is a static, self-contained page; locking it to itself
+		// closes the usual XSS injection surface.
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'")
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	data, err := web.FS.ReadFile(requested)
 	if err != nil {
-		data = []byte("<!doctype html><title>Unified API Gateway</title><p>Web console assets are not installed.</p>")
-	}
-	if strings.HasSuffix(file, ".css") {
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	} else if strings.HasSuffix(file, ".js") {
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Fall back to legacy on-disk assets (for deployments that overlay a
+		// customised console), then to a placeholder page.
+		if disk, diskErr := os.ReadFile(filepath.Join("web", filepath.FromSlash(requested))); diskErr == nil {
+			data = disk
+		} else {
+			data = []byte("<!doctype html><title>Unified API Gateway</title><p>Web console assets are not installed.</p>")
+		}
+	} else if etag := staticETag(data); etag != "" {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("ETag", etag)
+		if strings.TrimSpace(r.Header.Get("If-None-Match")) == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 	_, _ = w.Write(data)
+}
+
+func staticETag(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return `"` + hex.EncodeToString(sum[:12]) + `"`
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
@@ -1073,6 +1316,29 @@ func (s *Server) newRequestID() string {
 	return hex.EncodeToString(h[:8])
 }
 
+// requestIDPattern accepts conservative, header-safe identifiers. Client
+// supplied values are echoed back into responses and logs; anything outside
+// this shape is replaced with a generated id to prevent log injection.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{8,128}$`)
+
+// inboundRequestID honours observability.request_id_header and validates the
+// inbound value before reusing it.
+func (s *Server) inboundRequestID(cfg *config.Config, r *http.Request) string {
+	header := "X-Request-Id"
+	if custom := strings.TrimSpace(cfg.Observability.RequestIDHeader); custom != "" {
+		header = custom
+	}
+	if id := strings.TrimSpace(r.Header.Get(header)); requestIDPattern.MatchString(id) {
+		return id
+	}
+	if header != "X-Request-Id" {
+		if id := strings.TrimSpace(r.Header.Get("X-Request-Id")); requestIDPattern.MatchString(id) {
+			return id
+		}
+	}
+	return s.newRequestID()
+}
+
 func headersFromValues(values map[string][]string) http.Header {
 	h := make(http.Header, len(values))
 	for key, items := range values {
@@ -1081,18 +1347,6 @@ func headersFromValues(values map[string][]string) http.Header {
 		}
 	}
 	return h
-}
-
-func redactHeaders(headers http.Header) map[string][]string {
-	out := map[string][]string{}
-	for key, values := range headers {
-		if isSensitiveHeader(key) {
-			out[key] = []string{"[REDACTED]"}
-		} else {
-			out[key] = append([]string(nil), values...)
-		}
-	}
-	return out
 }
 
 func recordingKey(profile string, env transform.Envelope) string {

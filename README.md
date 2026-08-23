@@ -84,7 +84,8 @@ YAML 明文。
 - `transforms`：可复用的声明式改写片段；
 - `policies`：超时、限流、重试、熔断和审计策略；
 - `credentials` / `clients`：上游密钥引用、客户端凭据和 profile 白名单；
-- `observability`：日志脱敏、指标和 trace 设置。
+- `observability`：日志级别、请求 ID 头、指标和 trace 设置。`log_level` 与
+  `request_id_header` 已生效；`trace`/`redact_prompts` 为预留字段。
 
 一个 profile 可以写成：
 
@@ -153,8 +154,10 @@ OpenAI Chat Completions 契约，将上游模型固定为 `zai/glm-5.2`，并将
 `User-Agent` 固定为 `eve/0.27.8`；API key 只从 `AI_GATEWAY_API_KEY` 环境变量读取。
 该 profile 还会把过小的 `max_tokens` 提升到 128；这是为了兼容 Cherry Studio
 连接检测发送的 `max_tokens=1`，避免 GLM 5.2 把全部额度消耗在 reasoning 后返回空正文。
-透明 OpenAI/SSE 请求会逐块转发并立即 flush，不会等待完整响应体；需要语义转换的
-profile 仍会按其 `streaming_safe` 声明选择逐帧转换或受控缓冲。
+透明 OpenAI/SSE 请求会逐块转发并立即 flush。声明 `stream_safe: true` 的语义转换
+profile 同样逐帧翻译、逐帧 flush：上游的每个 SSE 事件在被接收的瞬间完成协议转换并发
+给客户端，不会为了翻译而缓冲整条流。上游返回非流式错误体时自动回退到缓冲转换，客
+户端仍能收到协议正确的错误响应。
 启动服务前请在当前 shell 设置该变量，例如：
 
 ```powershell
@@ -197,6 +200,12 @@ dry-run 预览每一阶段的 envelope diff，发布后可通过管理 API 回�
 响应开始发送后不能改变 HTTP 状态码；上游错误会转换为目标协议的错误事件并关闭
 连接。启用 `record` 时还必须显式设置 `observability.record_body: true`。
 
+`shadow` 模式可以用 profile 的 `shadow_upstream` 字段指定独立的影子上游；不指定时
+镜像请求会发往主上游（注意双倍计费）。影子上限 64 个并发，超出即丢弃并记录警告，
+且影子结果不影响熔断器。`replay` 先按请求摘要精确匹配录制；未命中时回退到同一
+profile/method/path 最近的一条录制，并通过 `X-Gateway-Replay: exact|approximate`
+响应头标注命中方式。
+
 ## 管理 API
 
 管理面默认在 `127.0.0.1:8781`，建议通过反向代理或本机隧道访问。实现提供下列
@@ -208,11 +217,12 @@ GET  /readyz                        配置和上游就绪状态
 GET  /admin/v1/status               当前激活版本、监听器和指标摘要
 GET  /admin/v1/config               当前配置（敏感字段已脱敏）
 POST /admin/v1/config/validate      校验 YAML，不改变 active 版本
-POST /admin/v1/preview               用样例请求执行 dry-run 并返回 diff
-POST /admin/v1/config/activate       激活已校验版本
-POST /admin/v1/config/rollback       回滚到指定历史版本
-POST /admin/v1/routes/explain        解释一条请求会命中哪个 route/profile
-GET  /admin/v1/recordings             查看 record fixture 索引
+POST /admin/v1/preview              用样例请求执行 dry-run 并返回 diff
+POST /admin/v1/config/activate      激活已校验版本
+POST /admin/v1/config/rollback      回滚到指定历史版本
+POST /admin/v1/routes/explain       解释一条请求会命中哪个 route/profile
+GET  /admin/v1/recordings           查看 record fixture 索引
+```
 
 快速切换当前默认 profile：
 
@@ -220,7 +230,6 @@ GET  /admin/v1/recordings             查看 record fixture 索引
 curl.exe -X POST http://127.0.0.1:8781/admin/v1/profile/switch `
   -H "Content-Type: application/json" `
   -d '{"profile":"openai-to-anthropic-dry-run"}'
-```
 ```
 
 一个最小的路由解释请求：
@@ -234,6 +243,33 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
 管理面和数据面使用不同的鉴权边界；生产部署不要把管理端口暴露到公网。
 管理面默认仅允许回环客户端；设置 `GATEWAY_ADMIN_TOKEN` 后，CLI 或 Web 控制台需通过
 `X-Admin-Token` 发送令牌。Web 控制台会在第一次收到 401 时提示输入并保存在当前浏览器。
+
+`/admin/v1/versions`、`/admin/v1/audit`、`/admin/v1/recordings` 支持 `?limit=` 参数
+（1–200，默认 100）。`/admin/v1/status` 返回 `gateway_version`（构建时通过
+`-ldflags -X unified-api-gateway/internal/server.BuildVersion=...` 注入，`make build`
+自动带入 git 描述）。注意：`/admin/v1/config/activate` 的 `path` 字段会以网关进程
+权限读取本地文件，属于管理面信任边界，请勿将管理端口暴露给不受信任的调用方。
+
+## 流量策略
+
+`policies.defaults` 与顶层 `limits` 现在由数据面强制执行：
+
+- `requests_per_second` / `burst`（或 `limits.requests_per_second`）：令牌桶限流，
+  超限返回 `429` 并带 `Retry-After`；
+- `max_concurrency`（或 `limits.concurrency`）：按 profile 的并发信号量，超限返回
+  `503`；
+- `retry.max_attempts` + `idempotent_only`：仅对幂等方法（GET/HEAD/PUT/DELETE 等）
+  或携带 `Idempotency-Key` 的请求在 5xx/网络错误时重试；上游的 `retries` 字段可
+  覆盖重试次数；流式响应在首字节发出后绝不重试；
+- `circuit_breaker.failure_threshold` / `reset_timeout_ms`：按 upstream 的熔断器，
+  连续失败达到阈值后打开（`503 circuit_open`），静置期过后放行单个半开探测；熔断
+  状态跨配置激活保留；
+- `request_timeout_ms`：非流式上游调用的总超时；流式调用只限制响应头到达时间
+  （30 秒），长生成不会被总超时截断。
+
+`policies.audit.enabled: true` 时每个数据面请求写一条 `request` 审计事件（异步
+写入 SQLite，积压时丢弃并告警）；`policies.audit.redact` 列表中的头名称会在预览、
+dry-run 输出和 record 存档中额外脱敏。
 
 ## 开发与测试
 
@@ -257,7 +293,14 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 ## 安全边界
 
 - 上游 URL 只来自已加载配置，不接受请求体或 Header 中的用户可控目标，降低 SSRF 风险；
-- Authorization、API key、prompt、响应正文和工具参数默认脱敏；
+- Authorization、API key、prompt、响应正文和工具参数默认脱敏，`policies.audit.redact`
+  可扩展脱敏名单；
+- 客户端密钥与管理令牌使用常量时间比较，避免时序侧信道；
+- 入站 `X-Request-Id`（或配置的 `observability.request_id_header`）只接受保守字符集，
+  非法值会被替换为网关生成的 ID，防止日志/响应头注入；
+- 内置 Web 控制台随二进制 embed 分发，响应带 CSP 与 nosniff 头，静态资源带 ETag；
+- `observability.log_level`（debug/info/warn/error）控制访问日志级别：失败请求记
+  info，成功请求记 debug；
 - 自动重试只针对幂等请求或带明确幂等键的请求；首字节发送后不重试；
 - 任意脚本（JavaScript/Lua/系统命令）不是默认转换能力；复杂扩展应使用受限、可
   审计的插件接口；

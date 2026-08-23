@@ -41,7 +41,11 @@ type Metrics struct {
 	fail   atomic.Uint64
 	active atomic.Int64
 	mu     sync.RWMutex
+	// recent is a ring buffer: new records overwrite the oldest slot instead
+	// of re-allocating the whole slice on every observation.
 	recent []RequestRecord
+	head   int
+	count  int
 	limit  int
 }
 
@@ -49,7 +53,7 @@ func New(limit int) *Metrics {
 	if limit <= 0 {
 		limit = 50
 	}
-	return &Metrics{limit: limit}
+	return &Metrics{limit: limit, recent: make([]RequestRecord, limit)}
 }
 
 func (m *Metrics) Begin() func() {
@@ -65,23 +69,28 @@ func (m *Metrics) Observe(record RequestRecord) {
 		m.fail.Add(1)
 	}
 	m.mu.Lock()
-	m.recent = append([]RequestRecord{record}, m.recent...)
-	if len(m.recent) > m.limit {
-		m.recent = m.recent[:m.limit]
+	m.recent[m.head] = record
+	m.head = (m.head + 1) % m.limit
+	if m.count < m.limit {
+		m.count++
 	}
 	m.mu.Unlock()
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	m.mu.RLock()
-	recent := append([]RequestRecord(nil), m.recent...)
+	out := make([]RequestRecord, 0, m.count)
+	for i := 0; i < m.count; i++ {
+		index := (m.head - 1 - i + m.limit) % m.limit
+		out = append(out, m.recent[index])
+	}
 	m.mu.RUnlock()
 	return Snapshot{
 		RequestsTotal:  m.total.Load(),
 		RequestsOK:     m.ok.Load(),
 		RequestsFailed: m.fail.Load(),
 		Active:         m.active.Load(),
-		Recent:         recent,
+		Recent:         out,
 	}
 }
 

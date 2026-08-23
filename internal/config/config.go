@@ -90,8 +90,10 @@ type Upstream struct {
 	TimeoutMS int               `yaml:"timeout_ms,omitempty" json:"timeout_ms,omitempty"`
 	Timeout   string            `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 	Retries   int               `yaml:"retries,omitempty" json:"retries,omitempty"`
-	Weight    int               `yaml:"weight,omitempty" json:"weight,omitempty"`
-	Insecure  bool              `yaml:"insecure,omitempty" json:"insecure,omitempty"`
+	// Insecure skips TLS verification for this upstream. Intended for
+	// self-hosted services with self-signed certificates; the gateway logs a
+	// warning for every insecure upstream on activation.
+	Insecure bool `yaml:"insecure,omitempty" json:"insecure,omitempty"`
 }
 
 // EffectiveURL returns BaseURL, falling back to URL for compatibility.
@@ -126,6 +128,7 @@ type Profile struct {
 	UpstreamContract   string                    `yaml:"upstream_contract,omitempty" json:"upstream_contract,omitempty"`
 	TrafficMode        string                    `yaml:"traffic_mode,omitempty" json:"traffic_mode,omitempty"`
 	Upstream           string                    `yaml:"upstream,omitempty" json:"upstream,omitempty"`
+	ShadowUpstream     string                    `yaml:"shadow_upstream,omitempty" json:"shadow_upstream,omitempty"`
 	Request            transform.TransformSpec   `yaml:"request,omitempty" json:"request,omitempty"`
 	Response           transform.TransformSpec   `yaml:"response,omitempty" json:"response,omitempty"`
 	RequestTransforms  []transform.TransformSpec `yaml:"request_transforms,omitempty" json:"request_transforms,omitempty"`
@@ -410,6 +413,11 @@ func (c *Config) Validate() error {
 			}
 		} else if mode == "live" || mode == "shadow" || mode == "record" {
 			errs = append(errs, fmt.Sprintf("profile %q: upstream is required for traffic_mode %q", name, mode))
+		}
+		if p.ShadowUpstream != "" {
+			if _, ok := c.Upstreams[p.ShadowUpstream]; !ok {
+				errs = append(errs, fmt.Sprintf("profile %q: shadow_upstream %q not found", name, p.ShadowUpstream))
+			}
 		}
 		for i, spec := range p.AllRequestTransforms() {
 			if err := spec.Validate(); err != nil {

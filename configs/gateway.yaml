@@ -235,6 +235,15 @@ transforms:
         X-Gateway-Source: unified
 
 policies:
+  # These settings are enforced by the data plane:
+  #   request_timeout_ms caps non-streaming upstream calls,
+  #   max_concurrency is a per-profile semaphore (503 when exhausted),
+  #   requests_per_second/burst is a token-bucket limiter (429 + Retry-After),
+  #   retry only repeats idempotent requests (or Idempotency-Key requests)
+  #     on 5xx or transport errors and never after the first streamed byte,
+  #   circuit_breaker trips per upstream after consecutive failures.
+  # audit.enabled records one event per data-plane request; audit.redact adds
+  # extra header names to redact in previews, dry-run output and recordings.
   defaults:
     request_timeout_ms: 60000
     max_concurrency: 128
