@@ -128,3 +128,87 @@ func TestOpenAIResponsesAdapterStillConvertsAnthropicUpstream(t *testing.T) {
 		t.Fatalf("output=%#v", body["output"])
 	}
 }
+
+func TestToolCallIndexUsesToolArraySpace(t *testing.T) {
+	// Anthropic block indexes span text and tool blocks together; OpenAI
+	// tool_calls[].index is the position inside the tool_calls array. A text
+	// block before the tool used to shift every tool index by one.
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"let me check\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ping\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"pong\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"[]\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-chat")
+	toolIndexes := map[float64]bool{}
+	for _, event := range translated {
+		if event.Data == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
+			t.Fatal(err)
+		}
+		choices, _ := chunk["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		delta, _ := choices[0].(map[string]any)["delta"].(map[string]any)
+		calls, _ := delta["tool_calls"].([]any)
+		if calls == nil {
+			continue
+		}
+		for _, raw := range calls {
+			call := raw.(map[string]any)
+			toolIndexes[call["index"].(float64)] = true
+		}
+	}
+	if !toolIndexes[0] || !toolIndexes[1] || len(toolIndexes) != 2 {
+		t.Fatalf("tool positions=%v, want exactly {0 1}", toolIndexes)
+	}
+}
+
+func TestToolChoiceShapeConversion(t *testing.T) {
+	// OpenAI strings must become Anthropic objects ("required" -> {"type":"any"}).
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"claude","tool_choice":"required","tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object"}}}],"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)}
+	output, err := (OpenAIChatToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if choice, ok := body["tool_choice"].(map[string]any); !ok || choice["type"] != "any" {
+		t.Fatalf("tool_choice=%#v, want {\"type\":\"any\"}", body["tool_choice"])
+	}
+
+	// Named function selection maps onto {"type":"tool","name":...}.
+	input.Body = []byte(`{"model":"claude","tool_choice":{"type":"function","function":{"name":"ping"}},"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)
+	output, err = (OpenAIChatToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if choice, ok := body["tool_choice"].(map[string]any); !ok || choice["type"] != "tool" || choice["name"] != "ping" {
+		t.Fatalf("tool_choice=%#v, want {\"type\":\"tool\",\"name\":\"ping\"}", body["tool_choice"])
+	}
+
+	// Reverse: Anthropic objects become OpenAI strings / function objects.
+	input.Body = []byte(`{"model":"gpt","tool_choice":{"type":"any"},"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)
+	output, err = (AnthropicToOpenAIChat{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["tool_choice"] != "required" {
+		t.Fatalf("tool_choice=%#v, want \"required\"", body["tool_choice"])
+	}
+}

@@ -98,19 +98,28 @@ func TestTranslateOpenAIToAnthropicProducesValidEventSequence(t *testing.T) {
 		}
 		types = append(types, payload["type"].(string))
 	}
-	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "message_delta", "message_delta", "message_stop"}
+	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_delta", "message_stop"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("sequence=%v", types)
 	}
+	// The tool block must be explicitly closed before the message ends;
+	// clients finalise accumulated partial_json on content_block_stop.
+	var toolStop map[string]any
+	if err := json.Unmarshal([]byte(translated[7].Data), &toolStop); err != nil {
+		t.Fatal(err)
+	}
+	if toolStop["index"] != float64(1) {
+		t.Fatalf("tool content_block_stop index=%v, want 1", toolStop["index"])
+	}
 	var finish map[string]any
-	if err := json.Unmarshal([]byte(translated[7].Data), &finish); err != nil {
+	if err := json.Unmarshal([]byte(translated[8].Data), &finish); err != nil {
 		t.Fatal(err)
 	}
 	if finish["delta"].(map[string]any)["stop_reason"] != "tool_calls" {
 		t.Fatalf("finish=%#v", finish)
 	}
 	var usageEvent map[string]any
-	if err := json.Unmarshal([]byte(translated[8].Data), &usageEvent); err != nil {
+	if err := json.Unmarshal([]byte(translated[9].Data), &usageEvent); err != nil {
 		t.Fatal(err)
 	}
 	if usageEvent["usage"].(map[string]any)["input_tokens"] != float64(4) {

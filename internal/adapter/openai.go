@@ -33,9 +33,14 @@ func (OpenAIChatToAnthropic) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 	} else {
 		out["max_tokens"] = 1024
 	}
-	for _, key := range []string{"temperature", "top_p", "stop_sequences", "stream", "tool_choice", "metadata"} {
+	for _, key := range []string{"temperature", "top_p", "stop_sequences", "stream", "metadata"} {
 		if value, ok := body[key]; ok {
 			out[key] = value
+		}
+	}
+	if choice, ok := body["tool_choice"]; ok {
+		if converted := toolChoiceToAnthropic(choice); converted != nil {
+			out["tool_choice"] = converted
 		}
 	}
 	if stop, ok := body["stop"]; ok {
@@ -219,9 +224,14 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 	if stream, ok := body["stream"]; ok {
 		out["stream"] = stream
 	}
-	for _, key := range []string{"temperature", "top_p", "tool_choice"} {
+	for _, key := range []string{"temperature", "top_p"} {
 		if value, ok := body[key]; ok {
 			out[key] = value
+		}
+	}
+	if choice, ok := body["tool_choice"]; ok {
+		if converted := toolChoiceToOpenAI(choice); converted != nil {
+			out["tool_choice"] = converted
 		}
 	}
 	if tools := convertAnthropicTools(body["tools"]); len(tools) > 0 {
@@ -529,6 +539,65 @@ func normalizeStop(value any) any {
 	}
 	if text := asString(value); text != "" {
 		return []any{text}
+	}
+	return value
+}
+
+// toolChoiceToAnthropic maps the OpenAI/Responses tool_choice vocabulary
+// ("auto"/"required"/"none" strings or a function object) onto Anthropic's
+// always-object form; Anthropic rejects bare strings with a 400.
+func toolChoiceToAnthropic(value any) any {
+	switch choice := value.(type) {
+	case string:
+		switch choice {
+		case "auto":
+			return map[string]any{"type": "auto"}
+		case "required":
+			return map[string]any{"type": "any"}
+		case "none":
+			return map[string]any{"type": "none"}
+		default:
+			return value
+		}
+	case map[string]any:
+		switch asString(choice["type"]) {
+		case "function":
+			name := asString(choice["name"]) // Responses uses a flat name
+			if name == "" {
+				if fn, ok := choice["function"].(map[string]any); ok { // Chat nests it
+					name = asString(fn["name"])
+				}
+			}
+			if name != "" {
+				return map[string]any{"type": "tool", "name": name}
+			}
+		case "auto", "any", "none", "tool":
+			return choice // already Anthropic-shaped
+		}
+		return value
+	default:
+		return value
+	}
+}
+
+// toolChoiceToOpenAI maps Anthropic's object form back onto the OpenAI
+// string / function-object vocabulary.
+func toolChoiceToOpenAI(value any) any {
+	choice, ok := value.(map[string]any)
+	if !ok {
+		return value // strings are already OpenAI-shaped
+	}
+	switch asString(choice["type"]) {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	case "tool":
+		if name := asString(choice["name"]); name != "" {
+			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		}
 	}
 	return value
 }

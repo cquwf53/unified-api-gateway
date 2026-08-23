@@ -121,9 +121,11 @@ type SSETranslator struct {
 	nextBlock   int
 	textIndex   int
 	blockByTool map[int]int // OpenAI tool_call index -> Anthropic block index
-	streamID    string
-	model       string
-	finishSent  bool
+	// openToolBlocks tracks Anthropic tool blocks opened but not yet stopped.
+	openToolBlocks []int
+	streamID       string
+	model          string
+	finishSent     bool
 	// createdUnix backs the OpenAI "created" field, which Anthropic streams
 	// never carry; it is stamped when the translator is created.
 	createdUnix int64
@@ -136,6 +138,11 @@ type SSETranslator struct {
 	// while usage totals only arrive with message_delta.
 	promptTokens    float64
 	promptTokensSet bool
+	// toolCallIndexByBlock maps Anthropic block indexes (text and tool blocks
+	// share one sequence) onto OpenAI tool_calls array positions, which are a
+	// separate numbering space.
+	toolCallIndexByBlock map[int]int
+	toolCallCount        int
 
 	// responses-target state: the Responses stream protocol uses
 	// response.created/delta/completed events and no [DONE] sentinel.
@@ -161,7 +168,11 @@ func (t *SSETranslator) respEvent(name string, payload map[string]any) SSEEvent 
 // "anthropic-messages" and "openai-chat". Identical or unknown contracts
 // return a pass-through translator.
 func NewSSETranslator(from, to string) *SSETranslator {
-	return &SSETranslator{from: strings.ToLower(from), to: strings.ToLower(to), blockByTool: map[int]int{}, nextBlock: -1, createdUnix: time.Now().Unix()}
+	return &SSETranslator{
+		from: strings.ToLower(from), to: strings.ToLower(to),
+		blockByTool: map[int]int{}, toolCallIndexByBlock: map[int]int{},
+		nextBlock: -1, createdUnix: time.Now().Unix(),
+	}
 }
 
 // Translate converts one upstream event into zero or more client events.
@@ -235,6 +246,7 @@ func (t *SSETranslator) translateDone() []SSEEvent {
 		return []SSEEvent{{Data: "[DONE]"}}
 	}
 	var out []SSEEvent
+	out = append(out, t.closeOpenToolBlocks()...)
 	out = append(out, t.closeTextBlock()...)
 	out = append(out, sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	return out
@@ -522,6 +534,7 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 	}
 	if finish != nil && !t.finishSent {
 		out = append(out, t.ensureStarted(payload)...)
+		out = append(out, t.closeOpenToolBlocks()...)
 		out = append(out, t.closeTextBlock()...)
 		out = append(out, sseEvent("message_delta", map[string]any{
 			"type":  "message_delta",
@@ -549,7 +562,9 @@ func (t *SSETranslator) translateToolCallDeltas(calls []any) []SSEEvent {
 			t.nextBlock++
 			block = t.nextBlock
 			t.blockByTool[index] = block
+			out = append(out, t.closeOpenToolBlocks()...)
 			out = append(out, t.closeTextBlock()...)
+			t.openToolBlocks = append(t.openToolBlocks, block)
 			start := map[string]any{
 				"type":          "content_block_start",
 				"index":         block,
@@ -612,6 +627,18 @@ func (t *SSETranslator) closeTextBlock() []SSEEvent {
 	}
 	t.textOpen = false
 	return []SSEEvent{sseEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": t.textIndex})}
+}
+
+// closeOpenToolBlocks emits content_block_stop for every tool block still
+// open. Anthropic requires every block to be closed; clients usually
+// finalise a tool call's accumulated partial_json on this event.
+func (t *SSETranslator) closeOpenToolBlocks() []SSEEvent {
+	var out []SSEEvent
+	for _, block := range t.openToolBlocks {
+		out = append(out, sseEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": block}))
+	}
+	t.openToolBlocks = nil
+	return out
 }
 
 func (t *SSETranslator) currentTextIndex() int {
@@ -785,12 +812,15 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 			// starts carry a tool_call delta.
 			return SSEEvent{}, nil
 		}
-		index := 0
+		blockIndex := 0
 		if n, ok := numberValueOK(payload["index"]); ok {
-			index = int(n)
+			blockIndex = int(n)
 		}
+		toolPosition := t.toolCallCount
+		t.toolCallIndexByBlock[blockIndex] = toolPosition
+		t.toolCallCount++
 		delta["tool_calls"] = []any{map[string]any{
-			"index": index, "id": block["id"], "type": "function",
+			"index": toolPosition, "id": block["id"], "type": "function",
 			"function": map[string]any{"name": block["name"], "arguments": ""},
 		}}
 	case "content_block_delta":
@@ -799,12 +829,13 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 				delta["content"] = text
 			}
 			if d["type"] == "input_json_delta" {
-				index := 0
+				blockIndex := 0
 				if n, ok := numberValueOK(payload["index"]); ok {
-					index = int(n)
+					blockIndex = int(n)
 				}
+				toolPosition := t.toolCallIndexByBlock[blockIndex]
 				delta["tool_calls"] = []any{map[string]any{
-					"index": index, "function": map[string]any{"arguments": asString(d["partial_json"])},
+					"index": toolPosition, "function": map[string]any{"arguments": asString(d["partial_json"])},
 				}}
 			}
 		}
