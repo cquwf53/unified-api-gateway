@@ -63,7 +63,7 @@ func TestAnthropicToResponsesStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := completed["response"].(map[string]any)
-	if response["status"] != "completed" || response["id"] != "msg_1" {
+	if response["status"] != "completed" || response["id"] != "resp_1" {
 		t.Fatalf("completed response=%#v", response)
 	}
 	// Clients that read event.response instead of accumulating deltas must
@@ -221,4 +221,83 @@ func TestStreamErrorOpenAIChatToAnthropic(t *testing.T) {
 	if sawMessageStop {
 		t.Fatal("a normal message_stop after the error would disguise the failure")
 	}
+}
+
+// TestUnterminatedAnthropicStreamToResponsesGetsTerminal pins the Finish()
+// ordering: an openai-responses target must not be captured by the generic
+// "openai" branch (which would emit a bare [DONE]).
+func TestUnterminatedAnthropicStreamToResponsesGetsTerminal(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_9\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"
+	translator := NewSSETranslator("anthropic-messages", "openai-responses")
+	var out []SSEEvent
+	for _, event := range eventsFromRaw(t, raw) {
+		translated, err := translator.Translate(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, translated...)
+	}
+	out = append(out, translator.Finish()...)
+	last := out[len(out)-1]
+	if !strings.Contains(last.Data, "response.completed") {
+		t.Fatalf("unterminated stream must end with response.completed, got %s", EncodeSSE(out))
+	}
+	for _, event := range out {
+		if event.Data == "[DONE]" {
+			t.Fatal("[DONE] leaked into a Responses stream")
+		}
+	}
+}
+
+// TestResponsesFunctionCallForwarding: Anthropic tool_use blocks become
+// function_call items with argument deltas and terminal done events.
+func TestResponsesFunctionCallForwarding(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ping\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-responses")
+	var types []string
+	for _, event := range translated {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatal(err)
+		}
+		types = append(types, payload["type"].(string))
+	}
+	joined := strings.Join(types, ",")
+	for _, needed := range []string{"response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.completed"} {
+		if !strings.Contains(joined, needed) {
+			t.Fatalf("missing %s in sequence=%v", needed, types)
+		}
+	}
+	// The completed response carries the assembled function call item.
+	var completed map[string]any
+	if err := json.Unmarshal([]byte(translated[len(translated)-1].Data), &completed); err != nil {
+		t.Fatal(err)
+	}
+	output := completed["response"].(map[string]any)["output"].([]any)
+	var callItem map[string]any
+	for _, raw := range output {
+		if item, ok := raw.(map[string]any); ok && item["type"] == "function_call" {
+			callItem = item
+		}
+	}
+	if callItem == nil {
+		t.Fatalf("completed output has no function_call item: %#v", output)
+	}
+	if callItem["name"] != "ping" || callItem["arguments"] != `{"a":1}` || callItem["call_id"] != "toolu_1" {
+		t.Fatalf("function_call item=%#v", callItem)
+	}
+}
+
+func eventsFromRaw(t *testing.T, raw string) []SSEEvent {
+	t.Helper()
+	events, err := ParseSSE(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
 }

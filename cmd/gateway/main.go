@@ -113,6 +113,19 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 		return err
 	}
 	defer storeDB.Close()
+	// A CLI activation saved while the management plane was down was stored
+	// "for next startup"; honour it instead of silently reverting to the
+	// on-disk config file.
+	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 {
+		if activeCfg, parseErr := config.Parse(active.YAML); parseErr == nil {
+			if activeSnapshot, snapErr := config.NewSnapshot(activeCfg, "store:"+active.ID); snapErr == nil {
+				snapshot = activeSnapshot
+				slog.Info("restored configuration saved by a previous activation", "id", active.ID, "created_by", active.CreatedBy)
+			}
+		} else {
+			slog.Warn("stored active configuration no longer parses; using the config file", "id", active.ID, "error", parseErr)
+		}
+	}
 	applyLogLevel(snapshot.Config.Observability.LogLevel)
 	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", snapshot.ID)
 	if err := storeDB.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: "startup", Active: true, SHA256: snapshot.Hash, YAML: data}); err != nil {

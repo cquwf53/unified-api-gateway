@@ -207,6 +207,20 @@ func (b *breaker) allow(now time.Time) bool {
 	}
 }
 
+// releaseProbe frees a half-open probe that was granted but never reached
+// the upstream, so the next request can retry the probe instead of the
+// breaker wedging in half-open with no in-flight probe.
+func (b *breaker) releaseProbe() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == breakerHalfOpen {
+		b.probing = false
+	}
+}
+
 func (b *breaker) recordSuccess() {
 	if b == nil {
 		return
@@ -296,17 +310,22 @@ func (rt *profileRuntime) beginPolicy(ctx context.Context, method string, header
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
 	}
 	if rt.bucket != nil && !rt.bucket.allow(now) {
+		// The breaker may have consumed its single half-open probe above;
+		// leaving it held would wedge the breaker behind a rate rejection.
+		rt.breaker.releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
 	}
 	if rt.sem != nil {
 		select {
 		case rt.sem <- struct{}{}:
 		default:
+			rt.breaker.releaseProbe()
 			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_limit", retryAfter: time.Second}
 		}
 		select {
 		case <-ctx.Done():
 			<-rt.sem
+			rt.breaker.releaseProbe()
 			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_wait_canceled", retryAfter: 0}
 		default:
 		}

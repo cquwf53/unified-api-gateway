@@ -511,7 +511,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "live" && wantsStreamFromEnvelope(prepared) && canDirectStream(*profile) {
 		status, headersSent, streamErr := s.streamUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
-		recordStreamResult(rt, headersSent, streamErr)
+		recordStreamResult(rt, headersSent, status, streamErr)
 		if streamErr != nil && !headersSent {
 			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
 		}
@@ -524,7 +524,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// stream_safe: false opts out (the response is then buffered and
 		// converted as a whole).
 		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
-		recordStreamResult(rt, headersSent, streamErr)
+		recordStreamResult(rt, headersSent, status, streamErr)
 		if streamErr != nil && !headersSent {
 			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
 		}
@@ -592,13 +592,14 @@ func streamErrorStage(headersSent bool, err error) string {
 
 // recordStreamResult feeds stream outcomes into the circuit breaker. A
 // client-side write failure after headers were sent is not the upstream's
-// fault and must not trip the breaker.
-func recordStreamResult(rt *profileRuntime, headersSent bool, err error) {
+// fault, and an upstream 5xx status must count as a failure even though the
+// bytes were forwarded without error.
+func recordStreamResult(rt *profileRuntime, headersSent bool, status int, err error) {
 	if rt == nil {
 		return
 	}
 	if err == nil {
-		rt.recordUpstreamResult(true)
+		rt.recordUpstreamResult(status < 500)
 		return
 	}
 	if !headersSent || upstreamCode(err) != "client_stream_write_failed" {
@@ -1523,6 +1524,11 @@ func filteredRequestHeaders(in http.Header) http.Header {
 	out := make(http.Header)
 	for key, values := range in {
 		if isHopByHopHeader(key) || strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "X-API-Key") || strings.EqualFold(key, "Host") {
+			continue
+		}
+		// Session cookies and the gateway's own admin credential never
+		// belong on an upstream request.
+		if strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "X-Admin-Token") {
 			continue
 		}
 		// Sec-WebSocket-* headers describe the client's upgrade handshake;

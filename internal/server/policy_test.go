@@ -310,3 +310,41 @@ defaults:
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestBreakerProbeNotWedgedByRateLimit: when the half-open probe is granted
+// but a later admission check rejects, the probe must be released so the
+// breaker does not stick open forever.
+func TestBreakerProbeNotWedgedByRateLimit(t *testing.T) {
+	breaker := newBreaker(breakerConfig{failureThreshold: 1, resetTimeout: time.Millisecond})
+	breaker.recordFailure(time.Now())
+	time.Sleep(5 * time.Millisecond) // half-open window elapses
+	now := time.Now()
+	if !breaker.allow(now) {
+		t.Fatal("half-open probe should be granted")
+	}
+	breaker.releaseProbe()
+	if !breaker.allow(now) {
+		t.Fatal("released probe must be re-grantable")
+	}
+}
+
+// TestStreamUpstreamErrorCountsAsBreakerFailure pins that a forwarded 5xx
+// stream status is a breaker failure, not a success.
+func TestStreamUpstreamErrorCountsAsBreakerFailure(t *testing.T) {
+	rt := &profileRuntime{policy: defaultPolicySet()}
+	recordStreamResult(rt, true, http.StatusInternalServerError, nil)
+	if rt.breaker != nil {
+		t.Fatal("no breaker configured; setup error")
+	}
+	// Give the runtime a real breaker and repeat.
+	rt.breaker = newBreaker(breakerConfig{failureThreshold: 1})
+	recordStreamResult(rt, true, http.StatusInternalServerError, nil)
+	if rt.breaker.state != breakerOpen {
+		t.Fatalf("5xx stream must trip the breaker, state=%d", rt.breaker.state)
+	}
+	rt2 := &profileRuntime{breaker: newBreaker(breakerConfig{failureThreshold: 1})}
+	recordStreamResult(rt2, true, http.StatusOK, nil)
+	if rt2.breaker.state != breakerClosed || rt2.breaker.failures != 0 {
+		t.Fatalf("2xx stream must be a clean success, state=%d failures=%d", rt2.breaker.state, rt2.breaker.failures)
+	}
+}

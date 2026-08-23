@@ -72,10 +72,15 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, (16<<20)+1))
 	if err != nil {
 		status, stage, code = http.StatusBadRequest, "grpc", "body_read_failed"
 		s.writeError(w, status, stage, code, err.Error(), "")
+		return
+	}
+	if len(body) > 16<<20 {
+		status, stage, code = http.StatusRequestEntityTooLarge, "grpc", "body_too_large"
+		s.writeError(w, status, stage, code, "gRPC message exceeds the 16 MiB limit", "")
 		return
 	}
 	base, err := url.Parse(upstream.EffectiveURL())
@@ -98,9 +103,7 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Header = filteredRequestHeaders(r.Header)
-	for key, value := range upstream.Headers {
-		request.Header.Set(key, resolveSecretValue(value))
-	}
+	applyUpstreamAuth(request.Header, snapshot.Config, upstream)
 	response, err := s.upstreamClient(upstream, false).Do(request)
 	if err != nil {
 		rt.recordUpstreamResult(false)
@@ -109,11 +112,17 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, (16<<20)+1))
 	if err != nil {
 		rt.recordUpstreamResult(false)
 		status, stage, code = http.StatusBadGateway, "grpc", "response_read_failed"
 		s.writeError(w, status, stage, code, err.Error(), "")
+		return
+	}
+	if len(responseBody) > 16<<20 {
+		rt.recordUpstreamResult(false)
+		status, stage, code = http.StatusBadGateway, "grpc", "response_too_large"
+		s.writeError(w, status, stage, code, "upstream gRPC message exceeds the 16 MiB limit", "")
 		return
 	}
 	rt.recordUpstreamResult(response.StatusCode < 500)

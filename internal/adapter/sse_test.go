@@ -115,7 +115,7 @@ func TestTranslateOpenAIToAnthropicProducesValidEventSequence(t *testing.T) {
 	if err := json.Unmarshal([]byte(translated[8].Data), &finish); err != nil {
 		t.Fatal(err)
 	}
-	if finish["delta"].(map[string]any)["stop_reason"] != "tool_calls" {
+	if finish["delta"].(map[string]any)["stop_reason"] != "tool_use" {
 		t.Fatalf("finish=%#v", finish)
 	}
 	var usageEvent map[string]any
@@ -237,4 +237,66 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestThinkingBecomesReasoningContentWithoutEmptyFrames(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-chat")
+	sawReasoning, emptyFrames := false, 0
+	for _, event := range translated {
+		if event.Data == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
+			t.Fatal(err)
+		}
+		choice := chunk["choices"].([]any)[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if delta["reasoning_content"] == "hmm" {
+			sawReasoning = true
+		}
+		if len(delta) == 0 && choice["finish_reason"] == nil {
+			emptyFrames++
+		}
+	}
+	if !sawReasoning {
+		t.Fatal("thinking content was dropped")
+	}
+	if emptyFrames != 0 {
+		t.Fatalf("signature/unknown deltas must not produce empty frames, got %d", emptyFrames)
+	}
+}
+
+func TestLateArgumentsForClosedToolBlockAreDropped(t *testing.T) {
+	// Open tool 0, open tool 1 (closing 0), then a late delta for tool 0:
+	// writing into the closed block would emit an invalid sequence.
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"a\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"b\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"late\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	translated := mustTranslate(t, raw, "openai-chat", "anthropic-messages")
+	for _, event := range translated {
+		if !strings.Contains(event.Data, "content_block_delta") {
+			continue
+		}
+		if strings.Contains(event.Data, "late") {
+			t.Fatal("arguments for a closed block leaked into the stream")
+		}
+	}
+	// Both tool blocks still get explicit stops.
+	stops := 0
+	for _, event := range translated {
+		if strings.Contains(event.Data, "content_block_stop") {
+			stops++
+		}
+	}
+	if stops != 2 {
+		t.Fatalf("expected stops for both tool blocks, got %d: %s", stops, EncodeSSE(translated))
+	}
 }

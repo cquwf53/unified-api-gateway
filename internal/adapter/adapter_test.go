@@ -212,3 +212,54 @@ func TestToolChoiceShapeConversion(t *testing.T) {
 		t.Fatalf("tool_choice=%#v, want \"required\"", body["tool_choice"])
 	}
 }
+
+func TestDataURIImageBecomesBase64Source(t *testing.T) {
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"claude","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}},{"type":"text","text":"what is this"}]}]}`)}
+	output, err := (OpenAIChatToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	content := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	image := content[0].(map[string]any)
+	source := image["source"].(map[string]any)
+	if source["type"] != "base64" || source["media_type"] != "image/png" || source["data"] != "aGVsbG8=" {
+		t.Fatalf("source=%#v", source)
+	}
+	// http(s) URLs keep the url form.
+	input.Body = []byte(`{"model":"claude","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/cat.png"}}]}]}`)
+	output, err = (OpenAIChatToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	content = body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	source = content[0].(map[string]any)["source"].(map[string]any)
+	if source["type"] != "url" || source["url"] != "https://example.test/cat.png" {
+		t.Fatalf("source=%#v", source)
+	}
+}
+
+func TestParallelToolCallsFlagMapped(t *testing.T) {
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"claude","max_tokens":8,"parallel_tool_calls":false,"tool_choice":"auto","messages":[{"role":"user","content":"hi"}]}`)}
+	output, err := (OpenAIChatToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	choice, ok := body["tool_choice"].(map[string]any)
+	if !ok || choice["type"] != "auto" || choice["disable_parallel_tool_use"] != true {
+		t.Fatalf("tool_choice=%#v", body["tool_choice"])
+	}
+	if _, leaked := body["parallel_tool_calls"]; leaked {
+		t.Fatal("parallel_tool_calls must not be forwarded to Anthropic")
+	}
+}

@@ -79,6 +79,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		s.writeError(w, status, "adapter", "websocket_adapter_required", "message-level WebSocket transforms require a dedicated adapter", requestID)
 		return
 	}
+	// Reject cross-site browser upgrades before touching the upstream; the
+	// gorilla upgrader's own check would only run after a successful dial.
+	if !sameOrigin(r.Header.Get("Origin"), r.Host) {
+		status = http.StatusForbidden
+		s.writeError(w, status, "auth", "origin_rejected", "cross-origin WebSocket upgrades are not allowed", requestID)
+		return
+	}
 	upstream, ok := cfg.Upstreams[profile.Upstream]
 	if !ok {
 		status = http.StatusBadGateway
@@ -113,9 +120,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	base.Path = joinURLPath(base.Path, r.URL.Path)
 	base.RawQuery = r.URL.RawQuery
 	requestHeaders := filteredRequestHeaders(r.Header)
-	for key, value := range upstream.Headers {
-		requestHeaders.Set(key, resolveSecretValue(value))
-	}
+	applyUpstreamAuth(requestHeaders, cfg, upstream)
 	requestHeaders.Set("X-Gateway-Request-Id", requestID)
 	dialer := websocket.Dialer{Subprotocols: requestedSubprotocols(r.Header)}
 	upstreamConn, upstreamResponse, err := dialer.DialContext(r.Context(), base.String(), requestHeaders)

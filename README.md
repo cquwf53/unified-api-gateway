@@ -338,6 +338,24 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
   审计的插件接口；
 - 只代理用户有权访问的服务，不用于绕过供应商限制或伪造官方客户端身份。
 
+## 已知限制
+
+当前实现明确不做（或只做有限支持）的事情：
+
+- **replay 无租户隔离**：录制按 profile + method + path + body 摘要索引，不同
+  client/tenant/config 版本共享同一录制库；
+- **热激活非原子**：`activate` 先写 SQLite 再切换内存快照，两步之间崩溃会留下
+  active 标记与实际内存状态不一致（重启时以 SQLite active 为准恢复）；
+- **交错并行工具流**：Anthropic 的顺序块格式无法表达 OpenAI 流中交错的
+  tool_calls 参数增量，已闭合块的迟到增量会被丢弃（官方 API 的并行工具调用是
+  顺序输出的，不受影响）；
+- **WebSocket 帧无大小上限与空闲 deadline**：依赖操作层保护；
+- **readyz 只检查配置已加载**，不做上游探活；
+- `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
+- `transforms` 具名引用存在性、credential 引用可达性等语义校验由
+  `Validate` 的引用检查部分覆盖，route 冲突（同优先级同匹配）只告警不拒绝；
+- 客户端鉴权在未配置任何可解析密钥时保持关闭（fail-open），见上文安全边界。
+
 ## 项目布局
 
 ```text

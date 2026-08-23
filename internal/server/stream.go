@@ -36,20 +36,7 @@ func buildUpstreamRequest(ctx context.Context, cfg *config.Config, upstream conf
 		return nil, err
 	}
 	request.Header = filteredRequestHeaders(in.Headers)
-	for key, value := range upstream.Headers {
-		request.Header.Set(key, resolveSecretValue(value))
-	}
-	if upstream.AuthRef != "" {
-		if credential, ok := cfg.Credentials[upstream.AuthRef]; ok {
-			if value := resolveCredential(credential); value != "" {
-				if strings.EqualFold(credential.Type, "api_key") {
-					request.Header.Set("X-API-Key", value)
-				} else {
-					request.Header.Set("Authorization", "Bearer "+value)
-				}
-			}
-		}
-	}
+	applyUpstreamAuth(request.Header, cfg, upstream)
 	request.Header.Set("X-Gateway-Request-Id", requestID)
 	if len(in.Body) > 0 {
 		request.ContentLength = int64(len(in.Body))
@@ -216,6 +203,29 @@ func readUpstreamResponse(profile config.Profile, response *http.Response) (tran
 		StatusCode:  response.StatusCode,
 		ContentType: response.Header.Get("Content-Type"),
 	}, nil
+}
+
+// applyUpstreamAuth stamps an outbound request with the upstream's static
+// headers and credential. It is shared by the HTTP, WebSocket and gRPC
+// planes so none of them can forget the auth injection.
+func applyUpstreamAuth(header http.Header, cfg *config.Config, upstream config.Upstream) {
+	for key, value := range upstream.Headers {
+		header.Set(key, resolveSecretValue(value))
+	}
+	if upstream.AuthRef == "" {
+		return
+	}
+	credential, ok := cfg.Credentials[upstream.AuthRef]
+	if !ok {
+		return
+	}
+	if value := resolveCredential(credential); value != "" {
+		if strings.EqualFold(credential.Type, "api_key") {
+			header.Set("X-API-Key", value)
+		} else {
+			header.Set("Authorization", "Bearer "+value)
+		}
+	}
 }
 
 func copyResponseHeaders(w http.ResponseWriter, headers http.Header) {

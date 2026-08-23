@@ -20,9 +20,13 @@ type SSEEvent struct {
 	Retry string
 }
 
-// maxSSELine bounds a single SSE line so a hostile or corrupted upstream
-// cannot make the gateway accumulate memory without limit.
-const maxSSELine = 4 << 20
+// maxSSELine bounds a single SSE line and maxSSEEvent the total data one
+// event may accumulate across its data: lines, so a hostile or corrupted
+// upstream cannot make the gateway buffer without limit.
+const (
+	maxSSELine  = 4 << 20
+	maxSSEEvent = 16 << 20
+)
 
 // ReadSSEStream parses events as they arrive and hands each completed event to
 // emit. It returns as soon as emit fails, which lets callers translate and
@@ -31,6 +35,7 @@ func ReadSSEStream(r io.Reader, emit func(SSEEvent) error) error {
 	reader := bufio.NewReaderSize(r, 32<<10)
 	var id, event, retry string
 	var data []string
+	dataBytes := 0
 	flush := func() error {
 		if id == "" && event == "" && retry == "" && len(data) == 0 {
 			return nil
@@ -62,6 +67,10 @@ func ReadSSEStream(r io.Reader, emit func(SSEEvent) error) error {
 			case "event":
 				event = value
 			case "data":
+				dataBytes += len(value)
+				if dataBytes > maxSSEEvent {
+					return errors.New("sse: event exceeds maximum accumulated size")
+				}
 				data = append(data, value)
 			case "retry":
 				retry = value
@@ -154,6 +163,12 @@ type SSETranslator struct {
 	respText      strings.Builder
 	respStop      string
 	respSeq       int
+	// respToolItems holds the function_call output items assembled from
+	// Anthropic tool_use blocks, in output order.
+	respToolItems []map[string]any
+	// toolCallByItem maps Responses function-call item ids onto OpenAI
+	// tool_calls array positions (responses -> anthropic direction).
+	toolCallByItem map[string]int
 }
 
 // respEvent stamps the sequence number every Responses protocol event
@@ -171,7 +186,7 @@ func NewSSETranslator(from, to string) *SSETranslator {
 	return &SSETranslator{
 		from: strings.ToLower(from), to: strings.ToLower(to),
 		blockByTool: map[int]int{}, toolCallIndexByBlock: map[int]int{},
-		nextBlock: -1, createdUnix: time.Now().Unix(),
+		toolCallByItem: map[string]int{}, nextBlock: -1, createdUnix: time.Now().Unix(),
 	}
 }
 
@@ -260,16 +275,16 @@ func (t *SSETranslator) Finish() []SSEEvent {
 	if t.from == t.to || t.from == "" || t.to == "" || t.doneSent {
 		return nil
 	}
+	if strings.Contains(t.to, "responses") {
+		t.doneSent = true
+		return t.responsesTerminal()
+	}
 	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "openai") {
 		t.doneSent = true
 		return []SSEEvent{{Data: "[DONE]"}}
 	}
 	if strings.Contains(t.from, "openai") && strings.Contains(t.to, "anthropic") {
 		return t.translateDone()
-	}
-	if strings.Contains(t.to, "responses") {
-		t.doneSent = true
-		return t.responsesTerminal()
 	}
 	return nil
 }
@@ -290,7 +305,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 	case "message_start":
 		if message, ok := payload["message"].(map[string]any); ok {
 			if id := asString(message["id"]); id != "" {
-				t.respID = id
+				t.respID = responsesResponseID(id)
 			}
 			if model := asString(message["model"]); model != "" {
 				t.respModel = model
@@ -315,8 +330,32 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			}),
 		}
+	case "content_block_start":
+		block, _ := payload["content_block"].(map[string]any)
+		if block == nil || asString(block["type"]) != "tool_use" {
+			return nil // text framing was already emitted in the prologue
+		}
+		callID := asString(block["id"])
+		itemID := "fc_" + callID
+		item := map[string]any{
+			"id": itemID, "call_id": callID, "type": "function_call",
+			"name": block["name"], "arguments": "", "status": "in_progress",
+		}
+		t.respToolItems = append(t.respToolItems, item)
+		outputIndex := len(t.respToolItems) // message item occupies index 0
+		return []SSEEvent{t.respEvent("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": outputIndex, "item": item,
+		})}
 	case "content_block_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
+			if asString(d["type"]) == "input_json_delta" && len(t.respToolItems) > 0 {
+				item := t.respToolItems[len(t.respToolItems)-1]
+				item["arguments"] = asString(item["arguments"]) + asString(d["partial_json"])
+				return []SSEEvent{t.respEvent("response.function_call_arguments.delta", map[string]any{
+					"type": "response.function_call_arguments.delta", "item_id": item["id"],
+					"output_index": len(t.respToolItems), "delta": asString(d["partial_json"]),
+				})}
+			}
 			if text := asString(d["text"]); text != "" {
 				t.respText.WriteString(text)
 				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
@@ -360,6 +399,15 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 // responsesItemID is the stable identifier linking output_item events with
 // their content parts and text deltas.
 const responsesItemID = "msg_0"
+
+// responsesResponseID rebrands Anthropic message ids (msg_*) as Responses
+// ids so clients see their own vocabulary.
+func responsesResponseID(id string) string {
+	if strings.HasPrefix(id, "msg_") {
+		return "resp_" + strings.TrimPrefix(id, "msg_")
+	}
+	return id
+}
 
 // responsesMessageItem builds the message output item for item.added/done and
 // the completed response's output array.
@@ -420,21 +468,37 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		response["usage"] = usage
 	}
 	item := t.responsesMessageItem("completed")
-	response["output"] = []any{item}
-	return []SSEEvent{
-		t.respEvent("response.output_text.done", map[string]any{
-			"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
-			"text": t.respText.String(),
-		}),
-		t.respEvent("response.content_part.done", map[string]any{
-			"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
-			"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
-		}),
-		t.respEvent("response.output_item.done", map[string]any{
-			"type": "response.output_item.done", "output_index": 0, "item": item,
-		}),
-		t.respEvent(finalEvent, map[string]any{"type": finalEvent, "response": response}),
+	output := []any{item}
+	var events []SSEEvent
+	if t.respText.String() != "" || len(t.respToolItems) == 0 {
+		events = append(events,
+			t.respEvent("response.output_text.done", map[string]any{
+				"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+				"text": t.respText.String(),
+			}),
+			t.respEvent("response.content_part.done", map[string]any{
+				"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+				"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
+			}))
 	}
+	events = append(events, t.respEvent("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": 0, "item": item,
+	}))
+	for index, toolItem := range t.respToolItems {
+		toolItem["status"] = "completed"
+		events = append(events,
+			t.respEvent("response.function_call_arguments.done", map[string]any{
+				"type": "response.function_call_arguments.done", "item_id": toolItem["id"],
+				"output_index": index + 1, "arguments": toolItem["arguments"],
+			}),
+			t.respEvent("response.output_item.done", map[string]any{
+				"type": "response.output_item.done", "output_index": index + 1, "item": toolItem,
+			}))
+		output = append(output, toolItem)
+	}
+	response["output"] = output
+	events = append(events, t.respEvent(finalEvent, map[string]any{"type": finalEvent, "response": response}))
+	return events
 }
 
 // responsesToAnthropic converts a Responses stream into Anthropic events by
@@ -451,6 +515,35 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}}}
 	case "response.output_text.delta":
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"content": payload["delta"]}}}
+	case "response.output_item.added":
+		item, _ := payload["item"].(map[string]any)
+		if item == nil || asString(item["type"]) != "function_call" {
+			return nil
+		}
+		callID := asString(item["call_id"])
+		if callID == "" {
+			callID = asString(item["id"])
+		}
+		position := len(t.toolCallByItem)
+		t.toolCallByItem[asString(item["id"])] = position
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
+			"index": position, "id": callID, "type": "function",
+			"function": map[string]any{"name": item["name"], "arguments": ""},
+		}}}}}
+	case "response.function_call_arguments.delta":
+		position, known := t.toolCallByItem[asString(payload["item_id"])]
+		if !known {
+			return nil
+		}
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
+			"index": position, "function": map[string]any{"arguments": payload["delta"]},
+		}}}}}
+	case "response.function_call_arguments.done":
+		return nil // arguments were accumulated delta by delta
+	case "response.incomplete":
+		t.doneSent = true
+		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "length"}}}),
+			sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	case "response.completed":
 		if response, ok := payload["response"].(map[string]any); ok {
 			if usage, ok := response["usage"].(map[string]any); ok {
@@ -459,15 +552,23 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 		}
 		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}),
 			t.openAIEventToAnthropic(SSEEvent{Data: ""}, chunk)...)
-	case "response.failed":
+	case "response.failed", "error":
 		message := "upstream request failed"
-		if response, ok := payload["response"].(map[string]any); ok {
+		if errPayload, ok := payload["error"].(map[string]any); ok {
+			if text := asString(errPayload["message"]); text != "" {
+				message = text
+			}
+		} else if response, ok := payload["response"].(map[string]any); ok {
 			if errPayload, ok := response["error"].(map[string]any); ok {
 				if text := asString(errPayload["message"]); text != "" {
 					message = text
 				}
 			}
 		}
+		// Mark the stream terminated so Finish() cannot append a normal
+		// message_stop after the error.
+		t.doneSent = true
+		t.finishSent = true
 		return []SSEEvent{sseEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": "upstream_error", "message": message}})}
 	default:
 		return nil
@@ -545,6 +646,15 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 	return out
 }
 
+func blockIsOpen(open []int, block int) bool {
+	for _, candidate := range open {
+		if candidate == block {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *SSETranslator) translateToolCallDeltas(calls []any) []SSEEvent {
 	var out []SSEEvent
 	for _, raw := range calls {
@@ -558,6 +668,12 @@ func (t *SSETranslator) translateToolCallDeltas(calls []any) []SSEEvent {
 		}
 		fn, _ := call["function"].(map[string]any)
 		block, seen := t.blockByTool[index]
+		if seen && !blockIsOpen(t.openToolBlocks, block) {
+			// Interleaved parallel-tool streams can deliver late argument
+			// deltas for a block Anthropic's sequential format already
+			// closed; writing into it would produce an invalid sequence.
+			continue
+		}
 		if !seen {
 			t.nextBlock++
 			block = t.nextBlock
@@ -662,7 +778,7 @@ func mapFinishReason(reason string) string {
 	case "content_filter":
 		return "refusal"
 	case "tool_calls":
-		return "tool_calls"
+		return "tool_use" // Anthropic's stop_reason vocabulary
 	default:
 		return reason
 	}
@@ -825,10 +941,12 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 		}}
 	case "content_block_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
-			if text := asString(d["text"]); text != "" {
-				delta["content"] = text
-			}
-			if d["type"] == "input_json_delta" {
+			switch asString(d["type"]) {
+			case "text_delta":
+				if text := asString(d["text"]); text != "" {
+					delta["content"] = text
+				}
+			case "input_json_delta":
 				blockIndex := 0
 				if n, ok := numberValueOK(payload["index"]); ok {
 					blockIndex = int(n)
@@ -837,7 +955,19 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 				delta["tool_calls"] = []any{map[string]any{
 					"index": toolPosition, "function": map[string]any{"arguments": asString(d["partial_json"])},
 				}}
+			case "thinking_delta":
+				// Extended thinking has no official Chat Completions field;
+				// reasoning_content is the de-facto standard (DeepSeek,
+				// Cherry Studio, OpenWebUI, LiteLLM all render it).
+				if text := asString(d["thinking"]); text != "" {
+					delta["reasoning_content"] = text
+				}
 			}
+		}
+		if len(delta) == 0 && choice["finish_reason"] == nil {
+			// Unhandled block types (signature deltas, redacted thinking)
+			// must not become empty frames.
+			return SSEEvent{}, nil
 		}
 	case "message_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {

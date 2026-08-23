@@ -43,6 +43,15 @@ func (OpenAIChatToAnthropic) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 			out["tool_choice"] = converted
 		}
 	}
+	// OpenAI expresses the no-parallel-tools constraint as a sibling flag;
+	// Anthropic carries it inside tool_choice.
+	if parallel, ok := body["parallel_tool_calls"].(bool); ok && !parallel {
+		if choice, ok := out["tool_choice"].(map[string]any); ok {
+			choice["disable_parallel_tool_use"] = true
+		} else {
+			out["tool_choice"] = map[string]any{"type": "auto", "disable_parallel_tool_use": true}
+		}
+	}
 	if stop, ok := body["stop"]; ok {
 		out["stop_sequences"] = normalizeStop(stop)
 	}
@@ -157,6 +166,7 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	message := map[string]any{"role": "assistant", "content": ""}
 	if content, ok := body["content"].([]any); ok {
 		var text strings.Builder
+		var reasoning strings.Builder
 		var toolCalls []any
 		for _, raw := range content {
 			part, ok := raw.(map[string]any)
@@ -166,6 +176,8 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 			switch part["type"] {
 			case "text":
 				text.WriteString(asString(part["text"]))
+			case "thinking", "redacted_thinking":
+				reasoning.WriteString(asString(part["thinking"]))
 			case "tool_use":
 				args, _ := json.Marshal(part["input"])
 				toolCalls = append(toolCalls, map[string]any{
@@ -179,6 +191,9 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 			}
 		}
 		message["content"] = text.String()
+		if reasoning.Len() > 0 {
+			message["reasoning_content"] = reasoning.String()
+		}
 		if len(toolCalls) > 0 {
 			message["tool_calls"] = toolCalls
 			choice["finish_reason"] = "tool_calls"
@@ -230,7 +245,13 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 		}
 	}
 	if choice, ok := body["tool_choice"]; ok {
-		if converted := toolChoiceToOpenAI(choice); converted != nil {
+		converted := toolChoiceToOpenAI(choice)
+		if anthropicChoice, ok := choice.(map[string]any); ok {
+			if disable, ok := anthropicChoice["disable_parallel_tool_use"].(bool); ok {
+				out["parallel_tool_calls"] = !disable
+			}
+		}
+		if converted != nil {
 			out["tool_choice"] = converted
 		}
 	}
@@ -494,7 +515,7 @@ func convertOpenAIContent(value any, role string) any {
 			result = append(result, map[string]any{"type": "text", "text": part["text"]})
 		case "image_url":
 			image, _ := part["image_url"].(map[string]any)
-			result = append(result, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": image["url"]}})
+			result = append(result, map[string]any{"type": "image", "source": anthropicImageSource(asString(image["url"]))})
 		default:
 			if text := asString(part["text"]); text != "" {
 				result = append(result, map[string]any{"type": "text", "text": text})
@@ -541,6 +562,36 @@ func normalizeStop(value any) any {
 		return []any{text}
 	}
 	return value
+}
+
+// anthropicImageSource converts an OpenAI image_url into an Anthropic image
+// source. data: URIs (the dominant path: every SDK uploading a local file
+// produces one) must become base64 sources - Anthropic rejects a data: URI
+// in url form with a 400.
+func anthropicImageSource(url string) map[string]any {
+	if !strings.HasPrefix(url, "data:") {
+		return map[string]any{"type": "url", "url": url}
+	}
+	// data:<media_type>[;base64],<data>
+	rest := strings.TrimPrefix(url, "data:")
+	header, data, found := strings.Cut(rest, ",")
+	if !found {
+		return map[string]any{"type": "url", "url": url}
+	}
+	mediaType := header
+	base64Encoded := strings.Contains(header, ";base64")
+	if base64Encoded {
+		mediaType = strings.TrimSuffix(header, ";base64")
+	}
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	if !base64Encoded {
+		// Non-base64 data URIs cannot be represented; forward as a url
+		// source and let the upstream reject it loudly.
+		return map[string]any{"type": "url", "url": url}
+	}
+	return map[string]any{"type": "base64", "media_type": mediaType, "data": data}
 }
 
 // toolChoiceToAnthropic maps the OpenAI/Responses tool_choice vocabulary
