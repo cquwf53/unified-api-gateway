@@ -145,6 +145,9 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	if out["created"] == nil {
 		out["created"] = time.Now().Unix()
 	}
+	if out["model"] == nil {
+		out["model"] = "gateway"
+	}
 	choice := map[string]any{"index": 0, "finish_reason": openAIFinishReason(asString(body["stop_reason"]))}
 	message := map[string]any{"role": "assistant", "content": ""}
 	if content, ok := body["content"].([]any); ok {
@@ -260,11 +263,15 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	if err != nil {
 		return Envelope{}, err
 	}
+	model := body["model"]
+	if model == nil {
+		model = "gateway"
+	}
 	out := map[string]any{
 		"id":    anthropicMessageID(asString(body["id"])),
 		"type":  "message",
 		"role":  "assistant",
-		"model": body["model"],
+		"model": model,
 	}
 	content := []any{}
 	stopReason := "end_turn"
@@ -398,11 +405,15 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 		}
 	}
 	result := chat.Clone()
+	responseModel := body["model"]
+	if responseModel == nil {
+		responseModel = "gateway"
+	}
 	result.Body, _ = json.Marshal(map[string]any{
 		"id":     body["id"],
 		"object": "response",
 		"status": "completed",
-		"model":  body["model"],
+		"model":  responseModel,
 		"output": []any{map[string]any{
 			"type": "message", "role": "assistant",
 			"content": []any{map[string]any{"type": "output_text", "text": text}},

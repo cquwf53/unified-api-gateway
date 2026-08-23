@@ -25,6 +25,16 @@ import (
 
 const CurrentVersion = 1
 
+// KnownAdapters lists the built-in adapter names accepted by profile.adapter.
+// The adapter package's registry must stay in sync; a test in that package
+// guards the mapping (config cannot import adapter without a cycle).
+var KnownAdapters = map[string]bool{
+	"transparent":                   true,
+	"openai-chat-to-anthropic":      true,
+	"anthropic-to-openai-chat":      true,
+	"openai-responses-to-anthropic": true,
+}
+
 // Config is the complete user-facing gateway configuration.
 type Config struct {
 	Version         int                                `yaml:"version,omitempty" json:"version"`
@@ -503,6 +513,12 @@ func (c *Config) Validate() error {
 		if p.Name != "" {
 			name = p.Name
 		}
+		// Reject unknown adapter names at load time: a typo here would
+		// otherwise pass every precheck and turn into runtime 422s for the
+		// whole profile the moment it is activated.
+		if adapterName := strings.ToLower(strings.TrimSpace(p.Adapter)); adapterName != "" && !KnownAdapters[adapterName] {
+			errs = append(errs, fmt.Sprintf("profile %q: unknown adapter %q (known: %s)", name, p.Adapter, strings.Join(sortedAdapterNames(), ", ")))
+		}
 		mode := strings.ToLower(strings.TrimSpace(p.TrafficMode))
 		if mode == "" {
 			mode = "live"
@@ -683,6 +699,15 @@ func allowedScheme(s string) bool {
 	default:
 		return false
 	}
+}
+
+func sortedAdapterNames() []string {
+	names := make([]string, 0, len(KnownAdapters))
+	for name := range KnownAdapters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // ProfileNames returns deterministic profile IDs, useful for management APIs.

@@ -244,6 +244,15 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, s.metrics.Prometheus())
 		return
 	case "/v1/models":
+		// The model list enumerates every profile (the values X-Gateway-Profile
+		// accepts), so it must sit behind the same client authentication as
+		// the proxy path.
+		if snapshot := s.Snapshot(); snapshot != nil && snapshot.Config != nil {
+			if requiresClientAuth(snapshot.Config) && s.callClientKey(snapshot.Config, r) == "" {
+				s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required", "")
+				return
+			}
+		}
 		s.handleModels(w, r)
 		return
 	}
@@ -640,6 +649,13 @@ func (s *Server) prepareRequest(ctx context.Context, cfg *config.Config, profile
 
 func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profile config.Profile, in transform.Envelope) (transform.Envelope, error) {
 	response := in
+	if response.StatusCode >= 400 {
+		// An upstream error body is not a protocol response: adapting it
+		// would fabricate an empty "successful" message and destroy the
+		// upstream's diagnosis. Answer with the client contract's error
+		// envelope and keep the upstream words verbatim.
+		return errorEnvelope(profile.ClientContract, response), nil
+	}
 	a, ok := s.registry.Get(profile.Adapter)
 	if !ok {
 		return transform.Envelope{}, fmt.Errorf("unknown adapter %q", profile.Adapter)
@@ -690,6 +706,54 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 		response.Body = adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(response.Body)}, {Data: "[DONE]"}})
 	}
 	return response, nil
+}
+
+// upstreamErrorMessage extracts a human-readable message from common error
+// shapes ({"error":{"message":...}} / {"message":...}) and falls back to the
+// raw body so nothing the upstream said is lost.
+func upstreamErrorMessage(body []byte) string {
+	var shaped struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &shaped) == nil {
+		if shaped.Error != nil && shaped.Error.Message != "" {
+			return shaped.Error.Message
+		}
+		if shaped.Message != "" {
+			return shaped.Message
+		}
+	}
+	if len(body) > 2048 {
+		return string(body[:2048]) + "…"
+	}
+	return string(body)
+}
+
+// errorEnvelope renders an upstream error in the client's protocol shape,
+// preserving the original status code and message.
+func errorEnvelope(clientContract string, response transform.Envelope) transform.Envelope {
+	contract := strings.ToLower(clientContract)
+	contentType := "application/json"
+	message := upstreamErrorMessage(response.Body)
+	var payload []byte
+	switch {
+	case strings.Contains(contract, "anthropic"):
+		payload, _ = json.Marshal(map[string]any{"type": "error", "error": map[string]any{"type": "upstream_error", "message": message}})
+	case strings.Contains(contract, "openai"), strings.Contains(contract, "responses"):
+		payload, _ = json.Marshal(map[string]any{"error": map[string]any{"message": message, "type": "upstream_error", "code": response.StatusCode}})
+	default:
+		// Generic clients receive the upstream bytes unchanged.
+		payload = response.Body
+		contentType = response.ContentType
+	}
+	headers := response.Headers.Clone()
+	if contentType != "" {
+		headers.Set("Content-Type", contentType)
+	}
+	return transform.Envelope{StatusCode: response.StatusCode, Headers: headers, Body: payload, ContentType: contentType}
 }
 
 func (s *Server) applyResponseTransforms(ctx context.Context, cfg *config.Config, profile config.Profile, response transform.Envelope) (transform.Envelope, error) {
@@ -1170,9 +1234,11 @@ func (s *Server) writeDryRunResponse(w http.ResponseWriter, requestID string, pr
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Gateway-Dry-Run", "true")
-		chunk := map[string]any{"id": "dryrun-" + requestID, "object": "chat.completion.chunk", "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": message}, "finish_reason": "stop"}}}
-		b, _ := json.Marshal(chunk)
-		_, _ = w.Write(adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(b)}, {Data: "[DONE]"}}))
+		content := map[string]any{"id": "dryrun-" + requestID, "object": "chat.completion.chunk", "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": message}}}}
+		finish := map[string]any{"id": "dryrun-" + requestID, "object": "chat.completion.chunk", "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+		contentBytes, _ := json.Marshal(content)
+		finishBytes, _ := json.Marshal(finish)
+		_, _ = w.Write(adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(contentBytes)}, {Data: string(finishBytes)}, {Data: "[DONE]"}}))
 		return
 	}
 	var payload any

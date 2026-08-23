@@ -136,6 +136,14 @@ type SSETranslator struct {
 	// while usage totals only arrive with message_delta.
 	promptTokens    float64
 	promptTokensSet bool
+
+	// responses-target state: the Responses stream protocol uses
+	// response.created/delta/completed events and no [DONE] sentinel.
+	respID        string
+	respModel     string
+	respStarted   bool
+	respCompleted bool
+	respUsage     map[string]any
 }
 
 // NewSSETranslator returns a translator between two contract names such as
@@ -157,6 +165,14 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 	if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
 		// A non-JSON event can still be safely forwarded as an opaque frame.
 		return []SSEEvent{event}, nil
+	}
+	// "openai-responses" contains "openai", so responses contracts must be
+	// matched before the generic Chat Completions branches.
+	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "responses") {
+		return t.anthropicToResponses(event, payload), nil
+	}
+	if strings.Contains(t.from, "responses") && strings.Contains(t.to, "anthropic") {
+		return t.responsesToAnthropic(event, payload), nil
 	}
 	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "openai") {
 		out, err := t.anthropicEventToOpenAI(event, payload)
@@ -187,6 +203,10 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 
 func (t *SSETranslator) translateDone() []SSEEvent {
 	t.doneSent = true
+	if strings.Contains(t.to, "responses") {
+		// Responses streams terminate with response.completed, not [DONE].
+		return t.responsesCompleted(nil)
+	}
 	if !strings.Contains(t.from, "openai") || !strings.Contains(t.to, "anthropic") {
 		return []SSEEvent{{Data: "[DONE]"}}
 	}
@@ -211,6 +231,10 @@ func (t *SSETranslator) Finish() []SSEEvent {
 	if strings.Contains(t.from, "openai") && strings.Contains(t.to, "anthropic") {
 		return t.translateDone()
 	}
+	if strings.Contains(t.to, "responses") {
+		t.doneSent = true
+		return t.responsesCompleted(nil)
+	}
 	return nil
 }
 
@@ -219,6 +243,128 @@ func eventType(event SSEEvent, payload map[string]any) string {
 		return event.Event
 	}
 	return asString(payload["type"])
+}
+
+// anthropicToResponses converts Anthropic events into the OpenAI Responses
+// streaming protocol (response.created, response.output_item.added,
+// response.output_text.delta, response.completed).
+func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]any) []SSEEvent {
+	switch eventType(event, payload) {
+	case "message_start":
+		if message, ok := payload["message"].(map[string]any); ok {
+			if id := asString(message["id"]); id != "" {
+				t.respID = id
+			}
+			if model := asString(message["model"]); model != "" {
+				t.respModel = model
+			}
+			if usage, ok := message["usage"].(map[string]any); ok {
+				t.respUsage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"])}
+			}
+		}
+		if t.respStarted {
+			return nil
+		}
+		t.respStarted = true
+		created := sseEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")})
+		added := sseEvent("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": 0,
+			"item": map[string]any{"type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+		})
+		return []SSEEvent{created, added}
+	case "content_block_delta":
+		if d, ok := payload["delta"].(map[string]any); ok {
+			if text := asString(d["text"]); text != "" {
+				return []SSEEvent{sseEvent("response.output_text.delta", map[string]any{
+					"type": "response.output_text.delta", "item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": text,
+				})}
+			}
+		}
+		return nil
+	case "message_delta":
+		if usage, ok := payload["usage"].(map[string]any); ok {
+			// message_start carries the prompt tokens while message_delta
+			// only reports the completion side; merge instead of overwriting.
+			merged := map[string]any{}
+			for key, value := range t.respUsage {
+				merged[key] = value
+			}
+			if n, ok := numberValueOK(usage["input_tokens"]); ok {
+				merged["input_tokens"] = n
+			}
+			if n, ok := numberValueOK(usage["output_tokens"]); ok {
+				merged["output_tokens"] = n
+			}
+			t.respUsage = merged
+		}
+		return nil
+	case "message_stop":
+		t.doneSent = true
+		return t.responsesCompleted(nil)
+	default:
+		return nil
+	}
+}
+
+// responsesResponse builds the response object embedded in Responses events.
+func (t *SSETranslator) responsesResponse(status string) map[string]any {
+	id := t.respID
+	if id == "" {
+		id = "resp-gateway"
+	}
+	model := t.respModel
+	if model == "" {
+		model = "gateway"
+	}
+	return map[string]any{"id": id, "object": "response", "status": status, "model": model}
+}
+
+// responsesCompleted emits the terminal response.completed event (with usage
+// when available). It is idempotent per translator.
+func (t *SSETranslator) responsesCompleted(usage map[string]any) []SSEEvent {
+	if t.respCompleted {
+		return nil
+	}
+	t.respCompleted = true
+	if usage == nil {
+		usage = t.respUsage
+	}
+	response := t.responsesResponse("completed")
+	if usage != nil {
+		total := numberOrZero(usage["input_tokens"]) + numberOrZero(usage["output_tokens"])
+		usage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"]), "total_tokens": total}
+		response["usage"] = usage
+	}
+	response["output"] = []any{map[string]any{"type": "message", "role": "assistant", "status": "completed", "content": []any{}}}
+	return []SSEEvent{sseEvent("response.completed", map[string]any{"type": "response.completed", "response": response})}
+}
+
+// responsesToAnthropic converts a Responses stream into Anthropic events by
+// reshaping each Responses event into a synthetic Chat chunk and reusing the
+// well-tested Chat -> Anthropic state machine.
+func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]any) []SSEEvent {
+	chunk := map[string]any{"choices": []any{}}
+	switch eventType(event, payload) {
+	case "response.created":
+		if response, ok := payload["response"].(map[string]any); ok {
+			chunk["id"] = response["id"]
+			chunk["model"] = response["model"]
+		}
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}}}
+	case "response.output_text.delta":
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"content": payload["delta"]}}}
+	case "response.completed":
+		if response, ok := payload["response"].(map[string]any); ok {
+			if usage, ok := response["usage"].(map[string]any); ok {
+				chunk["usage"] = map[string]any{"prompt_tokens": numberOrZero(usage["input_tokens"]), "completion_tokens": numberOrZero(usage["output_tokens"])}
+			}
+		}
+		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}),
+			t.openAIEventToAnthropic(SSEEvent{Data: ""}, chunk)...)
+	default:
+		return nil
+	}
+	return t.openAIEventToAnthropic(event, chunk)
 }
 
 func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[string]any) []SSEEvent {
@@ -316,7 +462,9 @@ func (t *SSETranslator) ensureStarted(payload map[string]any) []SSEEvent {
 		return nil
 	}
 	t.started = true
-	t.nextBlock = 0
+	// Anthropic block indexes start at 0; openTextBlock/translateToolCallDeltas
+	// increment before use, so the counter starts at -1.
+	t.nextBlock = -1
 	id := t.streamID
 	if id == "" {
 		id = "gateway-stream"

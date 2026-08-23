@@ -215,7 +215,10 @@ dry-run 预览每一阶段的 envelope diff，发布后可通过管理 API 回�
 
 `shadow`、`record`、`replay` 默认要求显式开启，避免意外副作用或重复计费。流式
 响应开始发送后不能改变 HTTP 状态码；上游错误会转换为目标协议的错误事件并关闭
-连接。启用 `record` 时还必须显式设置 `observability.record_body: true`。
+连接。非流式的上游错误（4xx/5xx）不会经过语义适配——网关保留原始状态码和上游
+错误消息，按客户端协议的错误信封（OpenAI `{"error":{...}}` / Anthropic
+`{"type":"error",...}`）返回，不会被伪装成空的"成功"响应。启用 `record` 时还必须
+显式设置 `observability.record_body: true`。
 
 `shadow` 模式可以用 profile 的 `shadow_upstream` 字段指定独立的影子上游；不指定时
 镜像请求会发往主上游（注意双倍计费）。影子上限 64 个并发，超出即丢弃并记录警告，
