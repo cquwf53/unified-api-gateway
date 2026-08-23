@@ -133,9 +133,22 @@ type Profile struct {
 	Response           transform.TransformSpec   `yaml:"response,omitempty" json:"response,omitempty"`
 	RequestTransforms  []transform.TransformSpec `yaml:"request_transforms,omitempty" json:"request_transforms,omitempty"`
 	ResponseTransforms []transform.TransformSpec `yaml:"response_transforms,omitempty" json:"response_transforms,omitempty"`
-	StreamSafe         bool                      `yaml:"stream_safe,omitempty" json:"stream_safe,omitempty"`
-	MaxBodyBytes       int64                     `yaml:"max_body_bytes,omitempty" json:"max_body_bytes,omitempty"`
-	AllowedMethods     []string                  `yaml:"allowed_methods,omitempty" json:"allowed_methods,omitempty"`
+	// StreamSafe is a tri-state switch: nil means "derive from the transform
+	// chain" (profiles without body rules stream frame by frame), while an
+	// explicit true/false always wins.
+	StreamSafe     *bool    `yaml:"stream_safe,omitempty" json:"stream_safe,omitempty"`
+	MaxBodyBytes   int64    `yaml:"max_body_bytes,omitempty" json:"max_body_bytes,omitempty"`
+	AllowedMethods []string `yaml:"allowed_methods,omitempty" json:"allowed_methods,omitempty"`
+}
+
+// IsStreamSafe reports whether this profile may be served with frame-by-frame
+// streaming. An explicit stream_safe wins; otherwise profiles without body
+// rules are streaming-safe by construction.
+func (p Profile) IsStreamSafe() bool {
+	if p.StreamSafe != nil {
+		return *p.StreamSafe
+	}
+	return streamSafeProfile(p)
 }
 
 // AllRequestTransforms returns the compact request spec followed by explicit
@@ -235,12 +248,19 @@ type Limits struct {
 }
 
 type Observability struct {
-	LogLevel        string `yaml:"log_level,omitempty" json:"log_level,omitempty"`
-	Trace           bool   `yaml:"trace,omitempty" json:"trace,omitempty"`
-	Metrics         bool   `yaml:"metrics,omitempty" json:"metrics,omitempty"`
+	LogLevel string `yaml:"log_level,omitempty" json:"log_level,omitempty"`
+	Trace    bool   `yaml:"trace,omitempty" json:"trace,omitempty"`
+	// Metrics gates the /metrics endpoints; nil defaults to enabled.
+	Metrics         *bool  `yaml:"metrics,omitempty" json:"metrics,omitempty"`
 	RecordBody      bool   `yaml:"record_body,omitempty" json:"record_body,omitempty"`
 	RedactPrompts   bool   `yaml:"redact_prompts,omitempty" json:"redact_prompts,omitempty"`
 	RequestIDHeader string `yaml:"request_id_header,omitempty" json:"request_id_header,omitempty"`
+}
+
+// MetricsEnabled reports whether the metrics endpoints are exposed; the
+// setting defaults to true when unset.
+func (o Observability) MetricsEnabled() bool {
+	return o.Metrics == nil || *o.Metrics
 }
 
 // ConfigSnapshot is an immutable-at-use version of Config.  The loader never
@@ -522,10 +542,6 @@ func (c *Config) applyDefaults() {
 		}
 		if p.TrafficMode == "" {
 			p.TrafficMode = "live"
-		}
-		if !p.StreamSafe {
-			// A profile is not assumed streaming-safe when it has body rules.
-			p.StreamSafe = streamSafeProfile(p)
 		}
 		c.Profiles[id] = p
 	}

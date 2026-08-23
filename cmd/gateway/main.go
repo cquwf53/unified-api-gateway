@@ -43,6 +43,7 @@ func run(args []string) error {
 	httpAddr := flags.String("http", "", "override data-plane listen address")
 	adminAddr := flags.String("admin", "", "override management listen address")
 	adminURL := flags.String("admin-url", "http://127.0.0.1:8781", "running management API URL for hot activation")
+	adminToken := flags.String("admin-token", "", "management API token (defaults to $GATEWAY_ADMIN_TOKEN)")
 	versionID := flags.String("id", "", "configuration version id")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -64,7 +65,7 @@ func run(args []string) error {
 		}
 		return rollback(*dbPath, *versionID)
 	case "activate":
-		return activate(*configPath, *dbPath, *adminURL)
+		return activate(*configPath, *dbPath, *adminURL, *adminToken)
 	case "preview":
 		return preview(*configPath)
 	case "serve":
@@ -170,19 +171,29 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 	return nil
 }
 
-func activate(configPath, dbPath, adminURL string) error {
+func activate(configPath, dbPath, adminURL, adminToken string) error {
 	snapshot, data, err := loadSnapshot(configPath)
 	if err != nil {
 		return err
 	}
+	if adminToken == "" {
+		adminToken = strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_TOKEN"))
+	}
 	payload, _ := json.Marshal(map[string]any{"yaml": string(data), "description": "CLI activation", "actor": "cli"})
+	fallbackReason := "running management API was unavailable"
 	if request, requestErr := http.NewRequest(http.MethodPost, strings.TrimRight(adminURL, "/")+"/admin/v1/config/activate", bytes.NewReader(payload)); requestErr == nil {
 		request.Header.Set("Content-Type", "application/json")
+		if adminToken != "" {
+			request.Header.Set("X-Admin-Token", adminToken)
+		}
 		if response, doErr := (&http.Client{Timeout: 5 * time.Second}).Do(request); doErr == nil {
 			defer response.Body.Close()
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				fmt.Printf("hot activated %s\n", snapshot.ID)
 				return nil
+			}
+			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+				fallbackReason = fmt.Sprintf("management API rejected the activation (HTTP %d; check --admin-token or GATEWAY_ADMIN_TOKEN)", response.StatusCode)
 			}
 		}
 	}
@@ -197,7 +208,7 @@ func activate(configPath, dbPath, adminURL string) error {
 	if err := db.Activate(context.Background(), snapshot.ID); err != nil {
 		return err
 	}
-	fmt.Printf("saved %s for next startup (running management API was unavailable)\n", snapshot.ID)
+	fmt.Printf("saved %s for next startup (%s)\n", snapshot.ID, fallbackReason)
 	return nil
 }
 

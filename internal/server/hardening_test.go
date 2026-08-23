@@ -29,9 +29,14 @@ func testGateway(t *testing.T, configure func(*config.Config)) *Server {
 }
 
 func TestEmbeddedConsoleServedWithCSPAndETag(t *testing.T) {
+	t.Setenv("GATEWAY_ADMIN_TOKEN", "test-admin")
 	gateway := testGateway(t, nil)
+	// The console is served on the admin plane only; the data plane answers
+	// with a pointer response instead.
 	recorder := httptest.NewRecorder()
-	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("X-Admin-Token", "test-admin")
+	gateway.ServeAdminHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d", recorder.Code)
 	}
@@ -47,11 +52,17 @@ func TestEmbeddedConsoleServedWithCSPAndETag(t *testing.T) {
 		t.Fatal("ETag missing")
 	}
 	conditional := httptest.NewRequest(http.MethodGet, "/", nil)
+	conditional.Header.Set("X-Admin-Token", "test-admin")
 	conditional.Header.Set("If-None-Match", etag)
 	second := httptest.NewRecorder()
-	gateway.ServeDataHTTP(second, conditional)
+	gateway.ServeAdminHTTP(second, conditional)
 	if second.Code != http.StatusNotModified {
 		t.Fatalf("conditional status=%d", second.Code)
+	}
+	pointer := httptest.NewRecorder()
+	gateway.ServeDataHTTP(pointer, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !strings.Contains(pointer.Body.String(), "admin_console") {
+		t.Fatalf("data plane should point at the admin console, got %s", pointer.Body.String())
 	}
 }
 

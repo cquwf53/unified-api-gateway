@@ -135,7 +135,7 @@ func TestSSEResponseIsTranslated(t *testing.T) {
 		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	defer upstream.Close()
-	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"anthropic": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "anthropic", StreamSafe: true}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"anthropic": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "anthropic", StreamSafe: &[]bool{true}[0]}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestTransparentStreamIsForwardedWithoutBufferingTransform(t *testing.T) {
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer upstream.Close()
-	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "transparent", ClientContract: "openai-chat", UpstreamContract: "openai-chat", TrafficMode: "live", Upstream: "u", StreamSafe: true}}, Routes: []config.Route{{ID: "stream", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "transparent", ClientContract: "openai-chat", UpstreamContract: "openai-chat", TrafficMode: "live", Upstream: "u", StreamSafe: &[]bool{true}[0]}}, Routes: []config.Route{{ID: "stream", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -447,7 +447,7 @@ func TestTranslatedStreamingIsIncremental(t *testing.T) {
 		flusher.Flush()
 	}))
 	defer upstream.Close()
-	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: true}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: &[]bool{true}[0]}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -521,7 +521,7 @@ func TestTranslatedStreamingFallsBackOnUpstreamError(t *testing.T) {
 		io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`)
 	}))
 	defer upstream.Close()
-	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: true}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: &[]bool{true}[0]}}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)

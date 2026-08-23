@@ -176,8 +176,12 @@ func TestGoldenAnthropicSSETranslation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lastChunk map[string]any
-	sawRole, sawText, sawFinish := false, false, false
+	sawRole, sawText, sawFinish, sawDone := false, false, false, false
 	for _, event := range translated {
+		if event.Data == "[DONE]" {
+			sawDone = true
+			continue
+		}
 		var chunk map[string]any
 		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
 			t.Fatalf("event is not JSON: %s", event.Data)
@@ -201,8 +205,8 @@ func TestGoldenAnthropicSSETranslation(t *testing.T) {
 			lastChunk = chunk
 		}
 	}
-	if !sawRole || !sawText || !sawFinish {
-		t.Fatalf("missing events: role=%v text=%v finish=%v", sawRole, sawText, sawFinish)
+	if !sawRole || !sawText || !sawFinish || !sawDone {
+		t.Fatalf("missing events: role=%v text=%v finish=%v done=%v", sawRole, sawText, sawFinish, sawDone)
 	}
 	usage, ok := lastChunk["usage"].(map[string]any)
 	if !ok {

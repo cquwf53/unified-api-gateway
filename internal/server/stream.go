@@ -168,6 +168,14 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Confi
 	if streamErr != nil {
 		return status, headersSent, streamErr
 	}
+	// Emit the client contract's terminator when the upstream stream ended
+	// without one (Anthropic never sends [DONE]; OpenAI never sends
+	// message_stop).
+	if finishing := translator.Finish(); len(finishing) > 0 {
+		if _, writeErr := w.Write(adapter.EncodeSSE(finishing)); writeErr == nil && flusher != nil {
+			flusher.Flush()
+		}
+	}
 	return status, headersSent, nil
 }
 

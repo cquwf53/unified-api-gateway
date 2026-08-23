@@ -217,7 +217,9 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/", "/index.html":
-		s.writeStatic(w, r)
+		// The admin console lives on the management plane only; serving it
+		// here would invite calls to /api/* that the data plane cannot answer.
+		s.writeJSON(w, http.StatusOK, map[string]any{"service": "unified-api-gateway", "plane": "data", "admin_console": "served on the admin listener (default http://127.0.0.1:8781/)", "health": "/healthz"})
 		return
 	case "/health", "/healthz", "/livez":
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "started_at": s.started})
@@ -230,6 +232,10 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "config": s.Snapshot().ID})
 		return
 	case "/metrics":
+		if !s.Snapshot().Config.Observability.MetricsEnabled() {
+			s.writeError(w, http.StatusNotFound, "observability", "metrics_disabled", "metrics endpoints are disabled by configuration", "")
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = io.WriteString(w, s.metrics.Prometheus())
 		return
@@ -269,6 +275,10 @@ func (s *Server) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/status", "/admin/v1/status":
 		s.writeJSON(w, http.StatusOK, s.statusPayload())
 	case "/api/metrics", "/admin/v1/metrics":
+		if !s.Snapshot().Config.Observability.MetricsEnabled() {
+			s.writeError(w, http.StatusNotFound, "observability", "metrics_disabled", "metrics endpoints are disabled by configuration", "")
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = io.WriteString(w, s.metrics.Prometheus())
 	case "/api/config", "/admin/v1/config":
@@ -366,6 +376,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if profile == nil {
 		s.writeError(w, http.StatusNotFound, "route", "profile_not_found", "no profile selected", requestID)
+		return
+	}
+	if !methodAllowed(profile.AllowedMethods, r.Method) {
+		s.writeError(w, http.StatusMethodNotAllowed, "route", "method_not_allowed", "profile "+profile.Name+" does not allow "+r.Method, requestID)
+		return
+	}
+	if profile.MaxBodyBytes > 0 && int64(len(body)) > profile.MaxBodyBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds the profile limit", requestID)
 		return
 	}
 
@@ -470,9 +488,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, streamErrorStage(headersSent, streamErr), streamErrorCode(streamErr))
 		return
 	}
-	if mode == "live" && wantsStreamFromEnvelope(prepared) && profile.StreamSafe {
+	if mode == "live" && wantsStreamFromEnvelope(prepared) && profile.IsStreamSafe() {
 		// Semantic adapters translate frame by frame so the client receives a
-		// live stream instead of a buffered burst.
+		// live stream instead of a buffered burst. An explicit
+		// stream_safe: false opts out (the response is then buffered and
+		// converted as a whole).
 		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
 		recordStreamResult(rt, headersSent, streamErr)
 		if streamErr != nil && !headersSent {
@@ -519,6 +539,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 func canDirectStream(profile config.Profile) bool {
 	return strings.EqualFold(profile.Adapter, "transparent") && len(profile.AllResponseTransforms()) == 0
+}
+
+// methodAllowed enforces profile.allowed_methods when it is set; an empty
+// list keeps the route matcher in charge.
+func methodAllowed(allowed []string, method string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(candidate), method) {
+			return true
+		}
+	}
+	return false
 }
 
 func streamErrorStage(headersSent bool, err error) string {
@@ -1092,7 +1126,7 @@ func (s *Server) profilePayload() []map[string]any {
 	cfg := s.Snapshot().Config
 	result := make([]map[string]any, 0, len(cfg.Profiles))
 	for id, p := range cfg.Profiles {
-		result = append(result, map[string]any{"id": id, "name": p.Name, "adapter": p.Adapter, "client_contract": p.ClientContract, "upstream_contract": p.UpstreamContract, "traffic_mode": normalizeMode(p.TrafficMode), "upstream": p.Upstream, "stream_safe": p.StreamSafe})
+		result = append(result, map[string]any{"id": id, "name": p.Name, "adapter": p.Adapter, "client_contract": p.ClientContract, "upstream_contract": p.UpstreamContract, "traffic_mode": normalizeMode(p.TrafficMode), "upstream": p.Upstream, "stream_safe": p.IsStreamSafe(), "allowed_methods": p.AllowedMethods})
 	}
 	return result
 }

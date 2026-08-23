@@ -251,10 +251,89 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 }
 
 func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envelope, error) {
-	// The response shape is the same conversion in the other direction as the
-	// OpenAIChatToAnthropic response adapter, so delegate through the inverse
-	// representation when the upstream returned a Messages JSON object.
-	return OpenAIChatToAnthropic{}.AdaptResponse(in, config.Profile{})
+	// The upstream answered in OpenAI Chat format; convert it into the
+	// Anthropic Messages contract the client speaks.
+	if len(in.Body) == 0 || !strings.Contains(strings.ToLower(in.ContentType), "json") {
+		return in.Clone(), nil
+	}
+	body, err := decodeJSON(in.Body)
+	if err != nil {
+		return Envelope{}, err
+	}
+	out := map[string]any{
+		"id":    anthropicMessageID(asString(body["id"])),
+		"type":  "message",
+		"role":  "assistant",
+		"model": body["model"],
+	}
+	content := []any{}
+	stopReason := "end_turn"
+	if choices := asSlice(body["choices"]); len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			stopReason = anthropicStopReason(asString(choice["finish_reason"]))
+			if message, ok := choice["message"].(map[string]any); ok {
+				if text := asString(message["content"]); text != "" {
+					content = append(content, map[string]any{"type": "text", "text": text})
+				}
+				for _, raw := range asSlice(message["tool_calls"]) {
+					call, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					fn, _ := call["function"].(map[string]any)
+					input := map[string]any{}
+					if args := asString(fn["arguments"]); args != "" {
+						if json.Unmarshal([]byte(args), &input) != nil {
+							input = map[string]any{"raw": args}
+						}
+					}
+					content = append(content, map[string]any{"type": "tool_use", "id": call["id"], "name": fn["name"], "input": input})
+				}
+			}
+		}
+	}
+	out["content"] = content
+	out["stop_reason"] = stopReason
+	if usage, ok := body["usage"].(map[string]any); ok {
+		out["usage"] = map[string]any{"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}
+	}
+	b, contentType, err := encodeJSON(out)
+	if err != nil {
+		return Envelope{}, err
+	}
+	result := in.Clone()
+	result.Body = b
+	result.Header = ensureJSONHeader(result.Header)
+	result.ContentType = contentType
+	result.Protocol = "anthropic-messages"
+	return result, nil
+}
+
+// anthropicMessageID rebrands OpenAI completion ids (chatcmpl_*) as Anthropic
+// message ids so clients see identifiers from their own vocabulary.
+func anthropicMessageID(id string) string {
+	if id == "" {
+		return "msg-gateway"
+	}
+	if strings.HasPrefix(id, "chatcmpl_") {
+		return "msg_" + strings.TrimPrefix(id, "chatcmpl_")
+	}
+	return id
+}
+
+// anthropicStopReason maps OpenAI finish reasons onto the Anthropic
+// stop_reason vocabulary.
+func anthropicStopReason(reason string) string {
+	switch reason {
+	case "length":
+		return "max_tokens"
+	case "tool_calls", "function_call", "tool_use":
+		return "tool_use"
+	case "content_filter":
+		return "refusal"
+	default: // "stop", "" and unknown values
+		return "end_turn"
+	}
 }
 
 type OpenAIResponsesToAnthropic struct{}
@@ -293,7 +372,10 @@ func (OpenAIResponsesToAnthropic) AdaptRequest(in Envelope, p config.Profile) (E
 }
 
 func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (Envelope, error) {
-	chat, err := AnthropicToOpenAIChat{}.AdaptResponse(in, p)
+	// The upstream returned Anthropic Messages; run it through the
+	// Anthropic -> OpenAI Chat conversion and reshape that into a Responses
+	// object.
+	chat, err := OpenAIChatToAnthropic{}.AdaptResponse(in, p)
 	if err != nil {
 		return Envelope{}, err
 	}

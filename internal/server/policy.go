@@ -294,25 +294,42 @@ func (b *breaker) retryAfter() time.Duration {
 	return time.Second
 }
 
-// retryAttemptsFor decides how many upstream attempts a request may use.
-// Retries are limited to idempotent methods (or requests carrying an explicit
-// Idempotency-Key) unless idempotent_only is disabled.
-func (rt *profileRuntime) retryAttemptsFor(method string, header http.Header) int {
-	if rt == nil || rt.policy.retryAttempts <= 1 {
-		return 1
+// allowsRetry reports whether the request may be replayed at all. Retries
+// are limited to idempotent methods (or requests carrying an explicit
+// Idempotency-Key) unless idempotent_only is disabled; upstream retries can
+// raise the attempt count but never bypass this check.
+func (rt *profileRuntime) allowsRetry(method string, header http.Header) bool {
+	if rt == nil {
+		return false
 	}
 	if !rt.policy.idempotentOnly {
-		return rt.policy.retryAttempts
+		return true
 	}
 	if header.Get("Idempotency-Key") != "" {
-		return rt.policy.retryAttempts
+		return true
 	}
 	switch strings.ToUpper(method) {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
-		return rt.policy.retryAttempts
+		return true
 	default:
+		return false
+	}
+}
+
+// retryAttempts computes the attempt budget for a request, taking both the
+// policy and any per-upstream retries override into account.
+func (rt *profileRuntime) retryAttempts(upstream config.Upstream, method string, header http.Header) int {
+	if rt == nil {
 		return 1
 	}
+	attempts := rt.policy.retryAttempts
+	if upstream.Retries > 0 && upstream.Retries+1 > attempts {
+		attempts = upstream.Retries + 1
+	}
+	if attempts <= 1 || !rt.allowsRetry(method, header) {
+		return 1
+	}
+	return attempts
 }
 
 func (rt *profileRuntime) recordUpstreamResult(success bool) {
@@ -383,10 +400,7 @@ func (s *Server) executeUpstream(ctx context.Context, cfg *config.Config, upstre
 		ctx, cancel = context.WithTimeout(ctx, rt.policy.requestTimeout)
 		defer cancel()
 	}
-	attempts := rt.retryAttemptsFor(method, header)
-	if upstream.Retries > 0 {
-		attempts = upstream.Retries + 1
-	}
+	attempts := rt.retryAttempts(upstream, method, header)
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {

@@ -85,7 +85,8 @@ YAML 明文。
 - `policies`：超时、限流、重试、熔断和审计策略；
 - `credentials` / `clients`：上游密钥引用、客户端凭据和 profile 白名单；
 - `observability`：日志级别、请求 ID 头、指标和 trace 设置。`log_level` 与
-  `request_id_header` 已生效；`trace`/`redact_prompts` 为预留字段。
+  `request_id_header` 已生效；`metrics: false` 可关闭 `/metrics` 端点（默认开启）；
+  `trace`/`redact_prompts` 为预留字段。
 
 一个 profile 可以写成：
 
@@ -121,8 +122,11 @@ profiles:
 ```
 
 改写阶段按 `path -> query -> headers -> body` 的顺序执行。`body` 规则只在请求是
-JSON 且 profile 声明了 JSON 契约时解析；未知字段默认保留。请求或响应体受到
-`max_body_bytes` 限制，超限返回可识别的 413/转换错误，而不是静默截断。
+JSON 且 profile 声明了 JSON 契约时解析；未知字段默认保留。profile 级的
+`max_body_bytes` 限制请求体大小（超限返回 413），同时约束上游响应的缓冲上限；
+`allowed_methods` 可将 profile 限制到指定方法（其余返回 405）。`stream_safe` 是
+三态：不写时按"是否有 body 改写规则"推导，显式写 `true`/`false` 时以配置为准
+（`false` 表示整条流缓冲转换后再一次性返回）。
 
 复杂规则可以抽成 `transforms`，在多个 profile 中复用：
 
@@ -259,8 +263,9 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
 - `max_concurrency`（或 `limits.concurrency`）：按 profile 的并发信号量，超限返回
   `503`；
 - `retry.max_attempts` + `idempotent_only`：仅对幂等方法（GET/HEAD/PUT/DELETE 等）
-  或携带 `Idempotency-Key` 的请求在 5xx/网络错误时重试；上游的 `retries` 字段可
-  覆盖重试次数；流式响应在首字节发出后绝不重试；
+  或携带 `Idempotency-Key` 的请求在 5xx/网络错误时重试；上游的 `retries` 字段可以
+  提高重试次数上限，但幂等性判断始终生效（POST 不会被重放）；流式响应在首字节
+  发出后绝不重试；
 - `circuit_breaker.failure_threshold` / `reset_timeout_ms`：按 upstream 的熔断器，
   连续失败达到阈值后打开（`503 circuit_open`），静置期过后放行单个半开探测；熔断
   状态跨配置激活保留；
@@ -293,6 +298,12 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 ## 安全边界
 
 - 上游 URL 只来自已加载配置，不接受请求体或 Header 中的用户可控目标，降低 SSRF 风险；
+- **未配置任何客户端密钥时，数据面处于开放模式**：任何人都可以通过
+  `X-Gateway-Profile` 头选择任意 profile——这是该模式下唯一的越权入口。请仅在
+  受保护网络中使用，或配置 `clients.*.key_ref`/`key_env`（对应环境变量存在时）
+  强制客户端鉴权，使 profile 覆盖重新受白名单约束；
+- Web 控制台只在管理面（默认 `127.0.0.1:8781`）提供服务；数据面 `/` 返回指向
+  管理面的提示 JSON，避免把管理 API 调用误打到数据面；
 - Authorization、API key、prompt、响应正文和工具参数默认脱敏，`policies.audit.redact`
   可扩展脱敏名单；
 - 客户端密钥与管理令牌使用常量时间比较，避免时序侧信道；

@@ -124,6 +124,10 @@ type SSETranslator struct {
 	model       string
 	finishSent  bool
 
+	// doneSent records that the client contract's stream terminator has been
+	// emitted ([DONE] for OpenAI clients, message_stop for Anthropic).
+	doneSent bool
+
 	// anthropic -> openai state: message_start carries the prompt token count
 	// while usage totals only arrive with message_delta.
 	promptTokens    float64
@@ -152,10 +156,24 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 	}
 	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "openai") {
 		out, err := t.anthropicEventToOpenAI(event, payload)
-		if err != nil || out.Data != "" {
-			return []SSEEvent{out}, nil
+		if err != nil {
+			return nil, err
 		}
-		return nil, nil
+		var events []SSEEvent
+		if out.Data != "" {
+			events = append(events, out)
+		}
+		// Anthropic streams end with message_stop and never send [DONE], so
+		// the sentinel has to be synthesised here; OpenAI SDKs that strictly
+		// wait for it would otherwise hang.
+		if eventType(event, payload) == "message_stop" && !t.doneSent {
+			t.doneSent = true
+			events = append(events, SSEEvent{Data: "[DONE]"})
+		}
+		if len(events) == 0 {
+			return nil, nil
+		}
+		return events, nil
 	}
 	if strings.Contains(t.from, "openai") && strings.Contains(t.to, "anthropic") {
 		return t.openAIEventToAnthropic(event, payload), nil
@@ -164,6 +182,7 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 }
 
 func (t *SSETranslator) translateDone() []SSEEvent {
+	t.doneSent = true
 	if !strings.Contains(t.from, "openai") || !strings.Contains(t.to, "anthropic") {
 		return []SSEEvent{{Data: "[DONE]"}}
 	}
@@ -171,6 +190,31 @@ func (t *SSETranslator) translateDone() []SSEEvent {
 	out = append(out, t.closeTextBlock()...)
 	out = append(out, sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	return out
+}
+
+// Finish emits the client contract's stream terminator when the upstream
+// ended without one (an Anthropic stream closed after message_stop already
+// sent [DONE]; an OpenAI stream that never sent [DONE] still owes Anthropic
+// clients a message_stop). Call it once after the last upstream event.
+func (t *SSETranslator) Finish() []SSEEvent {
+	if t.from == t.to || t.from == "" || t.to == "" || t.doneSent {
+		return nil
+	}
+	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "openai") {
+		t.doneSent = true
+		return []SSEEvent{{Data: "[DONE]"}}
+	}
+	if strings.Contains(t.from, "openai") && strings.Contains(t.to, "anthropic") {
+		return t.translateDone()
+	}
+	return nil
+}
+
+func eventType(event SSEEvent, payload map[string]any) string {
+	if event.Event != "" {
+		return event.Event
+	}
+	return asString(payload["type"])
 }
 
 func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[string]any) []SSEEvent {
@@ -321,13 +365,13 @@ func sseEvent(name string, payload map[string]any) SSEEvent {
 
 func mapFinishReason(reason string) string {
 	switch reason {
-	case "stop":
+	case "stop", "":
 		return "end_turn"
 	case "length":
 		return "max_tokens"
 	case "content_filter":
 		return "refusal"
-	case "", "tool_calls":
+	case "tool_calls":
 		return "tool_calls"
 	default:
 		return reason
@@ -470,6 +514,7 @@ func TranslateSSE(events []SSEEvent, from, to string) ([]SSEEvent, error) {
 		}
 		result = append(result, out...)
 	}
+	result = append(result, translator.Finish()...)
 	return result, nil
 }
 

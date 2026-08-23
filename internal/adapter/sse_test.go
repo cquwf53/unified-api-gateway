@@ -68,8 +68,15 @@ func TestSSEToolUseBlocksTranslateToOpenAIToolCalls(t *testing.T) {
 func TestSSEPingIsDropped(t *testing.T) {
 	raw := "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 	translated := mustTranslate(t, raw, "anthropic-messages", "openai-chat")
-	if len(translated) != 0 {
-		t.Fatalf("ping should be dropped, got %#v", translated)
+	// The ping itself must not become a chunk; the trailing event is the
+	// [DONE] sentinel Finish() appends to an unterminated stream.
+	for _, event := range translated {
+		if event.Data != "[DONE]" {
+			t.Fatalf("ping should be dropped, got %#v", translated)
+		}
+	}
+	if len(translated) == 0 {
+		t.Fatal("expected a [DONE] sentinel for the unterminated stream")
 	}
 }
 
@@ -188,6 +195,29 @@ func TestReadSSEStreamEmitsIncrementally(t *testing.T) {
 	}
 	if len(events) != 2 || events[0].Data != "one" || events[1].Data != "two" {
 		t.Fatalf("events=%#v", events)
+	}
+}
+
+func TestUnterminatedAnthropicStreamStillGetsDone(t *testing.T) {
+	// An Anthropic stream closed without message_stop (for example after an
+	// error) must still hand OpenAI clients the [DONE] sentinel.
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-chat")
+	if translated[len(translated)-1].Data != "[DONE]" {
+		t.Fatalf("missing [DONE] sentinel: %#v", translated)
+	}
+}
+
+func TestUnterminatedOpenAIStreamStillGetsMessageStop(t *testing.T) {
+	// Symmetric: an OpenAI stream that never sent [DONE] still owes Anthropic
+	// clients message_stop.
+	raw := "data: {\"id\":\"c1\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	translated := mustTranslate(t, raw, "openai-chat", "anthropic-messages")
+	last := translated[len(translated)-1]
+	if !strings.Contains(last.Data, "message_stop") {
+		t.Fatalf("missing message_stop: %s", EncodeSSE(translated))
 	}
 }
 
