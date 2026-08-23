@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
@@ -47,9 +48,8 @@ func defaultPolicySet() policySet {
 	return policySet{retryAttempts: 1, idempotentOnly: true}
 }
 
-// decodePolicySet merges policies.defaults (a plain map in config) with the
-// limits block. The YAML round-trip keeps config.Decode free of policy
-// internals and tolerates unknown policy keys.
+// decodePolicySet merges policies.defaults (validated against
+// config.PoliciesSpec at load time) with the limits block.
 func decodePolicySet(cfg *config.Config) policySet {
 	set := defaultPolicySet()
 	if cfg == nil {
@@ -65,33 +65,11 @@ func decodePolicySet(cfg *config.Config) policySet {
 	if cfg.Limits.Concurrency > 0 {
 		set.maxConcurrency = cfg.Limits.Concurrency
 	}
-	if len(cfg.Policies) == 0 {
-		return set
-	}
-	raw, err := yaml.Marshal(cfg.Policies)
+	spec, err := decodePoliciesSpec(cfg.Policies)
 	if err != nil {
-		return set
+		return set // shape errors are reported by config.Validate
 	}
-	var structured struct {
-		Defaults struct {
-			RequestTimeoutMS  int     `yaml:"request_timeout_ms"`
-			MaxConcurrency    int     `yaml:"max_concurrency"`
-			RequestsPerSecond float64 `yaml:"requests_per_second"`
-			Burst             int     `yaml:"burst"`
-			Retry             struct {
-				MaxAttempts    int   `yaml:"max_attempts"`
-				IdempotentOnly *bool `yaml:"idempotent_only"`
-			} `yaml:"retry"`
-			CircuitBreaker struct {
-				FailureThreshold int   `yaml:"failure_threshold"`
-				ResetTimeoutMS   int64 `yaml:"reset_timeout_ms"`
-			} `yaml:"circuit_breaker"`
-		} `yaml:"defaults"`
-	}
-	if err := yaml.Unmarshal(raw, &structured); err != nil {
-		return set
-	}
-	d := structured.Defaults
+	d := spec.Defaults
 	if d.RequestTimeoutMS > 0 {
 		set.requestTimeout = time.Duration(d.RequestTimeoutMS) * time.Millisecond
 	}
@@ -119,6 +97,24 @@ func decodePolicySet(cfg *config.Config) policySet {
 		set.breakerCfg.resetTimeout = time.Duration(d.CircuitBreaker.ResetTimeoutMS) * time.Millisecond
 	}
 	return set
+}
+
+// decodePoliciesSpec re-decodes the raw policies map into the typed shape.
+func decodePoliciesSpec(raw map[string]any) (config.PoliciesSpec, error) {
+	if len(raw) == 0 {
+		return config.PoliciesSpec{}, nil
+	}
+	encoded, err := yaml.Marshal(raw)
+	if err != nil {
+		return config.PoliciesSpec{}, err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	var spec config.PoliciesSpec
+	if err := decoder.Decode(&spec); err != nil {
+		return config.PoliciesSpec{}, err
+	}
+	return spec, nil
 }
 
 // tokenBucket is a minimal thread-safe rate limiter.
@@ -244,6 +240,48 @@ type profileRuntime struct {
 	sem     chan struct{}
 	bucket  *tokenBucket
 	breaker *breaker
+}
+
+// maxWebsocketConnections bounds concurrent proxied WebSocket connections
+// independently of HTTP request concurrency, which long-lived sockets must
+// not starve.
+const maxWebsocketConnections = 256
+
+// wsSlots is the server-wide WebSocket connection budget.
+func (s *Server) wsSlots() chan struct{} {
+	s.wsOnce.Do(func() { s.wsSem = make(chan struct{}, maxWebsocketConnections) })
+	return s.wsSem
+}
+
+// beginWebsocketPolicy applies admission control for a WebSocket upgrade:
+// breaker and rate limit at establishment plus a server-wide connection
+// budget held for the lifetime of the socket.
+func (rt *profileRuntime) beginWebsocketPolicy(ctx context.Context, method string, header http.Header, slots chan struct{}) (func(), *policyRejection) {
+	if rt == nil {
+		return func() {}, nil
+	}
+	now := time.Now()
+	if !rt.breaker.allow(now) {
+		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
+	}
+	if rt.bucket != nil && !rt.bucket.allow(now) {
+		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
+	}
+	if slots == nil {
+		return func() {}, nil
+	}
+	select {
+	case slots <- struct{}{}:
+	default:
+		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_connection_limit", retryAfter: time.Second}
+	}
+	select {
+	case <-ctx.Done():
+		<-slots
+		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_wait_canceled", retryAfter: 0}
+	default:
+	}
+	return func() { <-slots }, nil
 }
 
 // beginPolicy applies admission control for one request. The returned release

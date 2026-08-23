@@ -63,7 +63,11 @@ func (m *Metrics) Begin() func() {
 }
 
 func (m *Metrics) Observe(record RequestRecord) {
-	if record.Status >= 200 && record.Status < 400 && record.ErrorCode == "" {
+	// 101 Switching Protocols is the success status of a proxied WebSocket
+	// upgrade and must count as ok even though it sits below 2xx.
+	success := record.ErrorCode == "" &&
+		((record.Status >= 200 && record.Status < 400) || record.Status == http.StatusSwitchingProtocols)
+	if success {
 		m.ok.Add(1)
 	} else {
 		m.fail.Add(1)

@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"unified-api-gateway/internal/strictyaml"
 	"unified-api-gateway/internal/transform"
 
 	"gopkg.in/yaml.v3"
@@ -41,17 +43,10 @@ type Config struct {
 
 // UnmarshalYAML accepts the documented snake_case names and a few harmless
 // aliases used by early gateway configs (default_profile and top-level
-// listener addresses). Unknown keys anywhere in the tree are rejected: a
-// typo like stream_sfe must fail at load time, not silently disable a
-// feature. (The decoder's KnownFields cannot reach into custom
-// unmarshallers, so strictness is enforced by re-decoding the node.)
+// listener addresses). Unknown keys anywhere in the tree are rejected with
+// their original line numbers: a typo like stream_sfe must fail at load
+// time, not silently disable a feature.
 func (c *Config) UnmarshalYAML(node *yaml.Node) error {
-	known := map[string]bool{
-		"version": true, "listeners": true, "defaults_profile": true, "default_profile": true,
-		"upstreams": true, "profiles": true, "routes": true, "clients": true, "credentials": true,
-		"transforms": true, "policies": true, "observability": true, "limits": true,
-		"http": true, "admin": true, "grpc": true,
-	}
 	legacyAliases := map[string]bool{"default_profile": true, "http": true, "admin": true, "grpc": true}
 	type plainConfig Config
 	var p plainConfig
@@ -60,15 +55,15 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 		strict.Content = make([]*yaml.Node, 0, len(node.Content))
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key := node.Content[i].Value
-			if !known[key] {
-				return fmt.Errorf("unknown configuration key %q", key)
-			}
 			if legacyAliases[key] {
-				continue
+				continue // consumed by the alias fallback below
 			}
 			strict.Content = append(strict.Content, node.Content[i], node.Content[i+1])
 		}
-		if err := decodeStrictNode(&strict, &p); err != nil {
+		if err := node.Decode(&p); err != nil {
+			return err
+		}
+		if err := strictyaml.UnknownKeys(&strict, p); err != nil {
 			return err
 		}
 	} else if err := node.Decode(&p); err != nil {
@@ -96,18 +91,6 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 		}
 	}
 	return nil
-}
-
-// decodeStrictNode round-trips a YAML node through a KnownFields decoder so
-// unknown keys anywhere in its subtree are rejected.
-func decodeStrictNode(node *yaml.Node, target any) error {
-	raw, err := yaml.Marshal(node)
-	if err != nil {
-		return err
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	decoder.KnownFields(true)
-	return decoder.Decode(target)
 }
 
 // Listeners contains independent data, administration and optional gRPC
@@ -286,6 +269,58 @@ type Limits struct {
 	Concurrency    int     `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
 }
 
+// PoliciesSpec is the typed shape of the policies block. Config keeps the
+// raw map for management-API compatibility; Validate enforces this shape so
+// a typo cannot silently disable rate limiting, the circuit breaker or
+// audit.
+type PoliciesSpec struct {
+	Defaults PolicyDefaults `yaml:"defaults"`
+	Audit    AuditPolicy    `yaml:"audit"`
+}
+
+type PolicyDefaults struct {
+	RequestTimeoutMS  int                  `yaml:"request_timeout_ms"`
+	MaxConcurrency    int                  `yaml:"max_concurrency"`
+	RequestsPerSecond float64              `yaml:"requests_per_second"`
+	Burst             int                  `yaml:"burst"`
+	Retry             RetryPolicy          `yaml:"retry"`
+	CircuitBreaker    CircuitBreakerPolicy `yaml:"circuit_breaker"`
+}
+
+type RetryPolicy struct {
+	MaxAttempts    int   `yaml:"max_attempts"`
+	IdempotentOnly *bool `yaml:"idempotent_only"`
+}
+
+type CircuitBreakerPolicy struct {
+	FailureThreshold int   `yaml:"failure_threshold"`
+	ResetTimeoutMS   int64 `yaml:"reset_timeout_ms"`
+}
+
+type AuditPolicy struct {
+	Enabled bool     `yaml:"enabled"`
+	Redact  []string `yaml:"redact"`
+}
+
+// validatePolicyShape rejects unknown keys in the policies block. Line
+// numbers are relative to the block, which is acceptable for a shallow map.
+func validatePolicyShape(raw map[string]any) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	encoded, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("policies: %w", err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	var spec PoliciesSpec
+	if err := decoder.Decode(&spec); err != nil {
+		return fmt.Errorf("policies: %w", err)
+	}
+	return nil
+}
+
 type Observability struct {
 	LogLevel string `yaml:"log_level,omitempty" json:"log_level,omitempty"`
 	Trace    bool   `yaml:"trace,omitempty" json:"trace,omitempty"`
@@ -332,6 +367,12 @@ func Parse(data []byte) (*Config, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&c); err != nil {
+		// A document that is empty or contains only comments decodes to EOF;
+		// both fall back to the default configuration like a blank file.
+		if errors.Is(err, io.EOF) {
+			c = *NewDefault()
+			return &c, nil
+		}
 		return nil, fmt.Errorf("config YAML: %w", err)
 	}
 	c.applyDefaults()
@@ -540,6 +581,9 @@ func (c *Config) Validate() error {
 		if err := spec.Validate(); err != nil {
 			errs = append(errs, fmt.Sprintf("transform %q: %v", name, err))
 		}
+	}
+	if err := validatePolicyShape(c.Policies); err != nil {
+		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))

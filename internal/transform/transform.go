@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	"unified-api-gateway/internal/strictyaml"
 )
 
 // Envelope is the transport-neutral representation passed through a
@@ -109,8 +110,9 @@ func CloneSpec(in TransformSpec) TransformSpec { return cloneSpec(in) }
 
 // UnmarshalYAML accepts either a mapping or a list of mappings.  Accepting a
 // list is useful for profile request/response fields where users naturally
-// write a pipeline directly. Unknown mapping keys are rejected so typos in
-// rule names fail at load time.
+// write a pipeline directly. Unknown mapping keys anywhere in the spec are
+// rejected with their original line numbers so a typo like "renmae" fails at
+// load time.
 func (s *TransformSpec) UnmarshalYAML(node *yaml.Node) error {
 	if node == nil {
 		return nil
@@ -123,38 +125,16 @@ func (s *TransformSpec) UnmarshalYAML(node *yaml.Node) error {
 		*s = TransformSpec{Steps: steps}
 		return nil
 	}
-	if node.Kind == yaml.MappingNode {
-		known := map[string]bool{
-			"name": true, "method": true, "path": true, "path_prefix": true,
-			"query": true, "headers": true, "body": true, "status": true,
-			"status_map": true, "streaming_safe": true, "steps": true,
-		}
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			key := node.Content[i].Value
-			if !known[key] {
-				return fmt.Errorf("unknown transform key %q", key)
-			}
-		}
-	}
 	type plainSpec TransformSpec
 	var p plainSpec
-	if err := decodeSpecStrict(node, &p); err != nil {
+	if err := node.Decode(&p); err != nil {
+		return err
+	}
+	if err := strictyaml.UnknownKeys(node, p); err != nil {
 		return err
 	}
 	*s = TransformSpec(p)
 	return nil
-}
-
-// decodeSpecStrict round-trips the node through a KnownFields decoder so the
-// nested body/header/query maps are also checked for typos.
-func decodeSpecStrict(node *yaml.Node, target any) error {
-	raw, err := yaml.Marshal(node)
-	if err != nil {
-		return err
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	decoder.KnownFields(true)
-	return decoder.Decode(target)
 }
 
 // UnmarshalJSON mirrors the YAML convenience for API clients posting a list

@@ -50,25 +50,38 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	finish := s.metrics.Begin()
 	defer finish()
 	started := time.Now()
+	// The final status is captured by the deferred closure; evaluating
+	// s.observe's arguments at defer time would freeze http.StatusOK and
+	// record upstream failures as successes.
+	status := 0
+	stage, code := "", ""
+	defer func() {
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		s.observe("", started, r, nil, profile, profile.Upstream, status, stage, code)
+	}()
 	rt := s.runtimeFor(profile.Name)
 	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, true)
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
 			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rejection.retryAfter.Seconds()))
 		}
+		status, stage, code = rejection.status, "policy", rejection.code
 		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, "")
 		return
 	}
 	defer release()
-	defer s.observe("", started, r, nil, profile, profile.Upstream, http.StatusOK, "", "")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "grpc", "body_read_failed", err.Error(), "")
+		status, stage, code = http.StatusBadRequest, "grpc", "body_read_failed"
+		s.writeError(w, status, stage, code, err.Error(), "")
 		return
 	}
 	base, err := url.Parse(upstream.EffectiveURL())
 	if err != nil {
-		s.writeError(w, http.StatusBadGateway, "grpc", "upstream_url_invalid", err.Error(), "")
+		status, stage, code = http.StatusBadGateway, "grpc", "upstream_url_invalid"
+		s.writeError(w, status, stage, code, err.Error(), "")
 		return
 	}
 	if base.Scheme == "grpc" {
@@ -80,7 +93,8 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	base.RawQuery = r.URL.RawQuery
 	request, err := http.NewRequestWithContext(r.Context(), r.Method, base.String(), bytes.NewReader(body))
 	if err != nil {
-		s.writeError(w, http.StatusBadGateway, "grpc", "request_build_failed", err.Error(), "")
+		status, stage, code = http.StatusBadGateway, "grpc", "request_build_failed"
+		s.writeError(w, status, stage, code, err.Error(), "")
 		return
 	}
 	request.Header = filteredRequestHeaders(r.Header)
@@ -90,14 +104,16 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	response, err := s.upstreamClient(upstream, false).Do(request)
 	if err != nil {
 		rt.recordUpstreamResult(false)
-		s.writeError(w, http.StatusBadGateway, "grpc", "upstream_request_failed", err.Error(), "")
+		status, stage, code = http.StatusBadGateway, "grpc", "upstream_request_failed"
+		s.writeError(w, status, stage, code, err.Error(), "")
 		return
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
 		rt.recordUpstreamResult(false)
-		s.writeError(w, http.StatusBadGateway, "grpc", "response_read_failed", err.Error(), "")
+		status, stage, code = http.StatusBadGateway, "grpc", "response_read_failed"
+		s.writeError(w, status, stage, code, err.Error(), "")
 		return
 	}
 	rt.recordUpstreamResult(response.StatusCode < 500)
@@ -109,6 +125,7 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(key, value)
 		}
 	}
+	status = response.StatusCode
 	w.WriteHeader(response.StatusCode)
 	_, _ = w.Write(responseBody)
 }

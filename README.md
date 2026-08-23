@@ -140,8 +140,19 @@ transforms:
         X-Gateway-Source: unified
 ```
 
-`request.transforms`、`response.transforms` 可以引用名称，也可以直接写规则。激活
-前会做 schema、引用、路由冲突和 adapter 能力校验。
+在 `request` / `response` 规则里写 `name: <片段名>` 即可引用，也可以用
+`request_transforms` / `response_transforms` 列表串联多个片段；规则同样支持直接
+内联。激活前会做 schema、引用、路由冲突和 adapter 能力校验：
+
+```yaml
+profiles:
+  chat:
+    request:
+      name: add-client-source      # 引用上面的具名片段
+    request_transforms:            # 或者以列表串联多个片段
+      - name: add-client-source
+      - path: /v2/chat
+```
 
 ## 常用适配器与快速切换
 
@@ -307,7 +318,8 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 - Web 控制台只在管理面（默认 `127.0.0.1:8781`）提供服务；数据面 `/` 返回指向
   管理面的提示 JSON，避免把管理 API 调用误打到数据面；
 - WebSocket/gRPC 面与数据面执行同一套准入控制（限流/并发/熔断）并计入指标与
-  审计；WebSocket 升级做同源 Origin 校验，浏览器跨站连接被拒绝；
+  审计；WebSocket 升级做同源 Origin 校验，浏览器跨站连接被拒绝。WebSocket 使用
+  独立的连接数预算（默认 256），长连接不会占满 HTTP 请求并发额度；
 - 改写后的响应由网关重新分帧（Content-Length 自动重算），客户端不会读到
   与声明长度不符的截断响应；
 - Authorization、API key、prompt、响应正文和工具参数默认脱敏，`policies.audit.redact`

@@ -33,14 +33,16 @@ func sameOrigin(origin, host string) bool {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapshot *config.ConfigSnapshot, requestID string) {
+	// handleProxy already opened the metrics span; this handler only adds
+	// the terminal observation with the real outcome (a failed dial must
+	// not be recorded as a successful upgrade).
 	started := time.Now()
-	finish := s.metrics.Begin()
 	var profile *config.Profile
 	var selectedRoute *config.Route
 	upstreamName := ""
+	status := http.StatusSwitchingProtocols
 	defer func() {
-		finish()
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, http.StatusSwitchingProtocols, "", "")
+		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, "", "")
 	}()
 
 	cfg := snapshot.Config
@@ -48,7 +50,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	match.ClientID, match.Tenant = s.authenticateClient(cfg, r)
 	match.Client = match.ClientID
 	if requiresClientAuth(cfg) && match.ClientID == "" {
-		s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid client key is required", requestID)
+		status = http.StatusUnauthorized
+		s.writeError(w, status, "auth", "client_auth_required", "a valid client key is required", requestID)
 		return
 	}
 	if strings.TrimSpace(r.Header.Get("X-Gateway-Profile")) != "" && !requiresClientAuth(cfg) && match.ClientID == "" {
@@ -59,7 +62,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	var err error
 	profile, selectedRoute, err = route.SelectProfile(cfg, match)
 	if err != nil {
-		status := http.StatusNotFound
+		status = http.StatusNotFound
 		if err == route.ErrProfileForbidden {
 			status = http.StatusForbidden
 		}
@@ -67,28 +70,34 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		return
 	}
 	if profile == nil || strings.EqualFold(profile.Adapter, "") {
-		s.writeError(w, http.StatusNotFound, "route", "websocket_profile_missing", "no websocket profile selected", requestID)
+		status = http.StatusNotFound
+		s.writeError(w, status, "route", "websocket_profile_missing", "no websocket profile selected", requestID)
 		return
 	}
 	if !strings.EqualFold(profile.Adapter, "transparent") {
-		s.writeError(w, http.StatusNotImplemented, "adapter", "websocket_adapter_required", "message-level WebSocket transforms require a dedicated adapter", requestID)
+		status = http.StatusNotImplemented
+		s.writeError(w, status, "adapter", "websocket_adapter_required", "message-level WebSocket transforms require a dedicated adapter", requestID)
 		return
 	}
 	upstream, ok := cfg.Upstreams[profile.Upstream]
 	if !ok {
-		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_upstream_missing", "websocket upstream is not configured", requestID)
+		status = http.StatusBadGateway
+		s.writeError(w, status, "upstream", "websocket_upstream_missing", "websocket upstream is not configured", requestID)
 		return
 	}
 	upstreamName = profile.Upstream
 
-	// WebSocket connections hold a policy slot for their whole lifetime, so
-	// rate and concurrency limits apply on the same terms as HTTP requests.
+	// Long-lived WebSocket connections use a dedicated budget instead of the
+	// per-profile HTTP semaphore: a pile of idle sockets must not starve
+	// request concurrency. Rate limiting and the breaker still apply at
+	// establishment time.
 	rt := s.runtimeFor(profile.Name)
-	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, true)
+	release, rejection := rt.beginWebsocketPolicy(r.Context(), r.Method, r.Header, s.wsSlots())
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
 			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rejection.retryAfter.Seconds()))
 		}
+		status = rejection.status
 		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, requestID)
 		return
 	}
@@ -96,7 +105,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 
 	base, err := url.Parse(upstream.EffectiveURL())
 	if err != nil {
-		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_upstream_invalid", err.Error(), requestID)
+		status = http.StatusBadGateway
+		s.writeError(w, status, "upstream", "websocket_upstream_invalid", err.Error(), requestID)
 		return
 	}
 	base.Scheme = websocketScheme(base.Scheme)
@@ -107,7 +117,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		requestHeaders.Set(key, resolveSecretValue(value))
 	}
 	requestHeaders.Set("X-Gateway-Request-Id", requestID)
-	dialer := websocket.Dialer{}
+	dialer := websocket.Dialer{Subprotocols: requestedSubprotocols(r.Header)}
 	upstreamConn, upstreamResponse, err := dialer.DialContext(r.Context(), base.String(), requestHeaders)
 	if err != nil {
 		message := err.Error()
@@ -115,18 +125,26 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 			message = fmt.Sprintf("upstream returned %s", upstreamResponse.Status)
 		}
 		rt.recordUpstreamResult(false)
-		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_dial_failed", message, requestID)
+		status = http.StatusBadGateway
+		s.writeError(w, status, "upstream", "websocket_dial_failed", message, requestID)
 		return
 	}
 	rt.recordUpstreamResult(true)
 	defer upstreamConn.Close()
+	negotiated := []string{}
+	if upstreamResponse != nil {
+		negotiated = upstreamResponse.Header.Values("Sec-WebSocket-Protocol")
+	}
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  32 << 10,
 		WriteBufferSize: 32 << 10,
+		Subprotocols:    negotiated,
 		CheckOrigin:     func(request *http.Request) bool { return sameOrigin(request.Header.Get("Origin"), request.Host) },
 	}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		// Upgrade already wrote the error response.
+		status = http.StatusInternalServerError
 		return
 	}
 	defer clientConn.Close()
@@ -159,4 +177,19 @@ func websocketScheme(scheme string) string {
 	default:
 		return "ws"
 	}
+}
+
+// requestedSubprotocols collects the client's Sec-WebSocket-Protocol values
+// (gorilla expects them on the Dialer rather than in the header map, which
+// the outbound sanitizer strips).
+func requestedSubprotocols(header http.Header) []string {
+	var protocols []string
+	for _, value := range header.Values("Sec-WebSocket-Protocol") {
+		for _, part := range strings.Split(value, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				protocols = append(protocols, trimmed)
+			}
+		}
+	}
+	return protocols
 }

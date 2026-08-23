@@ -62,6 +62,8 @@ type Server struct {
 	shadowSem chan struct{}
 	auditCh   chan store.AuditEvent
 	auditWG   sync.WaitGroup
+	wsOnce    sync.Once
+	wsSem     chan struct{}
 }
 
 type Options struct {
@@ -316,13 +318,26 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	finish := s.metrics.Begin()
 	defer finish()
 	started := time.Now()
+	var selectedRoute *config.Route
+	var profile *config.Profile
+	upstreamName := ""
+	observeFailure := func(status int, stage, code, message string) {
+		s.writeError(w, status, stage, code, message, "")
+		s.observe("", started, r, selectedRoute, profile, upstreamName, status, stage, code)
+	}
 	snapshot := s.Snapshot()
 	if snapshot == nil || snapshot.Config == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "config", "not_ready", "no active configuration", "")
+		observeFailure(http.StatusServiceUnavailable, "config", "not_ready", "no active configuration")
 		return
 	}
 	cfg := snapshot.Config
 	requestID := s.inboundRequestID(cfg, r)
+	// fail answers and observes in one step so every early return keeps
+	// requests_total == requests_ok + requests_failed.
+	fail := func(status int, stage, code, message string) {
+		s.writeError(w, status, stage, code, message, requestID)
+		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, stage, code)
+	}
 	w.Header().Set("X-Request-Id", requestID)
 	if custom := strings.TrimSpace(cfg.Observability.RequestIDHeader); custom != "" && !strings.EqualFold(custom, "X-Request-Id") {
 		w.Header().Set(custom, requestID)
@@ -336,12 +351,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		maxBody = defaultMaxBody
 	}
 	if r.ContentLength > maxBody {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds configured limit", requestID)
+		fail(http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds configured limit")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "ingress", "body_read_failed", err.Error(), requestID)
+		fail(http.StatusBadRequest, "ingress", "body_read_failed", err.Error())
 		return
 	}
 	if int64(len(body)) > maxBody {
@@ -351,7 +366,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	clientID, tenant := s.authenticateClient(cfg, r)
 	if requiresClientAuth(cfg) && clientID == "" {
-		s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required", requestID)
+		fail(http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required")
 		return
 	}
 	match := route.FromHTTPRequest(r)
@@ -364,7 +379,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		match.Client = "__anonymous__"
 	}
 	match.Model = requestModel(body)
-	profile, selectedRoute, err := route.SelectProfile(cfg, match)
+	profile, selectedRoute, err = route.SelectProfile(cfg, match)
 	if err != nil {
 		status := http.StatusNotFound
 		code := "route_not_found"
@@ -373,11 +388,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		} else if errors.Is(err, route.ErrProfileNotFound) {
 			status, code = http.StatusBadRequest, "profile_not_found"
 		}
-		s.writeError(w, status, "route", code, err.Error(), requestID)
+		fail(status, "route", code, err.Error())
 		return
 	}
 	if profile == nil {
-		s.writeError(w, http.StatusNotFound, "route", "profile_not_found", "no profile selected", requestID)
+		fail(http.StatusNotFound, "route", "profile_not_found", "no profile selected")
 		return
 	}
 	if !methodAllowed(profile.AllowedMethods, r.Method) {
@@ -386,18 +401,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			allowed = append(allowed, strings.ToUpper(strings.TrimSpace(method)))
 		}
 		w.Header().Set("Allow", strings.Join(allowed, ", "))
-		s.writeError(w, http.StatusMethodNotAllowed, "route", "method_not_allowed", "profile "+profile.Name+" does not allow "+r.Method, requestID)
+		fail(http.StatusMethodNotAllowed, "route", "method_not_allowed", "profile "+profile.Name+" does not allow "+r.Method)
 		return
 	}
 	if profile.MaxBodyBytes > 0 && int64(len(body)) > profile.MaxBodyBytes {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds the profile limit", requestID)
+		fail(http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds the profile limit")
 		return
 	}
 
-	upstreamName := profile.Upstream
+	upstreamName = profile.Upstream
 	upstream, hasUpstream := cfg.Upstreams[upstreamName]
 	if !hasUpstream && strings.ToLower(profile.TrafficMode) != "mock" && strings.ToLower(profile.TrafficMode) != "dry-run" {
-		s.writeError(w, http.StatusBadGateway, "upstream", "upstream_not_found", "selected upstream is not configured", requestID)
+		fail(http.StatusBadGateway, "upstream", "upstream_not_found", "selected upstream is not configured")
 		return
 	}
 	mode := normalizeMode(profile.TrafficMode)
@@ -411,8 +426,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if rejection.retryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(rejection.retryAfter.Seconds()+0.999)))
 		}
-		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, requestID)
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, rejection.status, "policy", rejection.code)
+		fail(rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code)
 		return
 	}
 	defer release()
@@ -434,7 +448,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	prepared, err := s.prepareRequest(r.Context(), cfg, *profile, in)
 	if err != nil {
-		s.writeError(w, http.StatusUnprocessableEntity, "transform", "request_transform_failed", safeError(err), requestID)
+		fail(http.StatusUnprocessableEntity, "transform", "request_transform_failed", safeError(err))
 		return
 	}
 
@@ -447,7 +461,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		response := transform.Envelope{StatusCode: http.StatusOK, Headers: make(http.Header), Body: []byte(`{}`), ContentType: "application/json"}
 		response, err = s.applyResponseTransforms(r.Context(), cfg, *profile, response)
 		if err != nil {
-			s.writeError(w, http.StatusBadGateway, "transform", "mock_response_failed", safeError(err), requestID)
+			fail(http.StatusBadGateway, "transform", "mock_response_failed", safeError(err))
 			return
 		}
 		s.writeEnvelope(w, response)
@@ -456,7 +470,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "replay" {
 		if s.store == nil {
-			s.writeError(w, http.StatusNotImplemented, "replay", "replay_not_configured", "replay storage is not configured", requestID)
+			fail(http.StatusNotImplemented, "replay", "replay_not_configured", "replay storage is not configured")
 			return
 		}
 		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(profile.Name, prepared))
@@ -479,11 +493,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.observe(requestID, started, r, selectedRoute, profile, upstreamName, recording.StatusCode, "", "")
 			return
 		}
-		s.writeError(w, http.StatusNotFound, "replay", "recording_not_found", "no recording matches this request", requestID)
+		fail(http.StatusNotFound, "replay", "recording_not_found", "no recording matches this request")
 		return
 	}
 	if mode == "record" && !cfg.Observability.RecordBody {
-		s.writeError(w, http.StatusConflict, "record", "record_body_disabled", "record mode requires observability.record_body: true", requestID)
+		fail(http.StatusConflict, "record", "record_body_disabled", "record mode requires observability.record_body: true")
 		return
 	}
 	if mode == "live" && wantsStreamFromEnvelope(prepared) && canDirectStream(*profile) {
@@ -511,8 +525,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	upstreamEnvelope, err := s.executeUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, rt, r.Method, r.Header)
 	if err != nil {
-		s.writeError(w, upstreamStatus(err), "upstream", upstreamCode(err), safeError(err), requestID)
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, upstreamStatus(err), "upstream", upstreamCode(err))
+		fail(upstreamStatus(err), "upstream", upstreamCode(err), safeError(err))
 		return
 	}
 	upstreamEnvelope.Metadata = prepared.Metadata
@@ -530,13 +543,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := s.prepareResponse(r.Context(), cfg, *profile, upstreamEnvelope)
 	if err != nil {
-		s.writeError(w, http.StatusBadGateway, "transform", "response_transform_failed", safeError(err), requestID)
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, http.StatusBadGateway, "transform", "response_transform_failed")
+		fail(http.StatusBadGateway, "transform", "response_transform_failed", safeError(err))
 		return
 	}
 	if mode == "record" && s.store != nil {
 		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, Method: prepared.Method, Path: prepared.Path, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
-			s.writeError(w, http.StatusInternalServerError, "record", "record_save_failed", saveErr.Error(), requestID)
+			fail(http.StatusInternalServerError, "record", "record_save_failed", saveErr.Error())
 			return
 		}
 	}
@@ -1414,6 +1426,12 @@ func filteredRequestHeaders(in http.Header) http.Header {
 	out := make(http.Header)
 	for key, values := range in {
 		if isHopByHopHeader(key) || strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "X-API-Key") || strings.EqualFold(key, "Host") {
+			continue
+		}
+		// Sec-WebSocket-* headers describe the client's upgrade handshake;
+		// the outbound dialer must generate its own, and gorilla rejects a
+		// caller-supplied Sec-WebSocket-Key/Version outright.
+		if strings.HasPrefix(strings.ToLower(key), "sec-websocket-") {
 			continue
 		}
 		out[key] = append([]string(nil), values...)
