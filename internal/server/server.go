@@ -61,6 +61,7 @@ type Server struct {
 	breakers  map[string]*breaker
 	shadowSem chan struct{}
 	auditCh   chan store.AuditEvent
+	auditWG   sync.WaitGroup
 }
 
 type Options struct {
@@ -89,6 +90,7 @@ func New(options Options) (*Server, error) {
 		auditCh:    make(chan store.AuditEvent, 256),
 	}
 	if options.Store != nil {
+		s.auditWG.Add(1)
 		go s.drainAuditEvents()
 	}
 	s.current.Store(options.Snapshot)
@@ -379,6 +381,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !methodAllowed(profile.AllowedMethods, r.Method) {
+		allowed := make([]string, 0, len(profile.AllowedMethods))
+		for _, method := range profile.AllowedMethods {
+			allowed = append(allowed, strings.ToUpper(strings.TrimSpace(method)))
+		}
+		w.Header().Set("Allow", strings.Join(allowed, ", "))
 		s.writeError(w, http.StatusMethodNotAllowed, "route", "method_not_allowed", "profile "+profile.Name+" does not allow "+r.Method, requestID)
 		return
 	}
@@ -1201,12 +1208,22 @@ func (s *Server) observe(requestID string, started time.Time, r *http.Request, s
 // inserts never sit in the data-plane hot path; overflow is dropped with a
 // warning rather than blocking requests.
 func (s *Server) drainAuditEvents() {
+	defer s.auditWG.Done()
 	for event := range s.auditCh {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := s.store.AddAudit(ctx, event); err != nil {
 			slog.Warn("audit write failed", "action", event.Action, "error", err)
 		}
 		cancel()
+	}
+}
+
+// Close flushes pending audit writes; call it after the HTTP servers have
+// shut down so queued events are not lost on exit.
+func (s *Server) Close() {
+	if s.auditCh != nil {
+		close(s.auditCh)
+		s.auditWG.Wait()
 	}
 }
 
@@ -1319,7 +1336,10 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 
 func (s *Server) writeEnvelope(w http.ResponseWriter, env transform.Envelope) {
 	for key, values := range env.Headers {
-		if isHopByHopHeader(key) {
+		// Content-Length describes the upstream body, which adapters and
+		// response transforms may have rewritten; forwarding it truncates or
+		// corrupts the client stream. net/http computes the real length.
+		if isHopByHopHeader(key) || strings.EqualFold(key, "Content-Length") {
 			continue
 		}
 		for _, value := range values {

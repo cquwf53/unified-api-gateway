@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"unified-api-gateway/internal/config"
@@ -17,7 +18,31 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
+// sameOrigin allows browser connections only when the Origin matches the
+// request host, so a web page cannot drive the gateway's WebSocket plane from
+// another site. Non-browser clients (no Origin header) are always allowed.
+func sameOrigin(origin, host string) bool {
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, host)
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapshot *config.ConfigSnapshot, requestID string) {
+	started := time.Now()
+	finish := s.metrics.Begin()
+	var profile *config.Profile
+	var selectedRoute *config.Route
+	upstreamName := ""
+	defer func() {
+		finish()
+		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, http.StatusSwitchingProtocols, "", "")
+	}()
+
 	cfg := snapshot.Config
 	match := route.FromHTTPRequest(r)
 	match.ClientID, match.Tenant = s.authenticateClient(cfg, r)
@@ -31,7 +56,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		match.Client = "__anonymous__"
 	}
 	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
-	profile, selectedRoute, err := route.SelectProfile(cfg, match)
+	var err error
+	profile, selectedRoute, err = route.SelectProfile(cfg, match)
 	if err != nil {
 		status := http.StatusNotFound
 		if err == route.ErrProfileForbidden {
@@ -53,6 +79,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_upstream_missing", "websocket upstream is not configured", requestID)
 		return
 	}
+	upstreamName = profile.Upstream
+
+	// WebSocket connections hold a policy slot for their whole lifetime, so
+	// rate and concurrency limits apply on the same terms as HTTP requests.
+	rt := s.runtimeFor(profile.Name)
+	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, true)
+	if rejection != nil {
+		if rejection.retryAfter > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rejection.retryAfter.Seconds()))
+		}
+		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, requestID)
+		return
+	}
+	defer release()
+
 	base, err := url.Parse(upstream.EffectiveURL())
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_upstream_invalid", err.Error(), requestID)
@@ -73,14 +114,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		if upstreamResponse != nil {
 			message = fmt.Sprintf("upstream returned %s", upstreamResponse.Status)
 		}
+		rt.recordUpstreamResult(false)
 		s.writeError(w, http.StatusBadGateway, "upstream", "websocket_dial_failed", message, requestID)
 		return
 	}
+	rt.recordUpstreamResult(true)
 	defer upstreamConn.Close()
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  32 << 10,
 		WriteBufferSize: 32 << 10,
-		CheckOrigin:     func(_ *http.Request) bool { return true },
+		CheckOrigin:     func(request *http.Request) bool { return sameOrigin(request.Header.Get("Origin"), request.Host) },
 	}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -107,7 +150,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	go copyFrames(upstreamConn, clientConn)
 	go copyFrames(clientConn, upstreamConn)
 	<-ctx.Done()
-	_ = selectedRoute
 }
 
 func websocketScheme(scheme string) string {

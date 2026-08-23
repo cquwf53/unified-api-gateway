@@ -177,6 +177,7 @@ func TestGoldenAnthropicSSETranslation(t *testing.T) {
 	}
 	var lastChunk map[string]any
 	sawRole, sawText, sawFinish, sawDone := false, false, false, false
+	finishCount, emptyDeltaFrames := 0, 0
 	for _, event := range translated {
 		if event.Data == "[DONE]" {
 			sawDone = true
@@ -185,6 +186,21 @@ func TestGoldenAnthropicSSETranslation(t *testing.T) {
 		var chunk map[string]any
 		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
 			t.Fatalf("event is not JSON: %s", event.Data)
+		}
+		// OpenAI ChatCompletionChunk requires non-null id/created/model;
+		// strict client SDKs (Pydantic) reject null fields.
+		if chunk["id"] == nil || chunk["model"] == nil || chunk["created"] == nil {
+			t.Fatalf("chunk with null required fields: %s", event.Data)
+		}
+		if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
+			choice := choices[0].(map[string]any)
+			if choice["finish_reason"] != nil {
+				finishCount++
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if len(delta) == 0 && choice["finish_reason"] == nil {
+				emptyDeltaFrames++
+			}
 		}
 		if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
 			delta, _ := choices[0].(map[string]any)["delta"].(map[string]any)
@@ -207,6 +223,12 @@ func TestGoldenAnthropicSSETranslation(t *testing.T) {
 	}
 	if !sawRole || !sawText || !sawFinish || !sawDone {
 		t.Fatalf("missing events: role=%v text=%v finish=%v done=%v", sawRole, sawText, sawFinish, sawDone)
+	}
+	if finishCount != 1 {
+		t.Fatalf("exactly one finish_reason chunk allowed, got %d", finishCount)
+	}
+	if emptyDeltaFrames != 0 {
+		t.Fatalf("OpenAI streams must not contain empty-delta frames, got %d", emptyDeltaFrames)
 	}
 	usage, ok := lastChunk["usage"].(map[string]any)
 	if !ok {

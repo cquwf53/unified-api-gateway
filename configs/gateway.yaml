@@ -261,5 +261,4 @@ observability:
   log_level: info
   request_id_header: X-Request-Id
   metrics: true
-  tracing: false
   record_body: false

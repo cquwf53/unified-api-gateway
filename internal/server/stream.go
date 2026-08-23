@@ -170,9 +170,13 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Confi
 	}
 	// Emit the client contract's terminator when the upstream stream ended
 	// without one (Anthropic never sends [DONE]; OpenAI never sends
-	// message_stop).
+	// message_stop). A failed write is reported so telemetry does not count
+	// a broken client connection as a successful stream.
 	if finishing := translator.Finish(); len(finishing) > 0 {
-		if _, writeErr := w.Write(adapter.EncodeSSE(finishing)); writeErr == nil && flusher != nil {
+		if _, writeErr := w.Write(adapter.EncodeSSE(finishing)); writeErr != nil {
+			return status, headersSent, upstreamError{status: status, code: "client_stream_write_failed", err: writeErr}
+		}
+		if flusher != nil {
 			flusher.Flush()
 		}
 	}

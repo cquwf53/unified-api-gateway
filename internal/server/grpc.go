@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"unified-api-gateway/internal/route"
 )
@@ -45,6 +47,20 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadGateway, "grpc", "upstream_not_found", "gRPC upstream is not configured", "")
 		return
 	}
+	finish := s.metrics.Begin()
+	defer finish()
+	started := time.Now()
+	rt := s.runtimeFor(profile.Name)
+	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, true)
+	if rejection != nil {
+		if rejection.retryAfter > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rejection.retryAfter.Seconds()))
+		}
+		s.writeError(w, rejection.status, "policy", rejection.code, "request refused by traffic policy: "+rejection.code, "")
+		return
+	}
+	defer release()
+	defer s.observe("", started, r, nil, profile, profile.Upstream, http.StatusOK, "", "")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "grpc", "body_read_failed", err.Error(), "")
@@ -71,17 +87,20 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	for key, value := range upstream.Headers {
 		request.Header.Set(key, resolveSecretValue(value))
 	}
-	response, err := s.client.Do(request)
+	response, err := s.upstreamClient(upstream, false).Do(request)
 	if err != nil {
+		rt.recordUpstreamResult(false)
 		s.writeError(w, http.StatusBadGateway, "grpc", "upstream_request_failed", err.Error(), "")
 		return
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
+		rt.recordUpstreamResult(false)
 		s.writeError(w, http.StatusBadGateway, "grpc", "response_read_failed", err.Error(), "")
 		return
 	}
+	rt.recordUpstreamResult(response.StatusCode < 500)
 	for key, values := range response.Header {
 		if isHopByHopHeader(key) {
 			continue

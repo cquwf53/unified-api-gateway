@@ -38,11 +38,10 @@ func TestProfileMaxBodyBytesLimitsRequest(t *testing.T) {
 }
 
 func TestExplicitStreamSafeFalseIsHonoured(t *testing.T) {
-	no := false
 	// No body rules (would default to streaming-safe) but an explicit false
 	// must force buffered conversion.
 	cfg := &config.Config{Version: 1, Profiles: map[string]config.Profile{
-		"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", StreamSafe: &no},
+		"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", StreamSafe: boolPtr(false)},
 	}, Upstreams: map[string]config.Upstream{"u": {BaseURL: "http://127.0.0.1:1"}}}
 	if cfg.Profiles["p"].IsStreamSafe() {
 		t.Fatal("explicit stream_safe: false was flipped to true")
@@ -61,7 +60,6 @@ func TestExplicitStreamSafeFalseIsHonoured(t *testing.T) {
 }
 
 func TestExplicitStreamSafeFalseBypassesFrameStreaming(t *testing.T) {
-	no := false
 	release := make(chan struct{})
 	wroteFirst := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +73,7 @@ func TestExplicitStreamSafeFalseBypassesFrameStreaming(t *testing.T) {
 	}))
 	defer upstream.Close()
 	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{
-		"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: &no},
+		"p": {Name: "p", Adapter: "openai-chat-to-anthropic", ClientContract: "openai-chat", UpstreamContract: "anthropic-messages", TrafficMode: "live", Upstream: "u", StreamSafe: boolPtr(false)},
 	}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
@@ -153,6 +151,9 @@ func TestAllowedMethodsEnforced(t *testing.T) {
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d", recorder.Code)
 	}
+	if allow := recorder.Header().Get("Allow"); allow != "POST" {
+		t.Fatalf("405 must carry an Allow header (RFC 9110), got %q", allow)
+	}
 	allowed := httptest.NewRecorder()
 	gateway.ServeDataHTTP(allowed, httptest.NewRequest(http.MethodPost, "/thing", strings.NewReader(`{}`)))
 	if allowed.Code != http.StatusOK {
@@ -213,3 +214,6 @@ func TestUpstreamRetriesRespectIdempotency(t *testing.T) {
 		t.Fatalf("idempotent PUT should use upstream retries, calls=%d", calls)
 	}
 }
+
+// boolPtr keeps StreamSafe literals in tests readable.
+func boolPtr(value bool) *bool { return &value }

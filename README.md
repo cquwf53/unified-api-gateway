@@ -75,7 +75,9 @@ YAML 明文。
 
 ## 配置模型
 
-`configs/gateway.yaml` 是一个可复制的最小示例。顶层对象如下：
+`configs/gateway.yaml` 是一个可复制的最小示例。配置解析是**严格的**：未知键
+（包括拼写错误）会在加载和 `make validate` 时直接报错并指出行号，而不是被静默
+忽略。顶层对象如下：
 
 - `listeners`：数据面、管理面和长连接监听地址；
 - `upstreams`：上游名称、URL、协议、超时和认证引用；
@@ -304,6 +306,10 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
   强制客户端鉴权，使 profile 覆盖重新受白名单约束；
 - Web 控制台只在管理面（默认 `127.0.0.1:8781`）提供服务；数据面 `/` 返回指向
   管理面的提示 JSON，避免把管理 API 调用误打到数据面；
+- WebSocket/gRPC 面与数据面执行同一套准入控制（限流/并发/熔断）并计入指标与
+  审计；WebSocket 升级做同源 Origin 校验，浏览器跨站连接被拒绝；
+- 改写后的响应由网关重新分帧（Content-Length 自动重算），客户端不会读到
+  与声明长度不符的截断响应；
 - Authorization、API key、prompt、响应正文和工具参数默认脱敏，`policies.audit.redact`
   可扩展脱敏名单；
 - 客户端密钥与管理令牌使用常量时间比较，避免时序侧信道；

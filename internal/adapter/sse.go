@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // SSEEvent is a parsed Server-Sent Event frame. Data may contain newlines;
@@ -123,6 +124,9 @@ type SSETranslator struct {
 	streamID    string
 	model       string
 	finishSent  bool
+	// createdUnix backs the OpenAI "created" field, which Anthropic streams
+	// never carry; it is stamped when the translator is created.
+	createdUnix int64
 
 	// doneSent records that the client contract's stream terminator has been
 	// emitted ([DONE] for OpenAI clients, message_stop for Anthropic).
@@ -138,7 +142,7 @@ type SSETranslator struct {
 // "anthropic-messages" and "openai-chat". Identical or unknown contracts
 // return a pass-through translator.
 func NewSSETranslator(from, to string) *SSETranslator {
-	return &SSETranslator{from: strings.ToLower(from), to: strings.ToLower(to), blockByTool: map[int]int{}, nextBlock: -1}
+	return &SSETranslator{from: strings.ToLower(from), to: strings.ToLower(to), blockByTool: map[int]int{}, nextBlock: -1, createdUnix: time.Now().Unix()}
 }
 
 // Translate converts one upstream event into zero or more client events.
@@ -424,20 +428,42 @@ func numberValueOK(value any) (float64, bool) {
 }
 
 // anthropicEventToOpenAI converts one Anthropic event into an OpenAI chunk.
-// A zero Data result means the event should be dropped (for example pings).
+// A zero Data result means the event has no OpenAI equivalent and is dropped
+// (pings, text block framing, a second finish marker).
 func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[string]any) (SSEEvent, error) {
 	typ := event.Event
 	if typ == "" {
 		typ = asString(payload["type"])
 	}
-	if typ == "ping" {
+	if typ == "ping" || typ == "content_block_stop" {
 		return SSEEvent{}, nil
 	}
+	// OpenAI chunks require non-null id/created/model, but only message_start
+	// carries them in an Anthropic stream; latch once and reuse.
+	id, model := payload["id"], payload["model"]
+	if id == nil {
+		if t.streamID != "" {
+			id = t.streamID
+		} else {
+			id = "chatcmpl-gateway"
+		}
+	}
+	if model == nil {
+		if t.model != "" {
+			model = t.model
+		} else {
+			model = "gateway"
+		}
+	}
+	created := payload["created"]
+	if created == nil {
+		created = t.createdUnix
+	}
 	chunk := map[string]any{
-		"id":      payload["id"],
+		"id":      id,
 		"object":  "chat.completion.chunk",
-		"created": payload["created"],
-		"model":   payload["model"],
+		"created": created,
+		"model":   model,
 		"choices": []any{map[string]any{
 			"index": 0,
 			"delta": map[string]any{},
@@ -449,8 +475,14 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 	switch typ {
 	case "message_start":
 		if message, ok := payload["message"].(map[string]any); ok {
-			chunk["id"] = message["id"]
-			chunk["model"] = message["model"]
+			if streamID := asString(message["id"]); streamID != "" {
+				t.streamID = streamID
+				chunk["id"] = streamID
+			}
+			if streamModel := asString(message["model"]); streamModel != "" {
+				t.model = streamModel
+				chunk["model"] = streamModel
+			}
 			if usage, ok := message["usage"].(map[string]any); ok {
 				if n, ok := numberValueOK(usage["input_tokens"]); ok {
 					t.promptTokens = n
@@ -460,16 +492,20 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 		}
 		delta["role"] = "assistant"
 	case "content_block_start":
-		if block, ok := payload["content_block"].(map[string]any); ok && asString(block["type"]) == "tool_use" {
-			index := 0
-			if n, ok := numberValueOK(payload["index"]); ok {
-				index = int(n)
-			}
-			delta["tool_calls"] = []any{map[string]any{
-				"index": index, "id": block["id"], "type": "function",
-				"function": map[string]any{"name": block["name"], "arguments": ""},
-			}}
+		block, _ := payload["content_block"].(map[string]any)
+		if block == nil || asString(block["type"]) != "tool_use" {
+			// Text block framing has no OpenAI equivalent; only tool_use
+			// starts carry a tool_call delta.
+			return SSEEvent{}, nil
 		}
+		index := 0
+		if n, ok := numberValueOK(payload["index"]); ok {
+			index = int(n)
+		}
+		delta["tool_calls"] = []any{map[string]any{
+			"index": index, "id": block["id"], "type": "function",
+			"function": map[string]any{"name": block["name"], "arguments": ""},
+		}}
 	case "content_block_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
 			if text := asString(d["text"]); text != "" {
@@ -488,6 +524,7 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 	case "message_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
 			choice["finish_reason"] = openAIFinishReason(asString(d["stop_reason"]))
+			t.finishSent = true
 		}
 		if usage, ok := payload["usage"].(map[string]any); ok {
 			if _, present := usage["input_tokens"]; !present && t.promptTokensSet {
@@ -496,6 +533,12 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 			chunk["usage"] = anthropicUsageToOpenAI(usage)
 		}
 	case "message_stop":
+		// The OpenAI protocol allows exactly one finish marker; message_delta
+		// already produced one, so only synthesize "stop" when it did not.
+		if t.finishSent {
+			return SSEEvent{}, nil
+		}
+		t.finishSent = true
 		choice["finish_reason"] = "stop"
 	}
 	b, _ := json.Marshal(chunk)

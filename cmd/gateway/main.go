@@ -125,6 +125,8 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 	if err != nil {
 		return err
 	}
+	// Deferred in reverse order: flush audit writes before closing the store.
+	defer gateway.Close()
 	// WriteTimeout stays 0 on the data plane: it also covers streaming
 	// response bodies, and long completions routinely exceed any fixed bound.
 	// The admin plane has no streaming endpoints and keeps a hard cap.

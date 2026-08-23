@@ -295,7 +295,9 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	out["content"] = content
 	out["stop_reason"] = stopReason
 	if usage, ok := body["usage"].(map[string]any); ok {
-		out["usage"] = map[string]any{"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}
+		// Missing counters become zero, not JSON null: Messages clients
+		// expect numeric fields.
+		out["usage"] = map[string]any{"input_tokens": numberOrZero(usage["prompt_tokens"]), "output_tokens": numberOrZero(usage["completion_tokens"])}
 	}
 	b, contentType, err := encodeJSON(out)
 	if err != nil {
@@ -309,14 +311,17 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	return result, nil
 }
 
-// anthropicMessageID rebrands OpenAI completion ids (chatcmpl_*) as Anthropic
-// message ids so clients see identifiers from their own vocabulary.
+// anthropicMessageID rebrands OpenAI completion ids (chatcmpl-* or
+// chatcmpl_*) as Anthropic message ids so clients see identifiers from their
+// own vocabulary.
 func anthropicMessageID(id string) string {
 	if id == "" {
 		return "msg-gateway"
 	}
-	if strings.HasPrefix(id, "chatcmpl_") {
-		return "msg_" + strings.TrimPrefix(id, "chatcmpl_")
+	for _, prefix := range []string{"chatcmpl_", "chatcmpl-"} {
+		if strings.HasPrefix(id, prefix) {
+			return "msg_" + strings.TrimPrefix(id, prefix)
+		}
 	}
 	return id
 }

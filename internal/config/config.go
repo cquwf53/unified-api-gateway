@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -40,11 +41,37 @@ type Config struct {
 
 // UnmarshalYAML accepts the documented snake_case names and a few harmless
 // aliases used by early gateway configs (default_profile and top-level
-// listener addresses).
+// listener addresses). Unknown keys anywhere in the tree are rejected: a
+// typo like stream_sfe must fail at load time, not silently disable a
+// feature. (The decoder's KnownFields cannot reach into custom
+// unmarshallers, so strictness is enforced by re-decoding the node.)
 func (c *Config) UnmarshalYAML(node *yaml.Node) error {
-	type plain Config
-	var p plain
-	if err := node.Decode(&p); err != nil {
+	known := map[string]bool{
+		"version": true, "listeners": true, "defaults_profile": true, "default_profile": true,
+		"upstreams": true, "profiles": true, "routes": true, "clients": true, "credentials": true,
+		"transforms": true, "policies": true, "observability": true, "limits": true,
+		"http": true, "admin": true, "grpc": true,
+	}
+	legacyAliases := map[string]bool{"default_profile": true, "http": true, "admin": true, "grpc": true}
+	type plainConfig Config
+	var p plainConfig
+	if node.Kind == yaml.MappingNode {
+		strict := *node
+		strict.Content = make([]*yaml.Node, 0, len(node.Content))
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i].Value
+			if !known[key] {
+				return fmt.Errorf("unknown configuration key %q", key)
+			}
+			if legacyAliases[key] {
+				continue
+			}
+			strict.Content = append(strict.Content, node.Content[i], node.Content[i+1])
+		}
+		if err := decodeStrictNode(&strict, &p); err != nil {
+			return err
+		}
+	} else if err := node.Decode(&p); err != nil {
 		return err
 	}
 	*c = Config(p)
@@ -69,6 +96,18 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 		}
 	}
 	return nil
+}
+
+// decodeStrictNode round-trips a YAML node through a KnownFields decoder so
+// unknown keys anywhere in its subtree are rejected.
+func decodeStrictNode(node *yaml.Node, target any) error {
+	raw, err := yaml.Marshal(node)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	return decoder.Decode(target)
 }
 
 // Listeners contains independent data, administration and optional gRPC
@@ -282,14 +321,17 @@ func NewDefault() *Config {
 	return c
 }
 
-// Parse parses YAML (JSON is valid YAML) and validates it.
+// Parse parses YAML (JSON is valid YAML) and validates it. Unknown keys are
+// rejected so a typo fails fast instead of silently disabling a feature.
 func Parse(data []byte) (*Config, error) {
 	var c Config
 	if len(strings.TrimSpace(string(data))) == 0 {
 		c = *NewDefault()
 		return &c, nil
 	}
-	if err := yaml.Unmarshal(data, &c); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config YAML: %w", err)
 	}
 	c.applyDefaults()
