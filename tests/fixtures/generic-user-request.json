@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/api/v1/users",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Request-Source": "fixture"
+  },
+  "body": {
+    "user_id": 123,
+    "name": "Alice",
+    "debug": true,
+    "client_extra": "preserve-me"
+  }
+}

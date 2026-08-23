@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Unified API Gateway</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <strong>Unified</strong>
+          <small>API Gateway</small>
+        </div>
+      </div>
+
+      <nav aria-label="控制台导航">
+        <button class="nav-item active" data-view="overview"><span>◈</span>运行概览</button>
+        <button class="nav-item" data-view="profiles"><span>⇄</span>适配器</button>
+        <button class="nav-item" data-view="routes"><span>⌁</span>路由规则</button>
+        <button class="nav-item" data-view="playground"><span>⌘</span>改写实验室</button>
+        <button class="nav-item" data-view="versions"><span>↺</span>版本与审计</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="connection"><i id="connection-dot"></i><span id="connection-text">正在连接</span></div>
+        <div class="version" id="active-version">配置 —</div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">CONTROL PLANE</p>
+          <h1 id="page-title">运行概览</h1>
+        </div>
+        <div class="top-actions">
+          <button class="button ghost" id="refresh-button">刷新状态</button>
+          <button class="button primary" data-open-activate>激活配置</button>
+        </div>
+      </header>
+
+      <section class="view active" id="view-overview">
+        <div class="hero-card">
+          <div>
+            <span class="status-pill"><i></i>Gateway Online</span>
+            <h2>协议之间，不该有鸿沟。</h2>
+            <p>用 profile 将客户端契约、请求改写和上游协议组合起来。切换不会中断正在执行的请求。</p>
+          </div>
+          <div class="flow" aria-label="请求流水线">
+            <div><span>CLIENT</span><b>客户端请求</b></div><i>→</i>
+            <div class="flow-core"><span>PROFILE</span><b>适配与改写</b></div><i>→</i>
+            <div><span>UPSTREAM</span><b>上游服务</b></div>
+          </div>
+        </div>
+
+        <div class="stats-grid">
+          <article class="stat-card"><span>请求总数</span><strong id="metric-total">0</strong><small>当前进程</small></article>
+          <article class="stat-card"><span>成功请求</span><strong id="metric-ok">0</strong><small id="metric-rate">— 成功率</small></article>
+          <article class="stat-card"><span>活跃请求</span><strong id="metric-active">0</strong><small>实时并发</small></article>
+          <article class="stat-card accent"><span>已加载适配器</span><strong id="metric-adapters">0</strong><small>可立即切换</small></article>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="panel wide">
+            <div class="panel-heading"><div><span class="eyebrow">LIVE TRAFFIC</span><h3>最近请求</h3></div><span class="quiet">不记录正文与密钥</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>请求</th><th>Profile</th><th>模式</th><th>状态</th><th>耗时</th></tr></thead>
+                <tbody id="recent-requests"><tr><td colspan="5" class="empty">尚无请求</td></tr></tbody>
+              </table>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="eyebrow">ACTIVE SNAPSHOT</span><h3>当前配置</h3></div></div>
+            <dl class="snapshot-list">
+              <div><dt>版本 ID</dt><dd id="snapshot-id">—</dd></div>
+              <div><dt>加载时间</dt><dd id="snapshot-time">—</dd></div>
+              <div><dt>Profile</dt><dd id="snapshot-profiles">—</dd></div>
+              <div><dt>路由</dt><dd id="snapshot-routes">—</dd></div>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-profiles">
+        <div class="section-intro"><div><h2>适配器与 Profile</h2><p>适配器决定协议如何转换，运行模式决定流量如何处理。两者可以自由组合。</p></div><button class="button primary" data-open-activate>导入配置</button></div>
+        <div class="filter-row">
+          <button class="chip active" data-profile-filter="all">全部</button>
+          <button class="chip" data-profile-filter="live">Live</button>
+          <button class="chip" data-profile-filter="dry-run">Dry-run</button>
+          <button class="chip" data-profile-filter="mock">Mock</button>
+        </div>
+        <div class="profile-grid" id="profile-grid"><div class="loading-card">正在加载 profile…</div></div>
+      </section>
+
+      <section class="view" id="view-routes">
+        <div class="section-intro"><div><h2>路由规则</h2><p>高优先级和更具体的规则先匹配；命中后请求会锁定配置快照。</p></div><button class="button ghost" id="explain-demo">解释示例请求</button></div>
+        <div class="panel route-panel">
+          <div class="route-list" id="route-list"><div class="empty">正在加载路由…</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-playground">
+        <div class="section-intro"><div><h2>改写实验室</h2><p>只执行匹配、适配和声明式改写，不会向上游建立连接。</p></div><span class="safe-badge">ZERO EGRESS</span></div>
+        <div class="playground-grid">
+          <form class="panel editor-panel" id="preview-form">
+            <div class="panel-heading"><div><span class="eyebrow">INPUT</span><h3>客户端请求</h3></div></div>
+            <label>Profile<select id="preview-profile"></select></label>
+            <div class="inline-fields">
+              <label>方法<select id="preview-method"><option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
+              <label class="grow">路径<input id="preview-path" value="/v1/chat/completions"></label>
+            </div>
+            <label>Headers（JSON）<textarea id="preview-headers" spellcheck="false">{
+  "Content-Type": ["application/json"]
+}</textarea></label>
+            <label>Body（JSON）<textarea id="preview-body" class="code tall" spellcheck="false">{
+  "model": "claude-sonnet",
+  "messages": [{"role": "user", "content": "Hello from the gateway"}],
+  "max_tokens": 128
+}</textarea></label>
+            <button class="button primary full" type="submit">运行 Dry-run</button>
+          </form>
+          <article class="panel output-panel">
+            <div class="panel-heading"><div><span class="eyebrow">OUTPUT</span><h3>上游请求预览</h3></div><button class="icon-button" id="copy-preview" title="复制结果">复制</button></div>
+            <div class="pipeline-steps"><span class="done">路由</span><i></i><span class="done">适配</span><i></i><span class="done">改写</span><i></i><span>上游</span></div>
+            <pre id="preview-output">选择一个 Profile，然后运行 Dry-run。</pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-versions">
+        <div class="section-intro"><div><h2>版本与审计</h2><p>每次激活都保留完整快照。回滚会重新校验，但不会重启进程。</p></div><button class="button primary" data-open-activate>激活新版本</button></div>
+        <div class="dashboard-grid">
+          <article class="panel wide"><div class="panel-heading"><div><span class="eyebrow">CONFIG HISTORY</span><h3>配置版本</h3></div></div><div id="version-list" class="version-list"><div class="empty">暂无版本</div></div></article>
+          <article class="panel"><div class="panel-heading"><div><span class="eyebrow">AUDIT</span><h3>最近操作</h3></div></div><div id="audit-list" class="audit-list"><div class="empty">暂无审计事件</div></div></article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="activate-dialog">
+    <form method="dialog" class="dialog-card" id="activate-form">
+      <div class="dialog-heading"><div><span class="eyebrow">HOT ACTIVATE</span><h2>激活 YAML 配置</h2></div><button value="cancel" class="close-button" aria-label="关闭">×</button></div>
+      <p>配置会先完成解析、引用检查和转换规则校验；失败时当前 active 快照保持不变。</p>
+      <label>配置 YAML<textarea id="activate-yaml" class="code config-editor" spellcheck="false" placeholder="version: 1&#10;listeners: ..."></textarea></label>
+      <label>版本说明<input id="activate-description" placeholder="例如：新增 OpenAI → Anthropic 适配"></label>
+      <div class="dialog-actions"><button value="cancel" class="button ghost">取消</button><button type="submit" value="default" class="button primary">校验并激活</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

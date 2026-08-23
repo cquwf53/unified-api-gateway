@@ -1,0 +1,20 @@
+{
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "headers": {
+    "Authorization": "Bearer fixture-client-key",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "model": "claude-3-5-sonnet",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello in one sentence."
+      }
+    ],
+    "max_tokens": 64,
+    "temperature": 0.2,
+    "stream": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/v2/customers",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Api-Version": "2",
+    "X-Gateway-Source": "unified"
+  },
+  "body": {
+    "id": 123,
+    "displayName": "Alice",
+    "client_extra": "preserve-me",
+    "source": "client"
+  }
+}

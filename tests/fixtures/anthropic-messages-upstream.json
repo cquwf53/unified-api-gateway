@@ -1,0 +1,26 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "headers": {
+    "Content-Type": "application/json",
+    "Anthropic-Version": "2023-06-01",
+    "X-Api-Key": "<secret-injected-at-runtime>"
+  },
+  "body": {
+    "model": "claude-3-5-sonnet",
+    "max_tokens": 64,
+    "temperature": 0.2,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Say hello in one sentence."
+          }
+        ]
+      }
+    ],
+    "stream": false
+  }
+}

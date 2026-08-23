@@ -1,0 +1,12 @@
+bin/
+unified-api-gateway
+unified-api-gateway.exe
+gateway.exe
+data/*.db
+data/*.db-shm
+data/*.db-wal
+.gocache/
+.run-cache/
+.gomodcache/
+.env
+*.log

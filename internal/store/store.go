@@ -1,0 +1,304 @@
+// Package store persists configuration history and lightweight audit data.
+// It intentionally keeps the data model small so the gateway can run as a
+// single binary; a future distributed control plane can replace this package.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "github.com/glebarez/sqlite"
+)
+
+type Store struct {
+	db *sql.DB
+}
+
+type Version struct {
+	ID          string `json:"id"`
+	CreatedAt   string `json:"created_at"`
+	CreatedBy   string `json:"created_by"`
+	Active      bool   `json:"active"`
+	SHA256      string `json:"sha256"`
+	Description string `json:"description,omitempty"`
+	YAML        []byte `json:"-"`
+}
+
+type AuditEvent struct {
+	Action    string         `json:"action"`
+	Actor     string         `json:"actor"`
+	VersionID string         `json:"version_id,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
+	Details   map[string]any `json:"details,omitempty"`
+	CreatedAt string         `json:"created_at"`
+}
+
+func Open(path string) (*Store, error) {
+	if path == "" {
+		path = "data/gateway.db"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create store directory: %w", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite store: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db}
+	if err := s.migrate(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS config_versions (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  yaml BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_config_versions_created ON config_versions(created_at DESC);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  version_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC);
+CREATE TABLE IF NOT EXISTS recordings (
+  key TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  content_type TEXT NOT NULL DEFAULT '',
+  headers_json TEXT NOT NULL DEFAULT '{}',
+  body BLOB NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC);
+`)
+	if err != nil {
+		return fmt.Errorf("migrate sqlite store: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) SaveVersion(ctx context.Context, version Version) error {
+	if version.ID == "" {
+		return fmt.Errorf("version id is required")
+	}
+	if version.CreatedAt == "" {
+		version.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if version.CreatedBy == "" {
+		version.CreatedBy = "system"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO config_versions
+ (id, created_at, created_by, active, sha256, description, yaml)
+ VALUES (?, ?, ?, ?, ?, ?, ?)`, version.ID, version.CreatedAt, version.CreatedBy,
+		boolInt(version.Active), version.SHA256, version.Description, version.YAML)
+	return err
+}
+
+func (s *Store) Activate(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE config_versions SET active = 0`); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE config_versions SET active = 1 WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("configuration version %q not found", id)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) Active(ctx context.Context) (Version, error) {
+	return s.get(ctx, `SELECT id, created_at, created_by, active, sha256, description, yaml
+FROM config_versions WHERE active = 1 ORDER BY created_at DESC LIMIT 1`)
+}
+
+func (s *Store) GetVersion(ctx context.Context, id string) (Version, error) {
+	return s.get(ctx, `SELECT id, created_at, created_by, active, sha256, description, yaml
+FROM config_versions WHERE id = ?`, id)
+}
+
+func (s *Store) get(ctx context.Context, query string, args ...any) (Version, error) {
+	var v Version
+	var active int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&v.ID, &v.CreatedAt, &v.CreatedBy,
+		&active, &v.SHA256, &v.Description, &v.YAML)
+	if err != nil {
+		return Version{}, err
+	}
+	v.Active = active != 0
+	return v, nil
+}
+
+func (s *Store) ListVersions(ctx context.Context, limit int) ([]Version, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, created_at, created_by, active, sha256, description
+FROM config_versions ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Version
+	for rows.Next() {
+		var v Version
+		var active int
+		if err := rows.Scan(&v.ID, &v.CreatedAt, &v.CreatedBy, &active, &v.SHA256, &v.Description); err != nil {
+			return nil, err
+		}
+		v.Active = active != 0
+		result = append(result, v)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) AddAudit(ctx context.Context, event AuditEvent) error {
+	if event.CreatedAt == "" {
+		event.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if event.Actor == "" {
+		event.Actor = "system"
+	}
+	details := event.Details
+	if details == nil {
+		details = map[string]any{}
+	}
+	b, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO audit_events
+ (action, actor, version_id, request_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		event.Action, event.Actor, event.VersionID, event.RequestID, string(b), event.CreatedAt)
+	return err
+}
+
+func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEvent, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT action, actor, version_id, request_id, details_json, created_at
+FROM audit_events ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		var details string
+		if err := rows.Scan(&event.Action, &event.Actor, &event.VersionID, &event.RequestID, &details, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(details), &event.Details)
+		result = append(result, event)
+	}
+	return result, rows.Err()
+}
+
+type Recording struct {
+	Key         string              `json:"key"`
+	ProfileID   string              `json:"profile_id"`
+	StatusCode  int                 `json:"status_code"`
+	ContentType string              `json:"content_type,omitempty"`
+	Headers     map[string][]string `json:"headers,omitempty"`
+	Body        []byte              `json:"-"`
+	CreatedAt   string              `json:"created_at"`
+}
+
+func (s *Store) SaveRecording(ctx context.Context, recording Recording) error {
+	if recording.Key == "" {
+		return fmt.Errorf("recording key is required")
+	}
+	if recording.CreatedAt == "" {
+		recording.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if recording.Headers == nil {
+		recording.Headers = map[string][]string{}
+	}
+	headers, err := json.Marshal(recording.Headers)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO recordings
+ (key, profile_id, status_code, content_type, headers_json, body, created_at)
+ VALUES (?, ?, ?, ?, ?, ?, ?)`, recording.Key, recording.ProfileID, recording.StatusCode,
+		recording.ContentType, string(headers), recording.Body, recording.CreatedAt)
+	return err
+}
+
+func (s *Store) GetRecording(ctx context.Context, key string) (Recording, error) {
+	var recording Recording
+	var headers string
+	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, status_code, content_type, headers_json, body, created_at
+FROM recordings WHERE key = ?`, key).Scan(&recording.Key, &recording.ProfileID, &recording.StatusCode,
+		&recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
+	if err != nil {
+		return Recording{}, err
+	}
+	if err := json.Unmarshal([]byte(headers), &recording.Headers); err != nil {
+		return Recording{}, err
+	}
+	return recording, nil
+}
+
+func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT key, profile_id, status_code, content_type, created_at
+FROM recordings ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Recording
+	for rows.Next() {
+		var recording Recording
+		if err := rows.Scan(&recording.Key, &recording.ProfileID, &recording.StatusCode, &recording.ContentType, &recording.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, recording)
+	}
+	return result, rows.Err()
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}

@@ -1,0 +1,256 @@
+# Unified API Gateway example configuration.
+#
+# This file is intentionally safe to commit: credentials are references to
+# environment variables, never literal API keys. Copy it and adjust the
+# upstream URLs, route matchers, and profile transforms for your deployment.
+version: 1
+
+listeners:
+  http: ":8780"
+  admin: "127.0.0.1:8781"
+  grpc: ":8782"
+
+upstreams:
+  # A local endpoint is useful for testing generic rewrites without making an
+  # external request. Start any HTTP echo service on port 8789 when exercising
+  # the transparent profile.
+  echo:
+    base_url: "http://127.0.0.1:8789"
+    protocol: http
+    timeout_ms: 10000
+
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    protocol: http
+    auth_ref: anthropic-api-key
+    timeout_ms: 60000
+    headers:
+      anthropic-version: "2023-06-01"
+
+  vercel-ai-gateway:
+    # OpenAI-compatible AI Gateway endpoint. The profile below selects the
+    # concrete model and pins the outbound client signature.
+    base_url: "https://ai-gateway.vercel.sh"
+    protocol: http
+    auth_ref: vercel-ai-gateway-key
+    timeout_ms: 120000
+    headers:
+      User-Agent: "eve/0.27.8"
+
+credentials:
+  # The server resolves this reference from the named environment variable.
+  # Do not replace it with a real key in a checked-in file.
+  anthropic-api-key:
+    type: env
+    env: ANTHROPIC_API_KEY
+  vercel-ai-gateway-key:
+    type: env
+    env: AI_GATEWAY_API_KEY
+
+clients:
+  local:
+    key_ref: env:GATEWAY_CLIENT_API_KEY
+    profiles: [user-v1-to-v2, openai-to-anthropic, openai-to-anthropic-dry-run, mock-chat, vercel-zai-glm-5-2]
+
+profiles:
+  # Generic JSON example: POST /api/v1/users becomes POST /v2/customers.
+  user-v1-to-v2:
+    adapter: transparent
+    client_contract: generic-json
+    upstream_contract: generic-json
+    traffic_mode: live
+    upstream: echo
+    stream_safe: false
+    max_body_bytes: 1048576
+    request:
+      path: /v2/customers
+      headers:
+        set:
+          X-Api-Version: "2"
+          X-Gateway-Source: unified
+        delete: [X-Debug]
+      query:
+        set:
+          source: gateway
+      body:
+        rename:
+          user_id: id
+          name: displayName
+        set:
+          source: client
+        delete: [debug]
+    response:
+      body:
+        rename:
+          id: user_id
+          displayName: name
+
+  # OpenAI-compatible clients can call /v1/chat/completions while the
+  # upstream receives Anthropic Messages at /v1/messages.
+  openai-to-anthropic:
+    adapter: openai-chat-to-anthropic
+    client_contract: openai-chat
+    upstream_contract: anthropic-messages
+    traffic_mode: live
+    upstream: anthropic
+    stream_safe: true
+    max_body_bytes: 2097152
+    request:
+      path: /v1/messages
+      headers:
+        set:
+          content-type: application/json
+    response:
+      headers:
+        set:
+          content-type: application/json
+
+  # Same adapter, but safe for trying a change in the UI: no upstream
+  # connection is opened in dry-run mode.
+  openai-to-anthropic-dry-run:
+    adapter: openai-chat-to-anthropic
+    client_contract: openai-chat
+    upstream_contract: anthropic-messages
+    traffic_mode: dry-run
+    upstream: anthropic
+    stream_safe: true
+    max_body_bytes: 2097152
+
+  # OpenAI-compatible client -> Vercel AI Gateway Chat Completions.
+  # The model is fixed here so clients can keep sending their usual model
+  # value; the gateway rewrites it to zai/glm-5.2 upstream.
+  vercel-zai-glm-5-2:
+    adapter: transparent
+    client_contract: openai-chat
+    upstream_contract: openai-chat
+    traffic_mode: live
+    upstream: vercel-ai-gateway
+    stream_safe: true
+    max_body_bytes: 2097152
+    request:
+      path: /v1/chat/completions
+      headers:
+        set:
+          User-Agent: "eve/0.27.8"
+          content-type: application/json
+      body:
+        set:
+          model: zai/glm-5.2
+        minimum:
+          # Cherry Studio connectivity checks use max_tokens=1. GLM 5.2 can
+          # spend the entire budget on reasoning and return an empty message,
+          # so only undersized requests are raised to a usable floor.
+          max_tokens: 128
+
+  # A deterministic profile for local UI and integration tests.
+  mock-chat:
+    adapter: transparent
+    client_contract: openai-chat
+    upstream_contract: openai-chat
+    traffic_mode: mock
+    upstream: echo
+    response:
+      body:
+        set:
+          id: chatcmpl_mock
+          object: chat.completion
+          choices:
+            - index: 0
+              message:
+                role: assistant
+                content: "This is a gateway mock response."
+              finish_reason: stop
+
+routes:
+  - id: user-rewrite
+    name: Generic user rewrite
+    priority: 100
+    match:
+      path: /api/v1/users
+      methods: [POST]
+    profile: user-v1-to-v2
+
+  # A canary header can opt a permitted client into dry-run without changing
+  # the default profile for everyone else.
+  - id: openai-dry-run-canary
+    name: OpenAI adapter dry-run canary
+    priority: 210
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      headers:
+        X-Gateway-Profile: canary
+    profile: openai-to-anthropic-dry-run
+
+  - id: openai-chat
+    name: OpenAI Chat to Anthropic
+    priority: 200
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+    profile: openai-to-anthropic
+
+  - id: vercel-glm-52
+    name: Vercel AI Gateway · GLM 5.2
+    priority: 220
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      headers:
+        X-Gateway-Profile: vercel-zai-glm-5-2
+    profile: vercel-zai-glm-5-2
+
+  - id: vercel-glm-52-model
+    name: Model route · zai/glm-5.2
+    priority: 230
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      model: zai/glm-5.2
+    profile: vercel-zai-glm-5-2
+
+  - id: vercel-glm-52-alias
+    name: Client alias route · vercel-zai-glm-5-2
+    priority: 231
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      model: vercel-zai-glm-5-2
+    profile: vercel-zai-glm-5-2
+
+  - id: mock-chat
+    name: Local mock chat
+    priority: 50
+    match:
+      path: /v1/chat/completions/mock
+      methods: [POST]
+    profile: mock-chat
+
+transforms:
+  # Reusable transforms may be referenced from profile.request.transforms or
+  # profile.response.transforms. Inline rules are also supported.
+  add-client-source:
+    headers:
+      set:
+        X-Gateway-Source: unified
+
+policies:
+  defaults:
+    request_timeout_ms: 60000
+    max_concurrency: 128
+    retry:
+      max_attempts: 2
+      idempotent_only: true
+    circuit_breaker:
+      failure_threshold: 5
+      reset_timeout_ms: 30000
+  audit:
+    enabled: true
+    redact: [authorization, x-api-key, prompt, response_body]
+
+observability:
+  log_level: info
+  request_id_header: X-Request-Id
+  metrics: true
+  tracing: false
+  record_body: false
