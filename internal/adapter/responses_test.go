@@ -44,7 +44,7 @@ func TestAnthropicToResponsesStream(t *testing.T) {
 			t.Fatal("Responses streams must not carry a [DONE] sentinel")
 		}
 	}
-	want := "response.created,response.output_item.added,response.output_text.delta,response.output_text.delta,response.completed"
+	want := "response.created,response.in_progress,response.output_item.added,response.content_part.added,response.output_text.delta,response.output_text.delta,response.content_part.done,response.output_item.done,response.completed"
 	if strings.Join(types, ",") != want {
 		t.Fatalf("sequence=%v", types)
 	}
@@ -55,6 +55,16 @@ func TestAnthropicToResponsesStream(t *testing.T) {
 	response := completed["response"].(map[string]any)
 	if response["status"] != "completed" || response["id"] != "msg_1" {
 		t.Fatalf("completed response=%#v", response)
+	}
+	// Clients that read event.response instead of accumulating deltas must
+	// still receive the full message text.
+	item := response["output"].([]any)[0].(map[string]any)
+	if item["id"] != "msg_0" {
+		t.Fatalf("output item id must match the delta item_id, got %v", item["id"])
+	}
+	text := item["content"].([]any)[0].(map[string]any)["text"]
+	if text != "Hello" {
+		t.Fatalf("completed output text=%v, want accumulated \"Hello\"", text)
 	}
 	usage := response["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(5) || usage["output_tokens"] != float64(2) || usage["total_tokens"] != float64(7) {

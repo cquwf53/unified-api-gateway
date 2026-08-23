@@ -87,6 +87,85 @@ func TestUpstreamErrorAnthropicClientEnvelope(t *testing.T) {
 	}
 }
 
+// TestNativeOpenAIErrorPassesThroughUnchanged pins that an upstream error
+// already speaking the client's vocabulary is forwarded verbatim: rewriting
+// it would collapse provider error codes (rate_limit_exceeded, ...) that
+// retry middleware branches on.
+func TestNativeOpenAIErrorPassesThroughUnchanged(t *testing.T) {
+	upstreamBody := `{"error":{"message":"Rate limit reached","type":"tokens","param":null,"code":"rate_limit_exceeded"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+	// The vercel-zai-glm-5-2 shape: transparent adapter, openai-chat client.
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{
+		"p": {Name: "p", Adapter: "transparent", ClientContract: "openai-chat", UpstreamContract: "openai-chat", TrafficMode: "live", Upstream: "u"},
+	}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d", recorder.Code)
+	}
+	if strings.TrimSpace(recorder.Body.String()) != upstreamBody {
+		t.Fatalf("native error envelope was rewritten:\n got %s\nwant %s", recorder.Body.String(), upstreamBody)
+	}
+}
+
+// TestErrorResponsesStillRunResponseTransforms pins that status_map and
+// header rules apply to error responses - remapping upstream errors is their
+// main use case.
+func TestErrorResponsesStillRunResponseTransforms(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{
+		"p": {Name: "p", Adapter: "transparent", ClientContract: "openai-chat", TrafficMode: "live", Upstream: "u",
+			Response: transformSpec(`
+status_map:
+  500: 503
+headers:
+  set:
+    Retry-After: "5"
+`)},
+	}, Routes: []config.Route{{ID: "chat", Match: config.RouteMatch{Path: "/v1/chat/completions"}, Profile: "p"}}}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status_map did not remap the error: %d", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") != "5" {
+		t.Fatalf("header rule skipped on error response")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["error"].(map[string]any)["message"] != "boom" {
+		t.Fatalf("error message lost: %s", recorder.Body.String())
+	}
+}
+
 // TestUnknownAdapterRejectedAtValidation closes the gap where a typo'd
 // adapter name passed every precheck and only failed at request time.
 func TestUnknownAdapterRejectedAtValidation(t *testing.T) {

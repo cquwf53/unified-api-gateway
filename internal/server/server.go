@@ -653,8 +653,10 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 		// An upstream error body is not a protocol response: adapting it
 		// would fabricate an empty "successful" message and destroy the
 		// upstream's diagnosis. Answer with the client contract's error
-		// envelope and keep the upstream words verbatim.
-		return errorEnvelope(profile.ClientContract, response), nil
+		// envelope (verbatim when the upstream already speaks it) and still
+		// run the response transform chain so status_map/header rules keep
+		// working on errors.
+		return s.applyResponseTransforms(ctx, cfg, profile, errorEnvelope(profile.ClientContract, response))
 	}
 	a, ok := s.registry.Get(profile.Adapter)
 	if !ok {
@@ -733,9 +735,15 @@ func upstreamErrorMessage(body []byte) string {
 }
 
 // errorEnvelope renders an upstream error in the client's protocol shape,
-// preserving the original status code and message.
+// preserving the original status code and message. When the upstream already
+// speaks the client's error vocabulary the envelope is forwarded verbatim:
+// rewriting it would collapse provider error codes (rate_limit_exceeded,
+// insufficient_quota, ...) that retry middleware branches on.
 func errorEnvelope(clientContract string, response transform.Envelope) transform.Envelope {
 	contract := strings.ToLower(clientContract)
+	if errorMatchesContract(contract, response.Body) {
+		return response
+	}
 	contentType := "application/json"
 	message := upstreamErrorMessage(response.Body)
 	var payload []byte
@@ -754,6 +762,29 @@ func errorEnvelope(clientContract string, response transform.Envelope) transform
 		headers.Set("Content-Type", contentType)
 	}
 	return transform.Envelope{StatusCode: response.StatusCode, Headers: headers, Body: payload, ContentType: contentType}
+}
+
+// errorMatchesContract reports whether an upstream error body already uses
+// the client contract's error shape and can be forwarded as-is.
+func errorMatchesContract(contract string, body []byte) bool {
+	var probe struct {
+		Error json.RawMessage `json:"error"`
+		Type  string          `json:"type"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return false
+	}
+	hasErrorObject := len(probe.Error) > 0 && probe.Error[0] == '{'
+	switch {
+	case strings.Contains(contract, "anthropic"):
+		return probe.Type == "error" && hasErrorObject
+	case strings.Contains(contract, "openai"), strings.Contains(contract, "responses"):
+		// OpenAI errors are a bare {"error":{...}}; Anthropic errors also
+		// carry a top-level type:"error" marker and must still be translated.
+		return hasErrorObject && probe.Type != "error"
+	default:
+		return true
+	}
 }
 
 func (s *Server) applyResponseTransforms(ctx context.Context, cfg *config.Config, profile config.Profile, response transform.Envelope) (transform.Envelope, error) {

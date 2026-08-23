@@ -144,6 +144,7 @@ type SSETranslator struct {
 	respStarted   bool
 	respCompleted bool
 	respUsage     map[string]any
+	respText      strings.Builder
 }
 
 // NewSSETranslator returns a translator between two contract names such as
@@ -246,8 +247,9 @@ func eventType(event SSEEvent, payload map[string]any) string {
 }
 
 // anthropicToResponses converts Anthropic events into the OpenAI Responses
-// streaming protocol (response.created, response.output_item.added,
-// response.output_text.delta, response.completed).
+// streaming protocol, including the full item/part lifecycle and a terminal
+// response.completed that carries the complete assembled message (many
+// clients read event.response instead of accumulating deltas).
 func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]any) []SSEEvent {
 	switch eventType(event, payload) {
 	case "message_start":
@@ -266,17 +268,24 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			return nil
 		}
 		t.respStarted = true
-		created := sseEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")})
-		added := sseEvent("response.output_item.added", map[string]any{
-			"type": "response.output_item.added", "output_index": 0,
-			"item": map[string]any{"type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
-		})
-		return []SSEEvent{created, added}
+		return []SSEEvent{
+			sseEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")}),
+			sseEvent("response.in_progress", map[string]any{"type": "response.in_progress", "response": t.responsesResponse("in_progress")}),
+			sseEvent("response.output_item.added", map[string]any{
+				"type": "response.output_item.added", "output_index": 0,
+				"item": t.responsesMessageItem("in_progress"),
+			}),
+			sseEvent("response.content_part.added", map[string]any{
+				"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			}),
+		}
 	case "content_block_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
 			if text := asString(d["text"]); text != "" {
+				t.respText.WriteString(text)
 				return []SSEEvent{sseEvent("response.output_text.delta", map[string]any{
-					"type": "response.output_text.delta", "item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": text,
+					"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
 				})}
 			}
 		}
@@ -301,9 +310,38 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 	case "message_stop":
 		t.doneSent = true
 		return t.responsesCompleted(nil)
+	case "error":
+		return t.responsesFailed(payload)
 	default:
 		return nil
 	}
+}
+
+// responsesItemID is the stable identifier linking output_item events with
+// their content parts and text deltas.
+const responsesItemID = "msg_0"
+
+// responsesMessageItem builds the message output item for item.added/done and
+// the completed response's output array.
+func (t *SSETranslator) responsesMessageItem(status string) map[string]any {
+	item := map[string]any{"id": responsesItemID, "type": "message", "role": "assistant", "status": status}
+	if status == "completed" {
+		item["content"] = []any{map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}}}
+	} else {
+		item["content"] = []any{}
+	}
+	return item
+}
+
+// responsesFailed maps an upstream Anthropic error event onto the Responses
+// failure event.
+func (t *SSETranslator) responsesFailed(payload map[string]any) []SSEEvent {
+	t.doneSent = true
+	response := t.responsesResponse("failed")
+	if errPayload, ok := payload["error"].(map[string]any); ok {
+		response["error"] = errPayload
+	}
+	return []SSEEvent{sseEvent("response.failed", map[string]any{"type": "response.failed", "response": response})}
 }
 
 // responsesResponse builds the response object embedded in Responses events.
@@ -319,8 +357,9 @@ func (t *SSETranslator) responsesResponse(status string) map[string]any {
 	return map[string]any{"id": id, "object": "response", "status": status, "model": model}
 }
 
-// responsesCompleted emits the terminal response.completed event (with usage
-// when available). It is idempotent per translator.
+// responsesCompleted emits the terminal content_part.done, output_item.done
+// and response.completed events (with the accumulated text and usage). It is
+// idempotent per translator.
 func (t *SSETranslator) responsesCompleted(usage map[string]any) []SSEEvent {
 	if t.respCompleted {
 		return nil
@@ -335,8 +374,18 @@ func (t *SSETranslator) responsesCompleted(usage map[string]any) []SSEEvent {
 		usage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"]), "total_tokens": total}
 		response["usage"] = usage
 	}
-	response["output"] = []any{map[string]any{"type": "message", "role": "assistant", "status": "completed", "content": []any{}}}
-	return []SSEEvent{sseEvent("response.completed", map[string]any{"type": "response.completed", "response": response})}
+	item := t.responsesMessageItem("completed")
+	response["output"] = []any{item}
+	return []SSEEvent{
+		sseEvent("response.content_part.done", map[string]any{
+			"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+			"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
+		}),
+		sseEvent("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": 0, "item": item,
+		}),
+		sseEvent("response.completed", map[string]any{"type": "response.completed", "response": response}),
+	}
 }
 
 // responsesToAnthropic converts a Responses stream into Anthropic events by
@@ -361,6 +410,16 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 		}
 		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}),
 			t.openAIEventToAnthropic(SSEEvent{Data: ""}, chunk)...)
+	case "response.failed":
+		message := "upstream request failed"
+		if response, ok := payload["response"].(map[string]any); ok {
+			if errPayload, ok := response["error"].(map[string]any); ok {
+				if text := asString(errPayload["message"]); text != "" {
+					message = text
+				}
+			}
+		}
+		return []SSEEvent{sseEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": "upstream_error", "message": message}})}
 	default:
 		return nil
 	}
