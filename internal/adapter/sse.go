@@ -145,6 +145,16 @@ type SSETranslator struct {
 	respCompleted bool
 	respUsage     map[string]any
 	respText      strings.Builder
+	respStop      string
+	respSeq       int
+}
+
+// respEvent stamps the sequence number every Responses protocol event
+// carries and wraps the payload in a named SSE event.
+func (t *SSETranslator) respEvent(name string, payload map[string]any) SSEEvent {
+	t.respSeq++
+	payload["sequence_number"] = t.respSeq
+	return sseEvent(name, payload)
 }
 
 // NewSSETranslator returns a translator between two contract names such as
@@ -160,6 +170,9 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 		return []SSEEvent{event}, nil
 	}
 	if strings.EqualFold(event.Data, "[DONE]") {
+		if t.doneSent {
+			return nil, nil
+		}
 		return t.translateDone(), nil
 	}
 	var payload map[string]any
@@ -176,6 +189,16 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 		return t.responsesToAnthropic(event, payload), nil
 	}
 	if strings.Contains(t.from, "anthropic") && strings.Contains(t.to, "openai") {
+		if t.doneSent {
+			return nil, nil // the stream already terminated (error or [DONE])
+		}
+		if eventType(event, payload) == "error" {
+			// OpenAI streams surface mid-stream errors as a {"error":{...}}
+			// data frame; the stream then ends. The error must not vanish
+			// behind a normal-looking finish.
+			t.doneSent = true
+			return []SSEEvent{openAIStreamErrorEvent(payload), {Data: "[DONE]"}}, nil
+		}
 		out, err := t.anthropicEventToOpenAI(event, payload)
 		if err != nil {
 			return nil, err
@@ -206,7 +229,7 @@ func (t *SSETranslator) translateDone() []SSEEvent {
 	t.doneSent = true
 	if strings.Contains(t.to, "responses") {
 		// Responses streams terminate with response.completed, not [DONE].
-		return t.responsesCompleted(nil)
+		return t.responsesTerminal()
 	}
 	if !strings.Contains(t.from, "openai") || !strings.Contains(t.to, "anthropic") {
 		return []SSEEvent{{Data: "[DONE]"}}
@@ -234,7 +257,7 @@ func (t *SSETranslator) Finish() []SSEEvent {
 	}
 	if strings.Contains(t.to, "responses") {
 		t.doneSent = true
-		return t.responsesCompleted(nil)
+		return t.responsesTerminal()
 	}
 	return nil
 }
@@ -269,13 +292,13 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 		}
 		t.respStarted = true
 		return []SSEEvent{
-			sseEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")}),
-			sseEvent("response.in_progress", map[string]any{"type": "response.in_progress", "response": t.responsesResponse("in_progress")}),
-			sseEvent("response.output_item.added", map[string]any{
+			t.respEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")}),
+			t.respEvent("response.in_progress", map[string]any{"type": "response.in_progress", "response": t.responsesResponse("in_progress")}),
+			t.respEvent("response.output_item.added", map[string]any{
 				"type": "response.output_item.added", "output_index": 0,
 				"item": t.responsesMessageItem("in_progress"),
 			}),
-			sseEvent("response.content_part.added", map[string]any{
+			t.respEvent("response.content_part.added", map[string]any{
 				"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
 				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			}),
@@ -284,13 +307,18 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 		if d, ok := payload["delta"].(map[string]any); ok {
 			if text := asString(d["text"]); text != "" {
 				t.respText.WriteString(text)
-				return []SSEEvent{sseEvent("response.output_text.delta", map[string]any{
+				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
 					"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
 				})}
 			}
 		}
 		return nil
 	case "message_delta":
+		if d, ok := payload["delta"].(map[string]any); ok {
+			if reason := asString(d["stop_reason"]); reason != "" {
+				t.respStop = reason
+			}
+		}
 		if usage, ok := payload["usage"].(map[string]any); ok {
 			// message_start carries the prompt tokens while message_delta
 			// only reports the completion side; merge instead of overwriting.
@@ -309,7 +337,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 		return nil
 	case "message_stop":
 		t.doneSent = true
-		return t.responsesCompleted(nil)
+		return t.responsesTerminal()
 	case "error":
 		return t.responsesFailed(payload)
 	default:
@@ -341,7 +369,7 @@ func (t *SSETranslator) responsesFailed(payload map[string]any) []SSEEvent {
 	if errPayload, ok := payload["error"].(map[string]any); ok {
 		response["error"] = errPayload
 	}
-	return []SSEEvent{sseEvent("response.failed", map[string]any{"type": "response.failed", "response": response})}
+	return []SSEEvent{t.respEvent("response.failed", map[string]any{"type": "response.failed", "response": response})}
 }
 
 // responsesResponse builds the response object embedded in Responses events.
@@ -357,18 +385,23 @@ func (t *SSETranslator) responsesResponse(status string) map[string]any {
 	return map[string]any{"id": id, "object": "response", "status": status, "model": model}
 }
 
-// responsesCompleted emits the terminal content_part.done, output_item.done
-// and response.completed events (with the accumulated text and usage). It is
-// idempotent per translator.
-func (t *SSETranslator) responsesCompleted(usage map[string]any) []SSEEvent {
+// responsesTerminal emits the closing output_text.done, content_part.done,
+// output_item.done and the final completed/incomplete event (with the
+// accumulated text and usage). It is idempotent per translator.
+func (t *SSETranslator) responsesTerminal() []SSEEvent {
 	if t.respCompleted {
 		return nil
 	}
 	t.respCompleted = true
-	if usage == nil {
-		usage = t.respUsage
-	}
+	usage := t.respUsage
 	response := t.responsesResponse("completed")
+	finalEvent := "response.completed"
+	if t.respStop == "max_tokens" {
+		// A length-limited generation terminates with response.incomplete.
+		finalEvent = "response.incomplete"
+		response["status"] = "incomplete"
+		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
 	if usage != nil {
 		total := numberOrZero(usage["input_tokens"]) + numberOrZero(usage["output_tokens"])
 		usage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"]), "total_tokens": total}
@@ -377,14 +410,18 @@ func (t *SSETranslator) responsesCompleted(usage map[string]any) []SSEEvent {
 	item := t.responsesMessageItem("completed")
 	response["output"] = []any{item}
 	return []SSEEvent{
-		sseEvent("response.content_part.done", map[string]any{
+		t.respEvent("response.output_text.done", map[string]any{
+			"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+			"text": t.respText.String(),
+		}),
+		t.respEvent("response.content_part.done", map[string]any{
 			"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
 		}),
-		sseEvent("response.output_item.done", map[string]any{
+		t.respEvent("response.output_item.done", map[string]any{
 			"type": "response.output_item.done", "output_index": 0, "item": item,
 		}),
-		sseEvent("response.completed", map[string]any{"type": "response.completed", "response": response}),
+		t.respEvent(finalEvent, map[string]any{"type": finalEvent, "response": response}),
 	}
 }
 
@@ -427,6 +464,21 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 }
 
 func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[string]any) []SSEEvent {
+	if errPayload, ok := payload["error"].(map[string]any); ok {
+		// Anthropic streams report failures as an error event and close the
+		// stream; a normal message_stop afterwards would disguise the failure.
+		t.doneSent = true
+		t.finishSent = true
+		errType := asString(errPayload["type"])
+		if errType == "" {
+			errType = "api_error"
+		}
+		message := asString(errPayload["message"])
+		if message == "" {
+			message = "upstream error"
+		}
+		return []SSEEvent{sseEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": errType, "message": message}})}
+	}
 	var out []SSEEvent
 	if asString(payload["id"]) != "" {
 		t.streamID = asString(payload["id"])
@@ -587,6 +639,34 @@ func mapFinishReason(reason string) string {
 	default:
 		return reason
 	}
+}
+
+// openAIStreamErrorEvent reshapes an upstream error payload into the
+// {"error":{...}} data frame OpenAI streams use for mid-stream failures.
+func openAIStreamErrorEvent(payload map[string]any) SSEEvent {
+	errObj, _ := payload["error"].(map[string]any)
+	out := map[string]any{}
+	if errObj != nil {
+		if message := asString(errObj["message"]); message != "" {
+			out["message"] = message
+		}
+		if errType := asString(errObj["type"]); errType != "" {
+			out["type"] = errType
+		}
+		if code := errObj["code"]; code != nil {
+			out["code"] = code
+		}
+	}
+	if out["type"] == nil {
+		if errType := asString(payload["type"]); errType != "" && errType != "error" {
+			out["type"] = errType
+		}
+	}
+	if out["message"] == nil {
+		out["message"] = "upstream stream error"
+	}
+	b, _ := json.Marshal(map[string]any{"error": out})
+	return SSEEvent{Data: string(b)}
 }
 
 func openAIUsageToAnthropic(usage map[string]any) map[string]any {

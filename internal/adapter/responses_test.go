@@ -44,9 +44,19 @@ func TestAnthropicToResponsesStream(t *testing.T) {
 			t.Fatal("Responses streams must not carry a [DONE] sentinel")
 		}
 	}
-	want := "response.created,response.in_progress,response.output_item.added,response.content_part.added,response.output_text.delta,response.output_text.delta,response.content_part.done,response.output_item.done,response.completed"
+	want := "response.created,response.in_progress,response.output_item.added,response.content_part.added,response.output_text.delta,response.output_text.delta,response.output_text.done,response.content_part.done,response.output_item.done,response.completed"
 	if strings.Join(types, ",") != want {
 		t.Fatalf("sequence=%v", types)
+	}
+	// Every Responses protocol event carries an incrementing sequence_number.
+	for index, event := range translated {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["sequence_number"] != float64(index+1) {
+			t.Fatalf("event %d has sequence_number %v", index, payload["sequence_number"])
+		}
 	}
 	var completed map[string]any
 	if err := json.Unmarshal([]byte(translated[len(translated)-1].Data), &completed); err != nil {
@@ -121,4 +131,94 @@ func TestAnthropicBlockIndexesStartAtZero(t *testing.T) {
 		return
 	}
 	t.Fatal("no content_block_start in translated stream")
+}
+
+func TestResponsesIncompleteOnMaxTokens(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-responses")
+	last := translated[len(translated)-1]
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(last.Data), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["type"] != "response.incomplete" {
+		t.Fatalf("length-limited stream must end with response.incomplete, got %v", payload["type"])
+	}
+	response := payload["response"].(map[string]any)
+	if response["status"] != "incomplete" || response["incomplete_details"].(map[string]any)["reason"] != "max_output_tokens" {
+		t.Fatalf("incomplete response=%#v", response)
+	}
+	if response["usage"].(map[string]any)["output_tokens"] != float64(9) {
+		t.Fatalf("usage lost on incomplete: %#v", response["usage"])
+	}
+}
+
+func TestStreamErrorAnthropicToOpenAIChat(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"half a sent\"}}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-chat")
+	var errorChunk map[string]any
+	sawDone, sawFinish := false, false
+	for _, event := range translated {
+		if event.Data == "[DONE]" {
+			sawDone = true
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := payload["error"]; ok {
+			errorChunk = payload
+		}
+		if choices, ok := payload["choices"].([]any); ok && len(choices) > 0 {
+			if choices[0].(map[string]any)["finish_reason"] != nil {
+				sawFinish = true
+			}
+		}
+	}
+	if errorChunk == nil {
+		t.Fatalf("upstream error vanished: %s", EncodeSSE(translated))
+	}
+	errObj := errorChunk["error"].(map[string]any)
+	if errObj["message"] != "Overloaded" || errObj["type"] != "overloaded_error" {
+		t.Fatalf("error payload=%#v", errObj)
+	}
+	if !sawDone {
+		t.Fatal("stream must terminate with [DONE] after the error frame")
+	}
+	if sawFinish {
+		t.Fatal("a normal finish_reason chunk after the error would disguise the failure")
+	}
+}
+
+func TestStreamErrorOpenAIChatToAnthropic(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half a sent\"}}]}\n\n" +
+		"data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\",\"code\":null}}\n\n" +
+		"data: [DONE]\n\n"
+	translated := mustTranslate(t, raw, "openai-chat", "anthropic-messages")
+	sawErrorEvent, sawMessageStop := false, false
+	for _, event := range translated {
+		if event.Event == "error" || strings.Contains(event.Data, "\"type\":\"error\"") {
+			if !strings.Contains(event.Data, "The server had an error") {
+				t.Fatalf("error message lost: %s", event.Data)
+			}
+			sawErrorEvent = true
+		}
+		if strings.Contains(event.Data, "message_stop") {
+			sawMessageStop = true
+		}
+	}
+	if !sawErrorEvent {
+		t.Fatalf("upstream error vanished: %s", EncodeSSE(translated))
+	}
+	if sawMessageStop {
+		t.Fatal("a normal message_stop after the error would disguise the failure")
+	}
 }
