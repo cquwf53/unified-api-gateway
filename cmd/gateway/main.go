@@ -41,6 +41,7 @@ func run(args []string) error {
 	configPath := flags.String("config", defaultConfigPath, "YAML configuration path")
 	dbPath := flags.String("db", "data/gateway.db", "SQLite audit/history path")
 	httpAddr := flags.String("http", "", "override data-plane listen address")
+	preferFile := flags.Bool("prefer-file", false, "always start from the --config file, ignoring any stored active version")
 	adminAddr := flags.String("admin", "", "override management listen address")
 	adminURL := flags.String("admin-url", "http://127.0.0.1:8781", "running management API URL for hot activation")
 	adminToken := flags.String("admin-token", "", "management API token (defaults to $GATEWAY_ADMIN_TOKEN)")
@@ -69,7 +70,7 @@ func run(args []string) error {
 	case "preview":
 		return preview(*configPath)
 	case "serve":
-		return serve(*configPath, *dbPath, *httpAddr, *adminAddr)
+		return serve(*configPath, *dbPath, *httpAddr, *adminAddr, *preferFile)
 	default:
 		return fmt.Errorf("unknown command %q (use serve, validate, preview, activate, rollback, or status)", command)
 	}
@@ -91,7 +92,7 @@ func loadSnapshot(configPath string) (*config.ConfigSnapshot, []byte, error) {
 	return snapshot, data, nil
 }
 
-func serve(configPath, dbPath, httpOverride, adminOverride string) error {
+func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bool) error {
 	baseSnapshot, data, err := loadSnapshot(configPath)
 	if err != nil {
 		return err
@@ -106,7 +107,10 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 	// on-disk config file. data must follow the snapshot: saving the file
 	// YAML under the restored version's id would overwrite the stored
 	// configuration (SaveVersion is INSERT OR REPLACE).
-	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 {
+	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 && !preferFile {
+		if active.SHA256 != "" && active.SHA256 != baseSnapshot.Hash {
+			slog.Warn("stored active configuration differs from the config file; the stored version wins (use --prefer-file to change this)", "stored_id", active.ID, "file_id", baseSnapshot.ID)
+		}
 		if activeCfg, parseErr := config.Parse(active.YAML); parseErr == nil {
 			if activeSnapshot, snapErr := config.NewSnapshot(activeCfg, "store:"+active.ID); snapErr == nil {
 				baseSnapshot, data = activeSnapshot, active.YAML
@@ -214,7 +218,7 @@ func activate(configPath, dbPath, adminURL, adminToken string) error {
 				return nil
 			}
 			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-				fallbackReason = fmt.Sprintf("management API rejected the activation (HTTP %d; check --admin-token or GATEWAY_ADMIN_TOKEN)", response.StatusCode)
+				return fmt.Errorf("management API rejected the activation (HTTP %d; check --admin-token or GATEWAY_ADMIN_TOKEN); nothing was saved", response.StatusCode)
 			}
 		}
 	}

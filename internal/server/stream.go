@@ -94,7 +94,7 @@ func (s *Server) streamUpstream(ctx context.Context, cfg *config.Config, upstrea
 // the client sees a real-time stream instead of a buffered burst. When the
 // upstream answers with a non-event-stream body (typically an error JSON),
 // the response falls back to the buffered conversion pipeline.
-func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, w http.ResponseWriter) (status int, headersSent bool, err error) {
+func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewayState, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, w http.ResponseWriter) (status int, headersSent bool, err error) {
 	request, err := buildUpstreamRequest(ctx, cfg, upstream, in, requestID)
 	if err != nil {
 		return 0, false, upstreamError{status: http.StatusBadGateway, code: "build_upstream_request", err: err}
@@ -110,7 +110,7 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Confi
 		if bufErr != nil {
 			return response.StatusCode, false, bufErr
 		}
-		out, prepErr := s.prepareResponse(ctx, cfg, profile, buffered)
+		out, prepErr := s.prepareResponse(ctx, pinned, cfg, profile, buffered)
 		if prepErr != nil {
 			return http.StatusBadGateway, false, prepErr
 		}
@@ -131,6 +131,7 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Confi
 	translator := adapter.NewSSETranslator(profile.UpstreamContract, profile.ClientContract)
 	max := responseLimit(profile)
 	var total int64
+	var upstreamReadFailed bool
 	streamErr := adapter.ReadSSEStream(response.Body, func(event adapter.SSEEvent) error {
 		outEvents, translateErr := translator.Translate(event)
 		if translateErr != nil {
@@ -153,6 +154,17 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, cfg *config.Confi
 		return nil
 	})
 	if streamErr != nil {
+		// A read failure must not leave the client without a terminator:
+		// emit whatever closing events the target protocol requires before
+		// reporting the error for telemetry.
+		upstreamReadFailed = true
+		if finishing := translator.Finish(); len(finishing) > 0 {
+			_, _ = w.Write(adapter.EncodeSSE(finishing))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		_ = upstreamReadFailed
 		return status, headersSent, streamErr
 	}
 	// Emit the client contract's terminator when the upstream stream ended

@@ -74,3 +74,64 @@ func TestUnknownKeyErrorReportsAccurateLine(t *testing.T) {
 		t.Fatalf("error should report line 5 (original file line), got: %v", err)
 	}
 }
+
+func TestNamedTransformReferenceValidated(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+profiles:
+  p:
+    adapter: transparent
+    request:
+      name: does-not-exist
+`))
+	if err == nil {
+		t.Fatal("missing named transform must fail validation")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Fatalf("error should name the transform: %v", err)
+	}
+}
+
+func TestDuplicateRouteMatchersRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+profiles:
+  p:
+    adapter: transparent
+routes:
+  - id: one
+    match:
+      path: /v1/x
+    profile: p
+  - id: two
+    match:
+      path: /v1/x
+    profile: p
+`))
+	if err == nil {
+		t.Fatal("identical matchers must be rejected")
+	}
+	if !strings.Contains(err.Error(), "identical matchers") {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+func TestAuthRefValidated(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+upstreams:
+  u:
+    base_url: http://127.0.0.1:1
+    auth_ref: missing-cred
+profiles:
+  p:
+    adapter: transparent
+    upstream: u
+`))
+	if err == nil {
+		t.Fatal("missing auth_ref must fail validation")
+	}
+	if !strings.Contains(err.Error(), "missing-cred") {
+		t.Fatalf("error: %v", err)
+	}
+}

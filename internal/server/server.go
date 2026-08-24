@@ -50,6 +50,14 @@ type gatewayState struct {
 	snapshot  *config.ConfigSnapshot
 	runtimes  map[string]*profileRuntime
 	pipelines map[string]*compiledPipeline
+	policy    policySet
+}
+
+// allowsAnonymousOverride reports whether open-mode X-Gateway-Profile
+// requests may select a profile without client authentication. All planes
+// (HTTP, WebSocket, gRPC) must consult the same pinned state.
+func (st *gatewayState) allowsAnonymousOverride() bool {
+	return st == nil || st.policy.allowAnonymousProfileOverride
 }
 
 type Server struct {
@@ -115,6 +123,7 @@ func (s *Server) publishState(snapshot *config.ConfigSnapshot) {
 		snapshot:  snapshot,
 		runtimes:  s.buildRuntimes(cfg),
 		pipelines: buildPipelines(cfg),
+		policy:    decodePolicySet(cfg),
 	}
 	s.warnInsecureUpstreams(cfg)
 	s.state.Store(state)
@@ -248,9 +257,11 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 			s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
 			return
 		}
-		if err := s.store.Ping(r.Context()); err != nil {
-			s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "store": err.Error()})
-			return
+		if s.store != nil {
+			if err := s.store.Ping(r.Context()); err != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "store": err.Error()})
+				return
+			}
 		}
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "config": s.Snapshot().ID})
 		return
@@ -353,7 +364,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, status, stage, code, message, "")
 		s.observe("", started, r, selectedRoute, profile, upstreamName, status, stage, code)
 	}
-	snapshot := s.Snapshot()
+	// Pin every derived view (config, runtimes, pipelines, policy) for the
+	// whole request: a concurrent activation must not mix versions mid-flight
+	// or strip policy enforcement from an in-flight request.
+	pinned := s.state.Load()
+	snapshot := pinned.snapshot
 	if snapshot == nil || snapshot.Config == nil {
 		observeFailure(http.StatusServiceUnavailable, "config", "not_ready", "no active configuration")
 		return
@@ -403,7 +418,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	match.Tenant = tenant
 	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
 	if match.Profile != "" && !requiresClientAuth(cfg) && clientID == "" {
-		if !decodePolicySet(cfg).allowAnonymousProfileOverride {
+		if !pinned.allowsAnonymousOverride() {
 			fail(http.StatusForbidden, "auth", "profile_override_denied", "anonymous profile overrides are disabled by policy")
 			return
 		}
@@ -452,7 +467,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		mode = "live"
 	}
 	willCallUpstream := mode == "live" || mode == "shadow" || mode == "record"
-	rt := s.runtimeFor(profile.Name)
+	rt := pinned.runtimes[profile.Name]
 	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, willCallUpstream)
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
@@ -478,7 +493,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"client_stream": requestStream(body) || strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream"),
 		},
 	}
-	prepared, err := s.prepareRequest(r.Context(), cfg, *profile, in)
+	prepared, err := s.prepareRequest(r.Context(), pinned, cfg, *profile, in)
 	if err != nil {
 		fail(http.StatusUnprocessableEntity, "transform", "request_transform_failed", safeError(err))
 		return
@@ -491,7 +506,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "mock" {
 		response := transform.Envelope{StatusCode: http.StatusOK, Headers: make(http.Header), Body: []byte(`{}`), ContentType: "application/json"}
-		response, err = s.applyResponseTransforms(r.Context(), cfg, *profile, response)
+		response, err = s.applyResponseTransforms(r.Context(), pinned, cfg, *profile, response)
 		if err != nil {
 			fail(http.StatusBadGateway, "transform", "mock_response_failed", safeError(err))
 			return
@@ -547,7 +562,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// live stream instead of a buffered burst. An explicit
 		// stream_safe: false opts out (the response is then buffered and
 		// converted as a whole).
-		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
+		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), pinned, cfg, upstream, *profile, prepared, requestID, w)
 		recordStreamResult(rt, headersSent, status, streamErr)
 		if streamErr != nil && !headersSent {
 			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
@@ -574,7 +589,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		s.dispatchShadow(cfg, shadowUpstream, *profile, prepared, requestID)
 	}
-	response, err := s.prepareResponse(r.Context(), cfg, *profile, upstreamEnvelope)
+	response, err := s.prepareResponse(r.Context(), pinned, cfg, *profile, upstreamEnvelope)
 	if err != nil {
 		fail(http.StatusBadGateway, "transform", "response_transform_failed", safeError(err))
 		return
@@ -639,7 +654,7 @@ func streamErrorCode(err error) string {
 	return upstreamCode(err)
 }
 
-func (s *Server) prepareRequest(ctx context.Context, cfg *config.Config, profile config.Profile, in transform.Envelope) (transform.Envelope, error) {
+func (s *Server) prepareRequest(ctx context.Context, pinned *gatewayState, cfg *config.Config, profile config.Profile, in transform.Envelope) (transform.Envelope, error) {
 	adapterName := profile.Adapter
 	if adapterName == "" {
 		adapterName = "transparent"
@@ -663,7 +678,7 @@ func (s *Server) prepareRequest(ctx context.Context, cfg *config.Config, profile
 	if converted.URL != nil && converted.URL.Path != "" {
 		in.Path = converted.URL.Path
 	}
-	for _, compiled := range s.compiledRequestSteps(cfg, profile) {
+	for _, compiled := range s.compiledRequestSteps(pinned, cfg, profile) {
 		changed, err := compiled.Apply(ctx, in)
 		if err != nil {
 			return transform.Envelope{}, err
@@ -673,7 +688,7 @@ func (s *Server) prepareRequest(ctx context.Context, cfg *config.Config, profile
 	return in, nil
 }
 
-func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profile config.Profile, in transform.Envelope) (transform.Envelope, error) {
+func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg *config.Config, profile config.Profile, in transform.Envelope) (transform.Envelope, error) {
 	response := in
 	if response.StatusCode >= 400 {
 		// An upstream error body is not a protocol response: adapting it
@@ -682,7 +697,7 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 		// envelope (verbatim when the upstream already speaks it) and still
 		// run the response transform chain so status_map/header rules keep
 		// working on errors.
-		return s.applyResponseTransforms(ctx, cfg, profile, errorEnvelope(profile.ClientContract, response))
+		return s.applyResponseTransforms(ctx, pinned, cfg, profile, errorEnvelope(profile.ClientContract, response))
 	}
 	a, ok := s.registry.Get(profile.Adapter)
 	if !ok {
@@ -706,12 +721,21 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 			response.ContentType = contentType
 			response.Headers = response.Headers.Clone()
 			response.Headers.Set("Content-Type", contentType)
-			return response, nil
+		} else {
+			response.Body = adapter.EncodeSSE(translated)
+			response.ContentType = "text/event-stream"
+			response.Headers = response.Headers.Clone()
+			response.Headers.Set("Content-Type", "text/event-stream")
 		}
-		response.Body = adapter.EncodeSSE(translated)
-		response.ContentType = "text/event-stream"
-		response.Headers = response.Headers.Clone()
-		response.Headers.Set("Content-Type", "text/event-stream")
+		// Translated SSE responses still run the compiled response chain
+		// (header rules, status maps) before returning.
+		for _, compiled := range s.compiledResponseSteps(pinned, cfg, profile) {
+			changed, err := compiled.Apply(ctx, response)
+			if err != nil {
+				return transform.Envelope{}, err
+			}
+			response = changed
+		}
 		return response, nil
 	}
 	converted := adapter.Envelope{Method: http.MethodPost, Header: response.Headers.Clone(), Body: response.Body, StatusCode: response.StatusCode, ContentType: response.ContentType, Protocol: profile.UpstreamContract}
@@ -720,7 +744,7 @@ func (s *Server) prepareResponse(ctx context.Context, cfg *config.Config, profil
 		return transform.Envelope{}, err
 	}
 	response.Body, response.Headers, response.StatusCode, response.ContentType = converted.Body, converted.Header, converted.StatusCode, converted.ContentType
-	for _, compiled := range s.compiledResponseSteps(cfg, profile) {
+	for _, compiled := range s.compiledResponseSteps(pinned, cfg, profile) {
 		changed, err := compiled.Apply(ctx, response)
 		if err != nil {
 			return transform.Envelope{}, err
@@ -813,8 +837,8 @@ func errorMatchesContract(contract string, body []byte) bool {
 	}
 }
 
-func (s *Server) applyResponseTransforms(ctx context.Context, cfg *config.Config, profile config.Profile, response transform.Envelope) (transform.Envelope, error) {
-	for _, compiled := range s.compiledResponseSteps(cfg, profile) {
+func (s *Server) applyResponseTransforms(ctx context.Context, pinned *gatewayState, cfg *config.Config, profile config.Profile, response transform.Envelope) (transform.Envelope, error) {
+	for _, compiled := range s.compiledResponseSteps(pinned, cfg, profile) {
 		var err error
 		response, err = compiled.Apply(ctx, response)
 		if err != nil {
@@ -883,7 +907,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		input.Method = http.MethodPost
 	}
 	in := transform.Envelope{Method: input.Method, Path: input.Path, Headers: headersFromValues(input.Headers), Body: append([]byte(nil), input.Body...), Query: url.Values{}}
-	prepared, err := s.prepareRequest(r.Context(), snapshot.Config, *profile, in)
+	prepared, err := s.prepareRequest(r.Context(), s.state.Load(), snapshot.Config, *profile, in)
 	if err != nil {
 		s.writeError(w, http.StatusUnprocessableEntity, "transform", "preview_failed", safeError(err), "")
 		return

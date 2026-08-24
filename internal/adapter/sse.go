@@ -188,6 +188,9 @@ type SSETranslator struct {
 	// respPartAdded records whether the text content part was announced;
 	// pure-tool streams skip the part lifecycle entirely.
 	respPartAdded bool
+	// respItemAdded records whether the assistant message output item was
+	// announced; pure-tool streams skip it entirely.
+	respItemAdded bool
 	// toolCallByItem maps Responses function-call item ids onto OpenAI
 	// tool_calls array positions (responses -> anthropic direction), and
 	// toolArgsSeen records whether deltas already delivered the arguments
@@ -343,13 +346,12 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			return nil
 		}
 		t.respStarted = true
+		// The assistant message output item is announced lazily with the
+		// first text delta; pure-tool streams carry only function_call
+		// items and no empty message.
 		return []SSEEvent{
 			t.respEvent("response.created", map[string]any{"type": "response.created", "response": t.responsesResponse("in_progress")}),
 			t.respEvent("response.in_progress", map[string]any{"type": "response.in_progress", "response": t.responsesResponse("in_progress")}),
-			t.respEvent("response.output_item.added", map[string]any{
-				"type": "response.output_item.added", "output_index": 0,
-				"item": t.responsesMessageItem("in_progress"),
-			}),
 		}
 		// The text content part is announced lazily with the first delta so
 		// pure-tool streams never open a part they cannot close.
@@ -365,7 +367,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			"name": block["name"], "arguments": "", "status": "in_progress",
 		}
 		t.respToolItems = append(t.respToolItems, item)
-		outputIndex := len(t.respToolItems) // message item occupies index 0
+		outputIndex := len(t.respToolItems) // message item, when present, occupies index 0
 		return []SSEEvent{t.respEvent("response.output_item.added", map[string]any{
 			"type": "response.output_item.added", "output_index": outputIndex, "item": item,
 		})}
@@ -383,13 +385,21 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 				t.respText.WriteString(text)
 				if !t.respPartAdded {
 					t.respPartAdded = true
-					part := t.respEvent("response.content_part.added", map[string]any{
+					var opener []SSEEvent
+					if !t.respItemAdded {
+						t.respItemAdded = true
+						opener = append(opener, t.respEvent("response.output_item.added", map[string]any{
+							"type": "response.output_item.added", "output_index": 0,
+							"item": t.responsesMessageItem("in_progress"),
+						}))
+					}
+					opener = append(opener, t.respEvent("response.content_part.added", map[string]any{
 						"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
 						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-					})
-					return []SSEEvent{part, t.respEvent("response.output_text.delta", map[string]any{
+					}))
+					return append(opener, t.respEvent("response.output_text.delta", map[string]any{
 						"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
-					})}
+					}))
 				}
 				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
 					"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
@@ -500,23 +510,26 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		usage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"]), "total_tokens": total}
 		response["usage"] = usage
 	}
-	item := t.responsesMessageItem("completed")
-	output := []any{item}
 	var events []SSEEvent
-	if t.respPartAdded {
-		events = append(events,
-			t.respEvent("response.output_text.done", map[string]any{
-				"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
-				"text": t.respText.String(),
-			}),
-			t.respEvent("response.content_part.done", map[string]any{
-				"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
-				"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
-			}))
+	output := []any{}
+	if t.respItemAdded {
+		item := t.responsesMessageItem("completed")
+		output = append(output, item)
+		if t.respPartAdded {
+			events = append(events,
+				t.respEvent("response.output_text.done", map[string]any{
+					"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+					"text": t.respText.String(),
+				}),
+				t.respEvent("response.content_part.done", map[string]any{
+					"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+					"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
+				}))
+		}
+		events = append(events, t.respEvent("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": 0, "item": item,
+		}))
 	}
-	events = append(events, t.respEvent("response.output_item.done", map[string]any{
-		"type": "response.output_item.done", "output_index": 0, "item": item,
-	}))
 	for index, toolItem := range t.respToolItems {
 		toolItem["status"] = "completed"
 		events = append(events,

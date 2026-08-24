@@ -32,7 +32,12 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid client key is required", "")
 		return
 	}
+	pinned := s.state.Load()
 	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
+	if match.Profile != "" && !requiresClientAuth(snapshot.Config) && match.ClientID == "" && !pinned.allowsAnonymousOverride() {
+		s.writeError(w, http.StatusForbidden, "auth", "profile_override_denied", "anonymous profile overrides are disabled by policy", "")
+		return
+	}
 	profile, _, err := route.SelectProfile(snapshot.Config, match)
 	if err != nil || profile == nil {
 		s.writeError(w, http.StatusNotFound, "grpc", "profile_not_found", "no gRPC profile matched", "")
@@ -58,6 +63,7 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	finish := s.metrics.Begin()
 	defer finish()
 	started := time.Now()
+	_ = started
 	// The final status is captured by the deferred closure; evaluating
 	// s.observe's arguments at defer time would freeze http.StatusOK and
 	// record upstream failures as successes.
@@ -69,7 +75,7 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.observe("", started, r, nil, profile, profile.Upstream, status, stage, code)
 	}()
-	rt := s.runtimeFor(profile.Name)
+	rt := pinned.runtimes[profile.Name]
 	release, rejection := rt.beginPolicy(r.Context(), r.Method, r.Header, true)
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
@@ -89,6 +95,13 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(body) > 16<<20 {
 		status, stage, code = http.StatusRequestEntityTooLarge, "grpc", "body_too_large"
 		s.writeError(w, status, stage, code, "gRPC message exceeds the 16 MiB limit", "")
+		return
+	}
+	// Chunked requests announce no ContentLength; enforce the profile cap
+	// on the actual byte count too.
+	if profile.MaxBodyBytes > 0 && int64(len(body)) > profile.MaxBodyBytes {
+		status, stage, code = http.StatusRequestEntityTooLarge, "grpc", "body_too_large"
+		s.writeError(w, status, stage, code, "gRPC message exceeds the profile limit", "")
 		return
 	}
 	base, err := url.Parse(upstream.EffectiveURL())

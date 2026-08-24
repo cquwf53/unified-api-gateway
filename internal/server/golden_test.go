@@ -121,7 +121,7 @@ func mustMarshal(t *testing.T, value any) []byte {
 func TestGoldenOpenAIChatToAnthropicRequest(t *testing.T) {
 	gateway, cfg := gatewayFromExampleConfig(t)
 	profile := cfg.Profiles["openai-to-anthropic"]
-	prepared, err := gateway.prepareRequest(t.Context(), cfg, profile, fixtureEnvelope(t, "openai-chat-request.json"))
+	prepared, err := gateway.prepareRequest(t.Context(), gateway.state.Load(), cfg, profile, fixtureEnvelope(t, "openai-chat-request.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestGoldenAnthropicResponseToOpenAI(t *testing.T) {
 	gateway, cfg := gatewayFromExampleConfig(t)
 	profile := cfg.Profiles["openai-to-anthropic"]
 	upstream := transform.Envelope{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: loadFixture(t, "anthropic-messages-response.json")}
-	response, err := gateway.prepareResponse(t.Context(), cfg, profile, upstream)
+	response, err := gateway.prepareResponse(t.Context(), gateway.state.Load(), cfg, profile, upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestGoldenAnthropicResponseToOpenAI(t *testing.T) {
 func TestGoldenGenericUserRewrite(t *testing.T) {
 	gateway, cfg := gatewayFromExampleConfig(t)
 	profile := cfg.Profiles["user-v1-to-v2"]
-	prepared, err := gateway.prepareRequest(t.Context(), cfg, profile, fixtureEnvelope(t, "generic-user-request.json"))
+	prepared, err := gateway.prepareRequest(t.Context(), gateway.state.Load(), cfg, profile, fixtureEnvelope(t, "generic-user-request.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

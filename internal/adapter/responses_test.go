@@ -301,3 +301,30 @@ func eventsFromRaw(t *testing.T, raw string) []SSEEvent {
 	}
 	return events
 }
+
+// TestPureToolResponsesStreamOmitsEmptyMessage pins that a tool-only stream
+// produces function_call items only - no orphan assistant message item.
+func TestPureToolResponsesStreamOmitsEmptyMessage(t *testing.T) {
+	raw := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ping\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	translated := mustTranslate(t, raw, "anthropic-messages", "openai-responses")
+	var completed map[string]any
+	if err := json.Unmarshal([]byte(translated[len(translated)-1].Data), &completed); err != nil {
+		t.Fatal(err)
+	}
+	output := completed["response"].(map[string]any)["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("pure-tool output should carry only the function_call, got %#v", output)
+	}
+	if output[0].(map[string]any)["type"] != "function_call" {
+		t.Fatalf("output[0]=%#v", output[0])
+	}
+	// And the event stream never announced a message item or content part.
+	for _, event := range translated {
+		if strings.Contains(event.Data, "\"type\":\"message\"") && strings.Contains(event.Data, "output_item.added") {
+			t.Fatalf("empty message item leaked into a pure-tool stream: %s", event.Data)
+		}
+	}
+}

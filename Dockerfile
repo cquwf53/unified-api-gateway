@@ -8,7 +8,10 @@ COPY go.mod ./
 COPY go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/unified-api-gateway ./cmd/gateway
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+    -ldflags="-s -w -X unified-api-gateway/internal/server.BuildVersion=${VERSION}" \
+    -o /out/unified-api-gateway ./cmd/gateway
 
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
@@ -20,5 +23,7 @@ COPY --from=build --chown=nonroot:nonroot /src/data /app/data
 
 EXPOSE 8780 8781 8782
 USER nonroot:nonroot
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD ["/app/unified-api-gateway", "validate", "--config", "/app/configs/gateway.yaml"]
 ENTRYPOINT ["/app/unified-api-gateway"]
 CMD ["--config", "/app/configs/gateway.yaml", "--admin", ":8781"]

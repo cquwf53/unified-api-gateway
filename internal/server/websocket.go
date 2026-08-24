@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -35,7 +36,9 @@ func sameOrigin(origin, host string) bool {
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapshot *config.ConfigSnapshot, requestID string) {
 	// handleProxy already opened the metrics span; this handler only adds
 	// the terminal observation with the real outcome (a failed dial must
-	// not be recorded as a successful upgrade).
+	// not be recorded as a successful upgrade). The pinned state keeps
+	// policy decisions stable for the whole connection.
+	pinned := s.state.Load()
 	started := time.Now()
 	var profile *config.Profile
 	var selectedRoute *config.Route
@@ -54,11 +57,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		s.writeError(w, status, "auth", "client_auth_required", "a valid client key is required", requestID)
 		return
 	}
-	if strings.TrimSpace(r.Header.Get("X-Gateway-Profile")) != "" && !requiresClientAuth(cfg) && match.ClientID == "" {
+	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
+	if match.Profile != "" && !requiresClientAuth(cfg) && match.ClientID == "" {
+		if !pinned.allowsAnonymousOverride() {
+			status = http.StatusForbidden
+			s.writeError(w, status, "auth", "profile_override_denied", "anonymous profile overrides are disabled by policy", requestID)
+			return
+		}
 		match.ClientID = "__anonymous__"
 		match.Client = "__anonymous__"
 	}
-	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
 	var err error
 	profile, selectedRoute, err = route.SelectProfile(cfg, match)
 	if err != nil {
@@ -77,6 +85,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	if !strings.EqualFold(profile.Adapter, "transparent") {
 		status = http.StatusNotImplemented
 		s.writeError(w, status, "adapter", "websocket_adapter_required", "message-level WebSocket transforms require a dedicated adapter", requestID)
+		return
+	}
+	if len(profile.AllowedMethods) > 0 && !methodAllowed(profile.AllowedMethods, r.Method) {
+		status = http.StatusMethodNotAllowed
+		s.writeError(w, status, "route", "method_not_allowed", "profile "+profile.Name+" does not allow "+r.Method, requestID)
 		return
 	}
 	// Reject cross-site browser upgrades before touching the upstream; the
@@ -98,7 +111,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	// per-profile HTTP semaphore: a pile of idle sockets must not starve
 	// request concurrency. Rate limiting and the breaker still apply at
 	// establishment time.
-	rt := s.runtimeFor(profile.Name)
+	rt := pinned.runtimes[profile.Name]
 	release, rejection := rt.beginWebsocketPolicy(r.Context(), r.Method, r.Header, s.wsSlots())
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
@@ -123,6 +136,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	applyUpstreamAuth(requestHeaders, cfg, upstream)
 	requestHeaders.Set("X-Gateway-Request-Id", requestID)
 	dialer := websocket.Dialer{Subprotocols: requestedSubprotocols(r.Header)}
+	if upstream.Insecure {
+		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in per upstream
+	}
 	upstreamConn, upstreamResponse, err := dialer.DialContext(r.Context(), base.String(), requestHeaders)
 	if err != nil {
 		message := err.Error()
@@ -163,8 +179,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		_ = upstreamConn.SetReadDeadline(deadline)
 	}
 	refreshDeadlines()
-	clientConn.SetPingHandler(func(string) error { refreshDeadlines(); return nil })
-	upstreamConn.SetPingHandler(func(string) error { refreshDeadlines(); return nil })
+	// Ping handlers must answer with a pong (peers use it for liveness)
+	// while refreshing the idle deadline.
+	pongHandler := func(conn *websocket.Conn) func(string) error {
+		return func(appData string) error {
+			refreshDeadlines()
+			deadline := time.Now().Add(10 * time.Second)
+			_ = conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
+			return nil
+		}
+	}
+	clientConn.SetPingHandler(pongHandler(clientConn))
+	upstreamConn.SetPingHandler(pongHandler(upstreamConn))
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

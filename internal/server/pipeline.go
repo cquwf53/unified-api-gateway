@@ -1,6 +1,8 @@
 package server
 
 import (
+	"log/slog"
+
 	"unified-api-gateway/internal/config"
 	"unified-api-gateway/internal/transform"
 )
@@ -31,9 +33,15 @@ func resolveSpecs(cfg *config.Config, specs []transform.TransformSpec) []transfo
 func compileSteps(specs []transform.TransformSpec) []*transform.CompiledTransform {
 	out := make([]*transform.CompiledTransform, 0, len(specs))
 	for _, spec := range specs {
-		if compiled, err := transform.Compile(spec); err == nil {
-			out = append(out, compiled)
+		compiled, err := transform.Compile(spec)
+		if err != nil {
+			// Configuration validation should make this unreachable;
+			// dropping a step silently (for example a header-deletion rule)
+			// would be a security hole, so log loudly.
+			slog.Warn("transform step failed to compile and was skipped", "name", spec.Name, "error", err)
+			continue
 		}
+		out = append(out, compiled)
 	}
 	return out
 }
@@ -55,18 +63,18 @@ func buildPipelines(cfg *config.Config) map[string]*compiledPipeline {
 // compiledRequestSteps returns the cached request chain for a profile,
 // falling back to a one-shot compilation for profiles assembled outside a
 // configuration snapshot (for example the preview endpoint).
-func (s *Server) compiledRequestSteps(cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
-	if state := s.state.Load(); state != nil {
-		if pipeline, ok := state.pipelines[profile.Name]; ok {
+func (s *Server) compiledRequestSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
+	if pinned != nil {
+		if pipeline, ok := pinned.pipelines[profile.Name]; ok {
 			return pipeline.request
 		}
 	}
 	return compileSteps(resolveSpecs(cfg, profile.AllRequestTransforms()))
 }
 
-func (s *Server) compiledResponseSteps(cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
-	if state := s.state.Load(); state != nil {
-		if pipeline, ok := state.pipelines[profile.Name]; ok {
+func (s *Server) compiledResponseSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
+	if pinned != nil {
+		if pipeline, ok := pinned.pipelines[profile.Name]; ok {
 			return pipeline.response
 		}
 	}

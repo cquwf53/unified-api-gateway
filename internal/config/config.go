@@ -547,11 +547,13 @@ func (c *Config) Validate() error {
 			}
 		}
 		for _, spec := range append(p.AllRequestTransforms(), p.AllResponseTransforms()...) {
-			if spec.Name == "" || spec.IsZero() == false {
-				continue
-			}
-			if _, ok := c.Transforms[spec.Name]; !ok {
-				errs = append(errs, fmt.Sprintf("profile %q: named transform %q not found", name, spec.Name))
+			// A named reference replaces the whole spec at resolve time, so
+			// the name must exist - a missing header-deletion transform must
+			// fail at load time, not silently become a no-op.
+			if spec.Name != "" {
+				if _, ok := c.Transforms[spec.Name]; !ok {
+					errs = append(errs, fmt.Sprintf("profile %q: named transform %q not found", name, spec.Name))
+				}
 			}
 		}
 		for i, spec := range p.AllRequestTransforms() {
@@ -588,6 +590,9 @@ func (c *Config) Validate() error {
 		if r.Match.Method != "" && len(r.Match.Methods) > 0 {
 			errs = append(errs, fmt.Sprintf("route %q: specify method or methods, not both", routeLabel(r, i)))
 		}
+	}
+	if err := detectDuplicateMatches(c.Routes); err != nil {
+		errs = append(errs, err.Error())
 	}
 	if c.DefaultsProfile != "" {
 		if _, ok := c.Profiles[c.DefaultsProfile]; !ok {
@@ -696,6 +701,23 @@ func streamSafeProfile(p Profile) bool {
 		}
 	}
 	return true
+}
+
+// detectDuplicateMatches rejects two routes whose matchers are identical:
+// the second can never win and almost always indicates a copy-paste error.
+func detectDuplicateMatches(routes []Route) error {
+	seen := map[string]string{}
+	for i, r := range routes {
+		key := fmt.Sprintf("%s|%s|%s|%s|%v|%v|%v|%v|%s|%s|%s|%s",
+			r.Match.Host, r.Match.Path, r.Match.PathPrefix, r.Match.Method,
+			r.Match.Methods, r.Match.Headers, r.Match.Query,
+			r.Match.Model, r.Match.Client, r.Match.ClientID, r.Match.Tenant, fmt.Sprint(r.Priority))
+		if first, ok := seen[key]; ok {
+			return fmt.Errorf("routes %q and %q have identical matchers and priority", first, routeLabel(r, i))
+		}
+		seen[key] = routeLabel(r, i)
+	}
+	return nil
 }
 
 func routeLabel(r Route, i int) string {

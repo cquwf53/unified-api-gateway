@@ -307,7 +307,7 @@ func TestPrepareRequestAppliesProtocolAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := gateway.prepareRequest(context.Background(), cfg, cfg.Profiles["p"], transform.Envelope{Method: "POST", Path: "/v1/chat/completions", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)})
+	out, err := gateway.prepareRequest(context.Background(), gateway.state.Load(), cfg, cfg.Profiles["p"], transform.Envelope{Method: "POST", Path: "/v1/chat/completions", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,6 +29,10 @@ go run ./cmd/gateway --config configs/gateway.yaml
 | `127.0.0.1:8781` | 管理 API（默认只绑定本机） |
 | `:8782` | gRPC-over-HTTP 透明入口（消息级 Protobuf 改写需 typed adapter） |
 
+存在 SQLite active 版本时，启动默认恢复它而非 `--config` 文件（两者不一致会打
+印 warning）；需要强制使用文件时加 `--prefer-file`。CLI 热激活收到管理面
+401/403 时会直接报错退出，不再静默写本地库假装成功。
+
 也可以使用 Makefile 或 Docker：
 
 ```powershell
@@ -356,8 +360,8 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 - Responses 的 reasoning/summary 事件未做翻译；
 - **readyz 只检查配置已加载**，不做上游探活；
 - `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
-- `transforms` 具名引用存在性、credential 引用可达性等语义校验由
-  `Validate` 的引用检查部分覆盖，route 冲突（同优先级同匹配）只告警不拒绝；
+- route 校验拒绝完全相同的 matcher+priority 组合，但**包含关系**冲突（如同
+  path 前缀的宽窄规则叠加）仍不检测；
 - 客户端鉴权在未配置任何可解析密钥时保持关闭（fail-open），见上文安全边界。
 
 ## 项目布局
