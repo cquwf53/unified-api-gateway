@@ -40,6 +40,9 @@ type policySet struct {
 	// allowAnonymousProfileOverride keeps the open-mode X-Gateway-Profile
 	// override available; setting it to false closes the escalation path.
 	allowAnonymousProfileOverride bool
+	// requireClientAuth fails closed: when true, requests without a valid
+	// client key are rejected even if no credential resolves.
+	requireClientAuth bool
 }
 
 type breakerConfig struct {
@@ -101,6 +104,9 @@ func decodePolicySet(cfg *config.Config) policySet {
 	}
 	if d.AllowAnonymousProfileOverride != nil {
 		set.allowAnonymousProfileOverride = *d.AllowAnonymousProfileOverride
+	}
+	if d.RequireClientAuth != nil {
+		set.requireClientAuth = *d.RequireClientAuth
 	}
 	return set
 }
@@ -224,6 +230,21 @@ func (b *breaker) releaseProbe() {
 	defer b.mu.Unlock()
 	if b.state == breakerHalfOpen {
 		b.probing = false
+	}
+}
+
+// updateConfig applies new breaker parameters while preserving state.
+func (b *breaker) updateConfig(cfg breakerConfig) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if cfg.failureThreshold > 0 {
+		b.threshold = cfg.failureThreshold
+	}
+	if cfg.resetTimeout > 0 {
+		b.resetAfter = cfg.resetTimeout
 	}
 }
 
@@ -442,6 +463,9 @@ func (s *Server) breakerFor(upstreamName string, cfg breakerConfig) *breaker {
 		s.breakers = map[string]*breaker{}
 	}
 	if existing, ok := s.breakers[upstreamName]; ok {
+		// Thresholds may have changed with the configuration; keep the
+		// failure history but honour the new parameters.
+		existing.updateConfig(cfg)
 		return existing
 	}
 	created := newBreaker(cfg)

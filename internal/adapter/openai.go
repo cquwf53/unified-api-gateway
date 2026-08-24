@@ -269,10 +269,19 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 		if !ok {
 			continue
 		}
-		out["messages"] = append(asSlice(out["messages"]), map[string]any{
-			"role":    m["role"],
-			"content": anthropicContentToOpenAI(m["content"]),
-		})
+		converted, role, extras := anthropicMessageToOpenAI(m)
+		if role != "" {
+			if message, ok := converted.(map[string]any); ok {
+				// A complete OpenAI message (assistant with tool_calls).
+				out["messages"] = append(asSlice(out["messages"]), message)
+			} else {
+				out["messages"] = append(asSlice(out["messages"]), map[string]any{
+					"role":    role,
+					"content": converted,
+				})
+			}
+		}
+		out["messages"] = append(asSlice(out["messages"]), extras...)
 	}
 	b, contentType, err := encodeJSON(out)
 	if err != nil {
@@ -524,6 +533,10 @@ func convertOpenAIContent(value any, role string) any {
 		case "input_image":
 			// The Responses API's flat image part.
 			result = append(result, map[string]any{"type": "image", "source": anthropicImageSource(asString(part["image_url"]))})
+		case "tool_use", "tool_result":
+			// Already Anthropic-shaped blocks (for example synthesised by
+			// the Responses input adapter); pass through untouched.
+			result = append(result, part)
 		default:
 			if text := asString(part["text"]); text != "" {
 				result = append(result, map[string]any{"type": "text", "text": text})
@@ -606,6 +619,68 @@ func anthropicImageSource(url string) map[string]any {
 		return map[string]any{"type": "url", "url": url}
 	}
 	return map[string]any{"type": "base64", "media_type": mediaType, "data": data}
+}
+
+// anthropicMessageToOpenAI converts one Anthropic message to the OpenAI
+// shape, mapping tool_use blocks to tool_calls and tool_result blocks to
+// tool-role messages. The returned role may be empty for content that has
+// no OpenAI representation yet.
+func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
+	role := asString(m["role"])
+	switch role {
+	case "user":
+		// tool_result blocks become their own tool-role messages appended
+		// after the (remaining) user content.
+		var results []any
+		var rest []any
+		for _, raw := range asSlice(m["content"]) {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if asString(part["type"]) == "tool_result" {
+				results = append(results, map[string]any{
+					"role":         "tool",
+					"tool_call_id": part["tool_use_id"],
+					"content":      contentText(part["content"]),
+				})
+				continue
+			}
+			rest = append(rest, raw)
+		}
+		if len(results) > 0 && len(rest) == 0 {
+			// Pure tool-result turn: only the tool messages are emitted.
+			return nil, "", results
+		}
+		return anthropicContentToOpenAI(rest), role, results
+	case "assistant":
+		// tool_use blocks become tool_calls on the assistant message.
+		content := anthropicContentToOpenAI(m["content"])
+		var toolCalls []any
+		for _, raw := range asSlice(m["content"]) {
+			part, ok := raw.(map[string]any)
+			if !ok || asString(part["type"]) != "tool_use" {
+				continue
+			}
+			args, _ := json.Marshal(part["input"])
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   part["id"],
+				"type": "function",
+				"function": map[string]any{
+					"name":      part["name"],
+					"arguments": string(args),
+				},
+			})
+		}
+		if len(toolCalls) == 0 {
+			return content, role, nil
+		}
+		message := map[string]any{"role": "assistant", "content": content}
+		message["tool_calls"] = toolCalls
+		return message, role, nil
+	default:
+		return anthropicContentToOpenAI(m["content"]), role, nil
+	}
 }
 
 // anthropicContentToOpenAI converts an Anthropic message body into OpenAI
@@ -752,13 +827,46 @@ func responsesInputToMessages(input, instructions any) []any {
 		if !ok {
 			continue
 		}
-		role := asString(item["role"])
-		if role == "" {
-			role = "user"
+		switch asString(item["type"]) {
+		case "function_call":
+			// A previous assistant tool call, replayed as history.
+			result = append(result, map[string]any{
+				"role": "assistant",
+				"content": []any{map[string]any{
+					"type": "tool_use", "id": item["call_id"], "name": item["name"],
+					"input": decodeJSONObject(asString(item["arguments"])),
+				}},
+			})
+		case "function_call_output":
+			result = append(result, map[string]any{
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "tool_result", "tool_use_id": item["call_id"],
+					"content": item["output"],
+				}},
+			})
+		default:
+			role := asString(item["role"])
+			if role == "" {
+				role = "user"
+			}
+			result = append(result, map[string]any{"role": role, "content": item["content"]})
 		}
-		result = append(result, map[string]any{"role": role, "content": item["content"]})
 	}
 	return result
+}
+
+// decodeJSONObject parses a JSON object string, falling back to a raw
+// wrapper when the payload is not valid JSON.
+func decodeJSONObject(text string) any {
+	if text == "" {
+		return map[string]any{}
+	}
+	var parsed any
+	if json.Unmarshal([]byte(text), &parsed) == nil {
+		return parsed
+	}
+	return map[string]any{"raw": text}
 }
 
 func asSlice(value any) []any {

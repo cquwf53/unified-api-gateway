@@ -344,6 +344,25 @@ func profileAllowed(cfg *config.Config, req Request, profile string) bool {
 	if !ok || client.Enabled != nil && !*client.Enabled {
 		return false
 	}
+	// An upstream allowlist is independent of the profile allowlist: when a
+	// credential restricts upstreams, the selected profile's upstream must
+	// be on that list too.
+	if len(client.Upstreams) > 0 {
+		selected, exists := cfg.Profiles[profile]
+		if !exists {
+			return false
+		}
+		upstreamOK := false
+		for _, allowed := range client.Upstreams {
+			if allowed == "*" || allowed == selected.Upstream {
+				upstreamOK = true
+				break
+			}
+		}
+		if !upstreamOK {
+			return false
+		}
+	}
 	if len(client.Profiles) == 0 {
 		return true
 	}

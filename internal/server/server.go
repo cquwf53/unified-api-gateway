@@ -61,7 +61,10 @@ func (st *gatewayState) allowsAnonymousOverride() bool {
 }
 
 type Server struct {
-	state      atomic.Pointer[gatewayState]
+	state atomic.Pointer[gatewayState]
+	// configMu serializes activation, rollback and quick-switch so two
+	// concurrent admin calls cannot interleave their store/memory phases.
+	configMu   sync.Mutex
 	registry   *adapter.Registry
 	client     *http.Client
 	metrics    *telemetry.Metrics
@@ -277,8 +280,8 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 		// The model list enumerates every profile (the values X-Gateway-Profile
 		// accepts), so it must sit behind the same client authentication as
 		// the proxy path.
-		if snapshot := s.Snapshot(); snapshot != nil && snapshot.Config != nil {
-			if requiresClientAuth(snapshot.Config) && s.callClientKey(snapshot.Config, r) == "" {
+		if state := s.state.Load(); state != nil && state.snapshot != nil && state.snapshot.Config != nil {
+			if (requiresClientAuth(state.snapshot.Config) || state.policy.requireClientAuth) && s.callClientKey(state.snapshot.Config, r) == "" {
 				s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required", "")
 				return
 			}
@@ -386,7 +389,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(custom, requestID)
 	}
 	if isWebSocketUpgrade(r) {
-		s.handleWebSocket(w, r, snapshot, requestID)
+		s.handleWebSocket(w, r, pinned, requestID)
 		return
 	}
 	maxBody := cfg.Limits.MaxBodyBytes
@@ -403,12 +406,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if int64(len(body)) > maxBody {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds configured limit", requestID)
+		fail(http.StatusRequestEntityTooLarge, "ingress", "body_too_large", "request body exceeds configured limit")
 		return
 	}
 
 	clientID, tenant := s.authenticateClient(cfg, r)
-	if requiresClientAuth(cfg) && clientID == "" {
+	if (requiresClientAuth(cfg) || pinned.policy.requireClientAuth) && clientID == "" {
 		fail(http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required")
 		return
 	}
@@ -644,7 +647,12 @@ func recordStreamResult(rt *profileRuntime, headersSent bool, status int, err er
 	}
 	if !headersSent || upstreamCode(err) != "client_stream_write_failed" {
 		rt.recordUpstreamResult(false)
+		return
 	}
+	// The client hung up mid-stream: the upstream outcome is unknown, so
+	// neither success nor failure is recorded, but a held half-open probe
+	// must be released or the breaker wedges.
+	rt.breaker.releaseProbe()
 }
 
 func streamErrorCode(err error) string {
@@ -712,29 +720,40 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 		if err != nil {
 			return transform.Envelope{}, err
 		}
-		if !wantsStreamFromEnvelope(in) {
+		clientWantsStream := wantsStreamFromEnvelope(in)
+		// Aggregate first, run the transform chain on the JSON body, and
+		// only then decide whether to re-wrap as SSE: applying a body rule
+		// to SSE text would corrupt it (invalid_json).
+		if clientWantsStream {
 			body, contentType, aggregateErr := adapter.AggregateSSE(translated, profile.ClientContract)
 			if aggregateErr != nil {
 				return transform.Envelope{}, aggregateErr
 			}
 			response.Body = body
 			response.ContentType = contentType
-			response.Headers = response.Headers.Clone()
-			response.Headers.Set("Content-Type", contentType)
 		} else {
-			response.Body = adapter.EncodeSSE(translated)
-			response.ContentType = "text/event-stream"
-			response.Headers = response.Headers.Clone()
-			response.Headers.Set("Content-Type", "text/event-stream")
+			body, contentType, aggregateErr := adapter.AggregateSSE(translated, profile.ClientContract)
+			if aggregateErr != nil {
+				return transform.Envelope{}, aggregateErr
+			}
+			response.Body = body
+			response.ContentType = contentType
 		}
-		// Translated SSE responses still run the compiled response chain
-		// (header rules, status maps) before returning.
+		response.Headers = response.Headers.Clone()
+		response.Headers.Set("Content-Type", response.ContentType)
 		for _, compiled := range s.compiledResponseSteps(pinned, cfg, profile) {
 			changed, err := compiled.Apply(ctx, response)
 			if err != nil {
 				return transform.Envelope{}, err
 			}
 			response = changed
+		}
+		if clientWantsStream && !strings.Contains(strings.ToLower(response.ContentType), "event-stream") {
+			// The transform chain may have rewritten the JSON; re-wrap the
+			// final body as a single-frame SSE stream with a terminator.
+			response.Headers.Set("Content-Type", "text/event-stream")
+			response.ContentType = "text/event-stream"
+			response.Body = adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(response.Body)}, {Data: "[DONE]"}})
 		}
 		return response, nil
 	}
@@ -915,6 +934,42 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, s.previewPayload("preview", profile, selectedRoute, profile.Upstream, prepared, "preview", configuredRedactions(snapshot.Config)))
 }
 
+// commitConfig stores a version, publishes it to memory and then flips the
+// stored active marker. Memory is authoritative for the running process;
+// the DB marker only matters for the next boot.
+func (s *Server) commitConfig(snapshot *config.ConfigSnapshot, data []byte, createdBy, description string) error {
+	if s.store != nil {
+		if err := s.store.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: createdBy, Active: true, SHA256: snapshot.Hash, Description: description, YAML: data}); err != nil {
+			return err
+		}
+	}
+	s.publishState(snapshot)
+	if s.store != nil {
+		if err := s.store.Activate(context.Background(), snapshot.ID); err != nil {
+			slog.Warn("stored active marker update failed; memory already runs the new config", "id", snapshot.ID, "error", err)
+		}
+	}
+	return nil
+}
+
+// ClientAuthKeysConfigured reports whether any enabled client credential
+// resolves to a non-empty key. require_client_auth refuses to serve when
+// this is false, closing the fail-open default.
+func ClientAuthKeysConfigured(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, client := range cfg.Clients {
+		if client.Enabled != nil && !*client.Enabled {
+			continue
+		}
+		if resolveClientKey(client) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		YAML        string `json:"yaml"`
@@ -956,18 +1011,14 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnprocessableEntity, "config", "snapshot_failed", err.Error(), "")
 		return
 	}
-	if s.store != nil {
-		if err := s.store.SaveVersion(r.Context(), store.Version{ID: snapshot.ID, CreatedBy: input.Actor, Active: true, SHA256: snapshot.Hash, Description: input.Description, YAML: data}); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "store", "save_version_failed", err.Error(), "")
-			return
-		}
-		if err := s.store.Activate(r.Context(), snapshot.ID); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "store", "activate_version_failed", err.Error(), "")
-			return
-		}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	createdBy := input.Actor
+	if createdBy == "" {
+		createdBy = "admin-api"
 	}
-	if err := s.Activate(snapshot); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "config", "activation_failed", err.Error(), "")
+	if err := s.commitConfig(snapshot, data, createdBy, input.Description); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "store", "save_version_failed", err.Error(), "")
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"activated": true, "id": snapshot.ID, "hash": snapshot.Hash, "loaded_at": snapshot.LoadedAt})
@@ -1027,18 +1078,10 @@ func (s *Server) handleQuickSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data, _ := yaml.Marshal(clone)
-	if s.store != nil {
-		if err := s.store.SaveVersion(r.Context(), store.Version{ID: snapshot.ID, CreatedBy: "quick-switch", Active: true, SHA256: snapshot.Hash, Description: input.Description, YAML: data}); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "store", "save_version_failed", err.Error(), "")
-			return
-		}
-		if err := s.store.Activate(r.Context(), snapshot.ID); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "store", "activate_version_failed", err.Error(), "")
-			return
-		}
-	}
-	if err := s.Activate(snapshot); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "config", "activation_failed", err.Error(), "")
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if err := s.commitConfig(snapshot, data, "quick-switch", input.Description); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "store", "save_version_failed", err.Error(), "")
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"switched": true, "profile": input.Profile, "route_id": input.RouteID, "id": snapshot.ID})
@@ -1102,12 +1145,10 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnprocessableEntity, "config", "snapshot_failed", err.Error(), "")
 		return
 	}
-	if err := s.store.Activate(r.Context(), input.ID); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "config", "store_activation_failed", err.Error(), "")
-		return
-	}
-	if err := s.Activate(snapshot); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "config", "activation_failed", err.Error(), "")
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if err := s.commitConfig(snapshot, version.YAML, "rollback:"+input.ID, version.Description); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "config", "rollback_failed", err.Error(), "")
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"rolled_back": true, "id": snapshot.ID})
@@ -1301,10 +1342,14 @@ func (s *Server) previewPayload(requestID string, profile *config.Profile, selec
 	if json.Unmarshal(env.Body, &decoded) == nil {
 		body = decoded
 	}
+	if snapshot := s.Snapshot(); snapshot != nil && snapshot.Config != nil && snapshot.Config.Observability.RedactPrompts {
+		body = "[REDACTED]"
+	}
 	return map[string]any{"request_id": requestID, "mode": mode, "profile": profile.Name, "route": selectedRoute, "upstream": upstream, "request": map[string]any{"method": env.Method, "path": env.Path, "query": env.Query, "headers": redactHeadersWith(env.Headers, extraRedactions), "body": body}}
 }
 
 func (s *Server) writeDryRunResponse(w http.ResponseWriter, requestID string, profile *config.Profile, prepared transform.Envelope) {
+	_ = prepared // body redaction handled via s.Snapshot() at call sites
 	contract := strings.ToLower(profile.ClientContract)
 	message := "[dry-run] request validated; upstream was not called"
 	model := requestModel(prepared.Body)
@@ -1331,7 +1376,11 @@ func (s *Server) writeDryRunResponse(w http.ResponseWriter, requestID string, pr
 	case strings.Contains(contract, "openai") || strings.Contains(prepared.Path, "/chat/completions"):
 		payload = map[string]any{"id": "dryrun-" + requestID, "object": "chat.completion", "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": message}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 	default:
-		payload = map[string]any{"mode": "dry-run", "request_id": requestID, "profile": profile.Name, "upstream_called": false, "request": map[string]any{"method": prepared.Method, "path": prepared.Path, "query": prepared.Query, "headers": redactHeaders(prepared.Headers), "body": json.RawMessage(prepared.Body)}}
+		dryRunBody := any(json.RawMessage(prepared.Body))
+		if cfg2 := s.Snapshot(); cfg2 != nil && cfg2.Config != nil && cfg2.Config.Observability.RedactPrompts {
+			dryRunBody = "[REDACTED]"
+		}
+		payload = map[string]any{"mode": "dry-run", "request_id": requestID, "profile": profile.Name, "upstream_called": false, "request": map[string]any{"method": prepared.Method, "path": prepared.Path, "query": prepared.Query, "headers": redactHeaders(prepared.Headers), "body": dryRunBody}}
 	}
 	w.Header().Set("X-Gateway-Dry-Run", "true")
 	s.writeJSON(w, http.StatusOK, payload)

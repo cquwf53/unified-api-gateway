@@ -69,8 +69,12 @@ func TestAnthropicToResponsesStream(t *testing.T) {
 	// Clients that read event.response instead of accumulating deltas must
 	// still receive the full message text.
 	item := response["output"].([]any)[0].(map[string]any)
-	if item["id"] != "msg_0" {
-		t.Fatalf("output item id must match the delta item_id, got %v", item["id"])
+	if !strings.HasPrefix(item["id"].(string), "msg_") {
+		t.Fatalf("output item id should look like a message id, got %v", item["id"])
+	}
+	// The delta frames carry the same item id.
+	if !strings.Contains(string(mustJSONT(t, translated)), `"item_id":"`+item["id"].(string)+`"`) {
+		t.Fatalf("delta item_id must match the output item id %v", item["id"])
 	}
 	text := item["content"].([]any)[0].(map[string]any)["text"]
 	if text != "Hello" {
@@ -327,4 +331,9 @@ func TestPureToolResponsesStreamOmitsEmptyMessage(t *testing.T) {
 			t.Fatalf("empty message item leaked into a pure-tool stream: %s", event.Data)
 		}
 	}
+}
+
+func mustJSONT(t *testing.T, events []SSEEvent) []byte {
+	t.Helper()
+	return EncodeSSE(events)
 }

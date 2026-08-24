@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"unified-api-gateway/internal/config"
+
+	"gopkg.in/yaml.v3"
 	"unified-api-gateway/internal/server"
 	"unified-api-gateway/internal/store"
 )
@@ -94,11 +96,17 @@ func loadSnapshot(configPath string) (*config.ConfigSnapshot, []byte, error) {
 
 func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bool) error {
 	baseSnapshot, data, err := loadSnapshot(configPath)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// A corrupt file is fatal; a missing file may still be recoverable
+		// from the stored active configuration below.
 		return err
 	}
+	fileLoadFailed := err != nil
 	storeDB, err := store.Open(dbPath)
 	if err != nil {
+		if fileLoadFailed {
+			return err
+		}
 		return err
 	}
 	defer storeDB.Close()
@@ -107,7 +115,7 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	// on-disk config file. data must follow the snapshot: saving the file
 	// YAML under the restored version's id would overwrite the stored
 	// configuration (SaveVersion is INSERT OR REPLACE).
-	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 && !preferFile {
+	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 && !preferFile && !fileLoadFailed {
 		if active.SHA256 != "" && active.SHA256 != baseSnapshot.Hash {
 			slog.Warn("stored active configuration differs from the config file; the stored version wins (use --prefer-file to change this)", "stored_id", active.ID, "file_id", baseSnapshot.ID)
 		}
@@ -119,6 +127,13 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 		} else {
 			slog.Warn("stored active configuration no longer parses; using the config file", "id", active.ID, "error", parseErr)
 		}
+	}
+	if fileLoadFailed && (baseSnapshot == nil || baseSnapshot.Config == nil) {
+		return errors.New("config file could not be loaded and no stored active configuration is available")
+	}
+	// Fail closed: require_client_auth with no resolvable key refuses to serve.
+	if policiesDecodeRequireClientAuth(baseSnapshot) && !server.ClientAuthKeysConfigured(baseSnapshot.Config) {
+		return errors.New("require_client_auth is enabled but no client credential resolves to a key; refusing to start fail-open")
 	}
 	// Persist the version exactly as it will run; listener overrides below
 	// are process-local and deliberately excluded from the stored YAML.
@@ -217,8 +232,11 @@ func activate(configPath, dbPath, adminURL, adminToken string) error {
 				fmt.Printf("hot activated %s\n", snapshot.ID)
 				return nil
 			}
-			if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-				return fmt.Errorf("management API rejected the activation (HTTP %d; check --admin-token or GATEWAY_ADMIN_TOKEN); nothing was saved", response.StatusCode)
+			if response.StatusCode >= 400 {
+				// Any definitive management-plane rejection (auth,
+				// validation, conflict, internal error) must not degrade
+				// into a silent local save that pretends success.
+				return fmt.Errorf("management API rejected the activation (HTTP %d); nothing was saved", response.StatusCode)
 			}
 		}
 	}
@@ -285,6 +303,27 @@ func printStatus(dbPath string) error {
 	b, _ := json.MarshalIndent(map[string]any{"gateway_version": server.BuildVersion, "versions": items}, "", "  ")
 	fmt.Println(string(b))
 	return nil
+}
+
+// policiesDecodeRequireClientAuth reads policies.defaults.require_client_auth
+// without importing the server package's runtime policy engine.
+func policiesDecodeRequireClientAuth(snapshot *config.ConfigSnapshot) bool {
+	if snapshot == nil || snapshot.Config == nil {
+		return false
+	}
+	var spec struct {
+		Defaults struct {
+			Require *bool `yaml:"require_client_auth"`
+		} `yaml:"defaults"`
+	}
+	raw, err := yaml.Marshal(snapshot.Config.Policies)
+	if err != nil {
+		return false
+	}
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		return false
+	}
+	return spec.Defaults.Require != nil && *spec.Defaults.Require
 }
 
 // applyLogLevel maps observability.log_level onto the default logger.

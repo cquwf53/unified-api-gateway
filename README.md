@@ -237,7 +237,7 @@ profile/method/path 最近的一条录制，并通过 `X-Gateway-Replay: exact|a
 
 ```text
 GET  /healthz                       存活检查
-GET  /readyz                        配置和上游就绪状态
+GET  /readyz                        配置与存储就绪状态（不含上游探活）
 GET  /admin/v1/status               当前激活版本、监听器和指标摘要
 GET  /admin/v1/config               当前配置（敏感字段已脱敏）
 POST /admin/v1/config/validate      校验 YAML，不改变 active 版本
@@ -296,6 +296,9 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
 写入 SQLite，积压时丢弃并告警）；`policies.audit.redact` 列表中的头名称会在预览、
 dry-run 输出和 record 存档中额外脱敏。
 
+`policies.defaults.require_client_auth: true` 时网关以 fail-closed 运行：未携带
+有效客户端密钥的请求在三个平面（HTTP/WS/gRPC）一律 401，且启动时若没有任何
+client 凭据能解析出密钥将直接拒绝启动，而不是退化成开放模式。
 `policies.defaults.allow_anonymous_profile_override: false` 可以关闭开放模式下的
 `X-Gateway-Profile` 越权入口（默认 true 以兼容旧行为）。credential `type: api_key`
 将引用的环境变量以 `x-api-key` 头发送（Anthropic 的方案），`env` 则用
@@ -362,7 +365,8 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 - `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
 - route 校验拒绝完全相同的 matcher+priority 组合，但**包含关系**冲突（如同
   path 前缀的宽窄规则叠加）仍不检测；
-- 客户端鉴权在未配置任何可解析密钥时保持关闭（fail-open），见上文安全边界。
+- 客户端鉴权默认在未配置任何可解析密钥时保持关闭（fail-open）；生产部署应
+  设置 `require_client_auth: true` 强制 fail-closed，见上文流量策略。
 
 ## 项目布局
 

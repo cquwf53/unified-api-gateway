@@ -298,6 +298,9 @@ type PolicyDefaults struct {
 	// AllowAnonymousProfileOverride toggles the open-mode X-Gateway-Profile
 	// override (defaults to true for backward compatibility).
 	AllowAnonymousProfileOverride *bool `yaml:"allow_anonymous_profile_override"`
+	// RequireClientAuth fails closed: requests without a valid client key
+	// are rejected, and startup fails when no credential resolves.
+	RequireClientAuth *bool `yaml:"require_client_auth"`
 }
 
 type RetryPolicy struct {

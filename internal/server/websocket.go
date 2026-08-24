@@ -33,12 +33,13 @@ func sameOrigin(origin, host string) bool {
 	return strings.EqualFold(parsed.Host, host)
 }
 
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapshot *config.ConfigSnapshot, requestID string) {
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned *gatewayState, requestID string) {
+	// The caller pinned the state for this request; reusing it guarantees
+	// the whole connection lifetime sees one configuration version.
+	snapshot := pinned.snapshot
 	// handleProxy already opened the metrics span; this handler only adds
 	// the terminal observation with the real outcome (a failed dial must
-	// not be recorded as a successful upgrade). The pinned state keeps
-	// policy decisions stable for the whole connection.
-	pinned := s.state.Load()
+	// not be recorded as a successful upgrade).
 	started := time.Now()
 	var profile *config.Profile
 	var selectedRoute *config.Route
@@ -52,7 +53,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	match := route.FromHTTPRequest(r)
 	match.ClientID, match.Tenant = s.authenticateClient(cfg, r)
 	match.Client = match.ClientID
-	if requiresClientAuth(cfg) && match.ClientID == "" {
+	if (requiresClientAuth(cfg) || pinned.policy.requireClientAuth) && match.ClientID == "" {
 		status = http.StatusUnauthorized
 		s.writeError(w, status, "auth", "client_auth_required", "a valid client key is required", requestID)
 		return
@@ -173,19 +174,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 	const wsIdleTimeout = 10 * time.Minute
 	clientConn.SetReadLimit(wsReadLimit)
 	upstreamConn.SetReadLimit(wsReadLimit)
-	refreshDeadlines := func() {
-		deadline := time.Now().Add(wsIdleTimeout)
-		_ = clientConn.SetReadDeadline(deadline)
-		_ = upstreamConn.SetReadDeadline(deadline)
+	// Each connection's read deadline is only touched by its own read loop
+	// (and pings on that connection), avoiding cross-connection writes.
+	refreshRead := func(conn *websocket.Conn) {
+		_ = conn.SetReadDeadline(time.Now().Add(wsIdleTimeout))
 	}
-	refreshDeadlines()
-	// Ping handlers must answer with a pong (peers use it for liveness)
-	// while refreshing the idle deadline.
+	refreshRead(clientConn)
+	refreshRead(upstreamConn)
+	writeDeadline := func() time.Time { return time.Now().Add(30 * time.Second) }
+	// Ping handlers answer with a pong (peers use it for liveness) and
+	// refresh that connection's own idle deadline.
 	pongHandler := func(conn *websocket.Conn) func(string) error {
 		return func(appData string) error {
-			refreshDeadlines()
-			deadline := time.Now().Add(10 * time.Second)
-			_ = conn.WriteControl(websocket.PongMessage, []byte(appData), deadline)
+			refreshRead(conn)
+			_ = conn.WriteControl(websocket.PongMessage, []byte(appData), writeDeadline())
 			return nil
 		}
 	}
@@ -203,7 +205,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 			if readErr != nil {
 				return
 			}
-			refreshDeadlines()
+			refreshRead(src)
+			_ = dst.SetWriteDeadline(writeDeadline())
 			if writeErr := dst.WriteMessage(messageType, payload); writeErr != nil {
 				return
 			}

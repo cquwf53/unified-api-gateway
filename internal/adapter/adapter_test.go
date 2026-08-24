@@ -263,3 +263,68 @@ func TestParallelToolCallsFlagMapped(t *testing.T) {
 		t.Fatal("parallel_tool_calls must not be forwarded to Anthropic")
 	}
 }
+
+func TestAnthropicToolHistoryConvertedToOpenAI(t *testing.T) {
+	// assistant tool_use + user tool_result must become tool_calls and a
+	// tool message, or multi-turn tool conversations lose their history.
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"gpt","max_tokens":8,"messages":[
+		{"role":"user","content":"weather?"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Oslo"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"12C"}]},
+		{"role":"user","content":"thanks"}
+	]}`)}
+	output, err := (AnthropicToOpenAIChat{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages=%d", len(messages))
+	}
+	assistant := messages[1].(map[string]any)
+	calls := assistant["tool_calls"].([]any)
+	call := calls[0].(map[string]any)
+	if call["id"] != "toolu_1" || call["function"].(map[string]any)["name"] != "get_weather" {
+		t.Fatalf("tool call=%#v", call)
+	}
+	if !strings.Contains(call["function"].(map[string]any)["arguments"].(string), "Oslo") {
+		t.Fatalf("arguments lost: %#v", call["function"])
+	}
+	toolMessage := messages[2].(map[string]any)
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "toolu_1" || toolMessage["content"] != "12C" {
+		t.Fatalf("tool message=%#v", toolMessage)
+	}
+}
+
+func TestResponsesFunctionCallOutputBecomesToolResult(t *testing.T) {
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"claude","max_output_tokens":8,"input":[
+		{"type":"function_call","call_id":"call_1","name":"ping","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_1","output":"pong"}
+	]}`)}
+	output, err := (OpenAIResponsesToAnthropic{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d", len(messages))
+	}
+	assistant := messages[0].(map[string]any)
+	block := assistant["content"].([]any)[0].(map[string]any)
+	if block["type"] != "tool_use" || block["id"] != "call_1" || block["name"] != "ping" {
+		t.Fatalf("tool_use block=%#v", block)
+	}
+	user := messages[1].(map[string]any)
+	result := user["content"].([]any)[0].(map[string]any)
+	if result["type"] != "tool_result" || result["tool_use_id"] != "call_1" || result["content"] != "pong" {
+		t.Fatalf("tool_result=%#v", result)
+	}
+}

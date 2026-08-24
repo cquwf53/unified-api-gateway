@@ -20,7 +20,8 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnsupportedMediaType, "grpc", "content_type_required", "gRPC requests must use application/grpc", "")
 		return
 	}
-	snapshot := s.Snapshot()
+	pinned := s.state.Load()
+	snapshot := pinned.snapshot
 	if snapshot == nil || snapshot.Config == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "grpc", "not_ready", "no active configuration", "")
 		return
@@ -28,11 +29,10 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	match := route.FromHTTPRequest(r)
 	match.ClientID, match.Tenant = s.authenticateClient(snapshot.Config, r)
 	match.Client = match.ClientID
-	if requiresClientAuth(snapshot.Config) && match.ClientID == "" {
+	if (requiresClientAuth(snapshot.Config) || pinned.policy.requireClientAuth) && match.ClientID == "" {
 		s.writeError(w, http.StatusUnauthorized, "auth", "client_auth_required", "a valid client key is required", "")
 		return
 	}
-	pinned := s.state.Load()
 	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
 	if match.Profile != "" && !requiresClientAuth(snapshot.Config) && match.ClientID == "" && !pinned.allowsAnonymousOverride() {
 		s.writeError(w, http.StatusForbidden, "auth", "profile_override_denied", "anonymous profile overrides are disabled by policy", "")

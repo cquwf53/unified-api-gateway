@@ -32,7 +32,7 @@ vet:
 	$(GO) vet ./...
 
 docker:
-	docker build -t $(BINARY):dev .
+	docker build --build-arg VERSION=$(VERSION) -t $(BINARY):$(VERSION) .
 
 clean:
 	rm -f $(BINARY) $(BINARY).exe

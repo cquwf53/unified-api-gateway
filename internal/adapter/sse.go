@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +20,10 @@ type toolCallBuffer struct {
 	name string
 	args strings.Builder
 }
+
+// maxBufferedToolArgs caps the argument bytes buffered per tool call while
+// translating parallel tool streams.
+const maxBufferedToolArgs = 4 << 20
 
 // SSEEvent is a parsed Server-Sent Event frame. Data may contain newlines;
 // parsing joins multiple data: lines according to the SSE specification.
@@ -150,10 +155,11 @@ type SSETranslator struct {
 	// call). Anthropic's block format is strictly sequential, so tool calls
 	// are replayed as complete blocks at the end of the stream in index
 	// order; this stays lossless even for interleaved parallel tool deltas.
-	toolBuffers map[int]*toolCallBuffer
-	streamID    string
-	model       string
-	finishSent  bool
+	toolBuffers  map[int]*toolCallBuffer
+	toolOverflow bool
+	streamID     string
+	model        string
+	finishSent   bool
 	// createdUnix backs the OpenAI "created" field, which Anthropic streams
 	// never carry; it is stamped when the translator is created.
 	createdUnix int64
@@ -188,6 +194,8 @@ type SSETranslator struct {
 	// respPartAdded records whether the text content part was announced;
 	// pure-tool streams skip the part lifecycle entirely.
 	respPartAdded bool
+	// itemID is this stream's message item identifier.
+	itemID string
 	// respItemAdded records whether the assistant message output item was
 	// announced; pure-tool streams skip it entirely.
 	respItemAdded bool
@@ -210,11 +218,20 @@ func (t *SSETranslator) respEvent(name string, payload map[string]any) SSEEvent 
 // NewSSETranslator returns a translator between two contract names such as
 // "anthropic-messages" and "openai-chat". Identical or unknown contracts
 // return a pass-through translator.
+var itemIDSequence atomic.Uint64
+
+// nextResponsesItemID returns a stream-unique message item id; consumers
+// that key on item ids across streams cannot collide on a fixed value.
+func nextResponsesItemID() string {
+	return fmt.Sprintf("msg_%d", itemIDSequence.Add(1))
+}
+
 func NewSSETranslator(from, to string) *SSETranslator {
 	return &SSETranslator{
 		from: strings.ToLower(from), to: strings.ToLower(to),
 		toolBuffers: map[int]*toolCallBuffer{}, toolCallIndexByBlock: map[int]int{},
 		toolCallByItem: map[string]int{}, toolArgsSeen: map[string]bool{}, nextBlock: -1, createdUnix: time.Now().Unix(),
+		itemID: nextResponsesItemID(),
 	}
 }
 
@@ -394,15 +411,15 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 						}))
 					}
 					opener = append(opener, t.respEvent("response.content_part.added", map[string]any{
-						"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+						"type": "response.content_part.added", "item_id": t.itemID, "output_index": 0, "content_index": 0,
 						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 					}))
 					return append(opener, t.respEvent("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
+						"type": "response.output_text.delta", "item_id": t.itemID, "output_index": 0, "content_index": 0, "delta": text,
 					}))
 				}
 				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
-					"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
+					"type": "response.output_text.delta", "item_id": t.itemID, "output_index": 0, "content_index": 0, "delta": text,
 				})}
 			}
 		}
@@ -439,10 +456,6 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 	}
 }
 
-// responsesItemID is the stable identifier linking output_item events with
-// their content parts and text deltas.
-const responsesItemID = "msg_0"
-
 // responsesResponseID rebrands Anthropic message ids (msg_*) as Responses
 // ids so clients see their own vocabulary.
 func responsesResponseID(id string) string {
@@ -455,7 +468,7 @@ func responsesResponseID(id string) string {
 // responsesMessageItem builds the message output item for item.added/done and
 // the completed response's output array.
 func (t *SSETranslator) responsesMessageItem(status string) map[string]any {
-	item := map[string]any{"id": responsesItemID, "type": "message", "role": "assistant", "status": status}
+	item := map[string]any{"id": t.itemID, "type": "message", "role": "assistant", "status": status}
 	if status == "completed" {
 		item["content"] = []any{map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}}}
 	} else {
@@ -518,11 +531,11 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		if t.respPartAdded {
 			events = append(events,
 				t.respEvent("response.output_text.done", map[string]any{
-					"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+					"type": "response.output_text.done", "item_id": t.itemID, "output_index": 0, "content_index": 0,
 					"text": t.respText.String(),
 				}),
 				t.respEvent("response.content_part.done", map[string]any{
-					"type": "response.content_part.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+					"type": "response.content_part.done", "item_id": t.itemID, "output_index": 0, "content_index": 0,
 					"part": map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}},
 				}))
 		}
@@ -731,7 +744,14 @@ func (t *SSETranslator) accumulateToolCalls(calls []any) {
 			if name := asString(fn["name"]); name != "" {
 				buffer.name = name
 			}
-			buffer.args.WriteString(asString(fn["arguments"]))
+			chunk := asString(fn["arguments"])
+			if buffer.args.Len()+len(chunk) > maxBufferedToolArgs {
+				// Bounded like every other stream buffer; a stream that
+				// exceeds it fails instead of growing without limit.
+				t.toolOverflow = true
+				return
+			}
+			buffer.args.WriteString(chunk)
 		}
 	}
 }
@@ -739,6 +759,10 @@ func (t *SSETranslator) accumulateToolCalls(calls []any) {
 // flushBufferedTools replays every buffered tool call as a complete
 // content_block start/delta/stop triple, in tool_calls index order.
 func (t *SSETranslator) flushBufferedTools() []SSEEvent {
+	if t.toolOverflow {
+		// An error event is better than silently truncated arguments.
+		return []SSEEvent{sseEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "buffered tool arguments exceeded the translation limit"}})}
+	}
 	indexes := make([]int, 0, len(t.toolBuffers))
 	for index := range t.toolBuffers {
 		indexes = append(indexes, index)

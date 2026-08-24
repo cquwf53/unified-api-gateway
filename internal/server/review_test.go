@@ -217,3 +217,32 @@ func TestUpstreamRetriesRespectIdempotency(t *testing.T) {
 
 // boolPtr keeps StreamSafe literals in tests readable.
 func boolPtr(value bool) *bool { return &value }
+
+// TestRequireClientAuthFailsClosed pins the fail-closed mode: with
+// require_client_auth and no resolvable key, every plane rejects anonymous
+// traffic instead of serving it open.
+func TestRequireClientAuthFailsClosed(t *testing.T) {
+	cfg := &config.Config{Version: 1, Policies: map[string]any{
+		"defaults": map[string]any{"require_client_auth": true},
+	}, Profiles: map[string]config.Profile{
+		"p": {Name: "p", Adapter: "transparent", TrafficMode: "dry-run"},
+	}, Routes: []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/thing"}, Profile: "p"}}}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/thing", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401 in fail-closed mode", recorder.Code)
+	}
+	models := httptest.NewRecorder()
+	gateway.ServeDataHTTP(models, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if models.Code != http.StatusUnauthorized {
+		t.Fatalf("models status=%d", models.Code)
+	}
+}
