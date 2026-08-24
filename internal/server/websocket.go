@@ -153,6 +153,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 		return
 	}
 	defer clientConn.Close()
+	const wsReadLimit = 8 << 20
+	const wsIdleTimeout = 10 * time.Minute
+	clientConn.SetReadLimit(wsReadLimit)
+	upstreamConn.SetReadLimit(wsReadLimit)
+	refreshDeadlines := func() {
+		deadline := time.Now().Add(wsIdleTimeout)
+		_ = clientConn.SetReadDeadline(deadline)
+		_ = upstreamConn.SetReadDeadline(deadline)
+	}
+	refreshDeadlines()
+	clientConn.SetPingHandler(func(string) error { refreshDeadlines(); return nil })
+	upstreamConn.SetPingHandler(func(string) error { refreshDeadlines(); return nil })
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -165,6 +177,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, snapsho
 			if readErr != nil {
 				return
 			}
+			refreshDeadlines()
 			if writeErr := dst.WriteMessage(messageType, payload); writeErr != nil {
 				return
 			}

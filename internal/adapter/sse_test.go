@@ -272,31 +272,54 @@ func TestThinkingBecomesReasoningContentWithoutEmptyFrames(t *testing.T) {
 	}
 }
 
-func TestLateArgumentsForClosedToolBlockAreDropped(t *testing.T) {
-	// Open tool 0, open tool 1 (closing 0), then a late delta for tool 0:
-	// writing into the closed block would emit an invalid sequence.
-	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"a\",\"arguments\":\"\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"b\",\"arguments\":\"\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"late\"}}]}}]}\n\n" +
-		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
-		"data: [DONE]\n\n"
+func TestInterleavedToolArgumentsPreserved(t *testing.T) {
+	// Interleaved parallel-tool deltas must stay lossless: every tool call
+	// is buffered and replayed as a complete block in tool index order.
+	frame := func(call map[string]any) string {
+		chunk := map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{call}}}}}
+		b, _ := json.Marshal(chunk)
+		return "data: " + string(b) + "\n\n"
+	}
+	finish := func() string {
+		chunk := map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"}}}
+		b, _ := json.Marshal(chunk)
+		return "data: " + string(b) + "\n\ndata: [DONE]\n\n"
+	}
+	raw := frame(map[string]any{"index": 0, "id": "call_a", "function": map[string]any{"name": "a", "arguments": `{"x":`}}) +
+		frame(map[string]any{"index": 1, "id": "call_b", "function": map[string]any{"name": "b", "arguments": `{"y":`}}) +
+		frame(map[string]any{"index": 0, "function": map[string]any{"arguments": `1,`}}) +
+		frame(map[string]any{"index": 1, "function": map[string]any{"arguments": `2}`}}) +
+		frame(map[string]any{"index": 0, "function": map[string]any{"arguments": `}`}}) +
+		finish()
 	translated := mustTranslate(t, raw, "openai-chat", "anthropic-messages")
+	var toolArgs []string
 	for _, event := range translated {
-		if !strings.Contains(event.Data, "content_block_delta") {
+		if !strings.Contains(event.Data, "input_json_delta") {
 			continue
 		}
-		if strings.Contains(event.Data, "late") {
-			t.Fatal("arguments for a closed block leaked into the stream")
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatal(err)
 		}
+		toolArgs = append(toolArgs, payload["delta"].(map[string]any)["partial_json"].(string))
 	}
-	// Both tool blocks still get explicit stops.
-	stops := 0
+	if len(toolArgs) != 2 {
+		t.Fatalf("expected two complete tool blocks, got %d: %s", len(toolArgs), EncodeSSE(translated))
+	}
+	if toolArgs[0] != `{"x":1,}` || toolArgs[1] != `{"y":2}` {
+		t.Fatalf("interleaved arguments corrupted: %#v", toolArgs)
+	}
+	// Tool blocks appear in index order with complete start/stop lifecycles.
+	stops, starts := 0, 0
 	for _, event := range translated {
 		if strings.Contains(event.Data, "content_block_stop") {
 			stops++
 		}
+		if strings.Contains(event.Data, "content_block_start") {
+			starts++
+		}
 	}
-	if stops != 2 {
-		t.Fatalf("expected stops for both tool blocks, got %d: %s", stops, EncodeSSE(translated))
+	if starts != 2 || stops != 2 {
+		t.Fatalf("tool block lifecycle incomplete: starts=%d stops=%d", starts, stops)
 	}
 }

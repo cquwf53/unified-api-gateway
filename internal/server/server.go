@@ -42,8 +42,18 @@ const (
 	defaultAdminToken       = ""
 )
 
+// gatewayState bundles everything derived from one configuration snapshot.
+// Publishing a single pointer makes hot activation atomic: a request can
+// never observe the config of one version with the pipelines or policy
+// runtimes of another.
+type gatewayState struct {
+	snapshot  *config.ConfigSnapshot
+	runtimes  map[string]*profileRuntime
+	pipelines map[string]*compiledPipeline
+}
+
 type Server struct {
-	current    atomic.Pointer[config.ConfigSnapshot]
+	state      atomic.Pointer[gatewayState]
 	registry   *adapter.Registry
 	client     *http.Client
 	metrics    *telemetry.Metrics
@@ -55,8 +65,6 @@ type Server struct {
 	clientMu     sync.Mutex
 	clientsByKey map[clientKey]*http.Client
 
-	runtimes  atomic.Pointer[map[string]*profileRuntime]
-	pipelines atomic.Pointer[map[string]*compiledPipeline]
 	breakerMu sync.Mutex
 	breakers  map[string]*breaker
 	shadowSem chan struct{}
@@ -95,12 +103,21 @@ func New(options Options) (*Server, error) {
 		s.auditWG.Add(1)
 		go s.drainAuditEvents()
 	}
-	s.current.Store(options.Snapshot)
-	s.runtimes.Store(&map[string]*profileRuntime{})
-	pipelines := buildPipelines(options.Snapshot.Config)
-	s.pipelines.Store(&pipelines)
-	s.rebuildRuntimes(options.Snapshot.Config)
+	s.publishState(options.Snapshot)
 	return s, nil
+}
+
+// publishState derives runtimes and pipelines for a snapshot and swaps the
+// whole state in one atomic store.
+func (s *Server) publishState(snapshot *config.ConfigSnapshot) {
+	cfg := snapshot.Config
+	state := &gatewayState{
+		snapshot:  snapshot,
+		runtimes:  s.buildRuntimes(cfg),
+		pipelines: buildPipelines(cfg),
+	}
+	s.warnInsecureUpstreams(cfg)
+	s.state.Store(state)
 }
 
 // clientKey identifies a derived HTTP client by the properties that affect
@@ -170,7 +187,10 @@ func (s *Server) Snapshot() *config.ConfigSnapshot {
 	if s == nil {
 		return nil
 	}
-	return s.current.Load()
+	if state := s.state.Load(); state != nil {
+		return state.snapshot
+	}
+	return nil
 }
 
 func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
@@ -180,8 +200,7 @@ func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
 	if err := snapshot.Config.Validate(); err != nil {
 		return err
 	}
-	s.current.Store(snapshot.Clone())
-	s.rebuildRuntimes(snapshot.Config)
+	s.publishState(snapshot.Clone())
 	if s.store != nil {
 		_ = s.store.AddAudit(context.Background(), store.AuditEvent{
 			Action:    "config.activate",
@@ -193,19 +212,15 @@ func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
 	return nil
 }
 
-// rebuildRuntimes recreates admission-control objects and compiled transform
-// pipelines for a newly activated configuration. Breakers are keyed by
-// upstream name and deliberately kept across activations.
-func (s *Server) rebuildRuntimes(cfg *config.Config) {
-	runtimes := s.buildRuntimes(cfg)
-	s.runtimes.Store(&runtimes)
-	pipelines := buildPipelines(cfg)
-	s.pipelines.Store(&pipelines)
-	if cfg != nil {
-		for name, upstream := range cfg.Upstreams {
-			if upstream.Insecure {
-				slog.Warn("upstream TLS verification is disabled", "upstream", name, "base_url", upstream.EffectiveURL())
-			}
+// warnInsecureUpstreams logs every upstream that disabled TLS verification;
+// it runs on each published state.
+func (s *Server) warnInsecureUpstreams(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	for name, upstream := range cfg.Upstreams {
+		if upstream.Insecure {
+			slog.Warn("upstream TLS verification is disabled", "upstream", name, "base_url", upstream.EffectiveURL())
 		}
 	}
 }
@@ -231,6 +246,10 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/readyz":
 		if s.Snapshot() == nil {
 			s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
+			return
+		}
+		if err := s.store.Ping(r.Context()); err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "store": err.Error()})
 			return
 		}
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "config": s.Snapshot().ID})
@@ -384,6 +403,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	match.Tenant = tenant
 	match.Profile = strings.TrimSpace(r.Header.Get("X-Gateway-Profile"))
 	if match.Profile != "" && !requiresClientAuth(cfg) && clientID == "" {
+		if !decodePolicySet(cfg).allowAnonymousProfileOverride {
+			fail(http.StatusForbidden, "auth", "profile_override_denied", "anonymous profile overrides are disabled by policy")
+			return
+		}
 		match.ClientID = "__anonymous__"
 		match.Client = "__anonymous__"
 	}
@@ -482,7 +505,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			fail(http.StatusNotImplemented, "replay", "replay_not_configured", "replay storage is not configured")
 			return
 		}
-		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(profile.Name, prepared))
+		clientID, tenant := metadataStrings(prepared)
+		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(profile.Name, prepared), clientID, tenant)
 		if replayErr == nil {
 			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
 			response.Headers = response.Headers.Clone()
@@ -494,7 +518,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Exact hashes rarely match twice for chat traffic, so fall back to
 		// the most recent recording of the same profile, method and path and
 		// label the response so clients can tell.
-		if recording, fuzzyErr := s.store.LatestRecordingForProfile(r.Context(), profile.Name, prepared.Method, prepared.Path); fuzzyErr == nil {
+		if recording, fuzzyErr := s.store.LatestRecordingForProfile(r.Context(), profile.Name, prepared.Method, prepared.Path, clientID, tenant); fuzzyErr == nil {
 			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
 			response.Headers = response.Headers.Clone()
 			response.Headers.Set("X-Gateway-Replay", "approximate")
@@ -518,7 +542,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, streamErrorStage(headersSent, streamErr), streamErrorCode(streamErr))
 		return
 	}
-	if mode == "live" && wantsStreamFromEnvelope(prepared) && profile.IsStreamSafe() {
+	if mode == "live" && wantsStreamFromEnvelope(prepared) && profile.IsStreamSafe() && len(profile.AllResponseTransforms()) == 0 {
 		// Semantic adapters translate frame by frame so the client receives a
 		// live stream instead of a buffered burst. An explicit
 		// stream_safe: false opts out (the response is then buffered and
@@ -556,7 +580,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "record" && s.store != nil {
-		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, Method: prepared.Method, Path: prepared.Path, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
+		recordingClient, recordingTenant := metadataStrings(prepared)
+		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, Method: prepared.Method, Path: prepared.Path, ClientID: recordingClient, Tenant: recordingTenant, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
 			fail(http.StatusInternalServerError, "record", "record_save_failed", saveErr.Error())
 			return
 		}
@@ -1449,7 +1474,7 @@ func (s *Server) writeEnvelope(w http.ResponseWriter, env transform.Envelope) {
 		// Content-Length describes the upstream body, which adapters and
 		// response transforms may have rewritten; forwarding it truncates or
 		// corrupts the client stream. net/http computes the real length.
-		if isHopByHopHeader(key) || strings.EqualFold(key, "Content-Length") {
+		if isHopByHopHeader(key) || strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Set-Cookie") {
 			continue
 		}
 		for _, value := range values {
@@ -1514,10 +1539,17 @@ func headersFromValues(values map[string][]string) http.Header {
 }
 
 func recordingKey(profile string, env transform.Envelope) string {
+	clientID, tenant := metadataStrings(env)
 	h := sha256.New()
-	_, _ = io.WriteString(h, profile+"\n"+env.Method+"\n"+env.Path+"\n"+env.Query.Encode()+"\n")
+	_, _ = io.WriteString(h, profile+"\n"+clientID+"\n"+tenant+"\n"+env.Method+"\n"+env.Path+"\n"+env.Query.Encode()+"\n")
 	_, _ = h.Write(env.Body)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func metadataStrings(env transform.Envelope) (string, string) {
+	clientID, _ := env.Metadata["client_id"].(string)
+	tenant, _ := env.Metadata["tenant"].(string)
+	return clientID, tenant
 }
 
 func filteredRequestHeaders(in http.Header) http.Header {
@@ -1564,12 +1596,17 @@ func resolveCredential(c config.Credential) string {
 	if c.Value != "" {
 		return c.Value
 	}
-	if strings.EqualFold(c.Type, "env") {
+	// Both "env" and "api_key" (Anthropic-style X-API-Key) credentials name
+	// an environment variable in Env (or Ref); only the injected header
+	// differs, which the caller picks from the type.
+	if strings.EqualFold(c.Type, "env") || strings.EqualFold(c.Type, "api_key") {
 		name := c.Env
 		if name == "" {
 			name = c.Ref
 		}
-		return os.Getenv(strings.TrimPrefix(name, "env:"))
+		if name != "" {
+			return os.Getenv(strings.TrimPrefix(name, "env:"))
+		}
 	}
 	if c.Ref != "" {
 		return resolveSecretValue(c.Ref)
@@ -1695,11 +1732,18 @@ func redactConfig(c *config.Config) *config.Config {
 	clone := c.Clone()
 	for id, credential := range clone.Credentials {
 		credential.Value = "[REDACTED]"
+		// A Ref that is not an env:/$ENV: reference is a literal secret.
+		if credential.Ref != "" && !strings.HasPrefix(credential.Ref, "env:") && !strings.HasPrefix(credential.Ref, "$ENV:") {
+			credential.Ref = "[REDACTED]"
+		}
 		clone.Credentials[id] = credential
 	}
 	for id, client := range clone.Clients {
 		if client.Key != "" {
 			client.Key = "[REDACTED]"
+		}
+		if client.KeyRef != "" && !strings.HasPrefix(client.KeyRef, "env:") && !strings.HasPrefix(client.KeyRef, "$ENV:") {
+			client.KeyRef = "[REDACTED]"
 		}
 		clone.Clients[id] = client
 	}

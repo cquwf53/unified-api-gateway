@@ -92,21 +92,9 @@ func loadSnapshot(configPath string) (*config.ConfigSnapshot, []byte, error) {
 }
 
 func serve(configPath, dbPath, httpOverride, adminOverride string) error {
-	snapshot, data, err := loadSnapshot(configPath)
+	baseSnapshot, data, err := loadSnapshot(configPath)
 	if err != nil {
 		return err
-	}
-	if httpOverride != "" {
-		snapshot.Config.Listeners.HTTP = httpOverride
-	}
-	if adminOverride != "" {
-		snapshot.Config.Listeners.Admin = adminOverride
-	}
-	if httpOverride != "" || adminOverride != "" {
-		snapshot, err = config.NewSnapshot(snapshot.Config, configPath+" (listener override)")
-		if err != nil {
-			return err
-		}
 	}
 	storeDB, err := store.Open(dbPath)
 	if err != nil {
@@ -115,24 +103,42 @@ func serve(configPath, dbPath, httpOverride, adminOverride string) error {
 	defer storeDB.Close()
 	// A CLI activation saved while the management plane was down was stored
 	// "for next startup"; honour it instead of silently reverting to the
-	// on-disk config file.
+	// on-disk config file. data must follow the snapshot: saving the file
+	// YAML under the restored version's id would overwrite the stored
+	// configuration (SaveVersion is INSERT OR REPLACE).
 	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 {
 		if activeCfg, parseErr := config.Parse(active.YAML); parseErr == nil {
 			if activeSnapshot, snapErr := config.NewSnapshot(activeCfg, "store:"+active.ID); snapErr == nil {
-				snapshot = activeSnapshot
+				baseSnapshot, data = activeSnapshot, active.YAML
 				slog.Info("restored configuration saved by a previous activation", "id", active.ID, "created_by", active.CreatedBy)
 			}
 		} else {
 			slog.Warn("stored active configuration no longer parses; using the config file", "id", active.ID, "error", parseErr)
 		}
 	}
-	applyLogLevel(snapshot.Config.Observability.LogLevel)
-	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", snapshot.ID)
-	if err := storeDB.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: "startup", Active: true, SHA256: snapshot.Hash, YAML: data}); err != nil {
+	// Persist the version exactly as it will run; listener overrides below
+	// are process-local and deliberately excluded from the stored YAML.
+	applyLogLevel(baseSnapshot.Config.Observability.LogLevel)
+	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", baseSnapshot.ID)
+	if err := storeDB.SaveVersion(context.Background(), store.Version{ID: baseSnapshot.ID, CreatedBy: "startup", Active: true, SHA256: baseSnapshot.Hash, YAML: data}); err != nil {
 		slog.Warn("save startup version", "error", err)
 	}
-	if err := storeDB.Activate(context.Background(), snapshot.ID); err != nil {
+	if err := storeDB.Activate(context.Background(), baseSnapshot.ID); err != nil {
 		slog.Warn("activate startup version in history", "error", err)
+	}
+	// Command-line listener overrides are re-applied after the restore so
+	// they survive a stored active configuration.
+	snapshot := baseSnapshot
+	if httpOverride != "" {
+		snapshot.Config.Listeners.HTTP = httpOverride
+	}
+	if adminOverride != "" {
+		snapshot.Config.Listeners.Admin = adminOverride
+	}
+	if httpOverride != "" || adminOverride != "" {
+		if snapshot, err = config.NewSnapshot(snapshot.Config, configPath+" (listener override)"); err != nil {
+			return err
+		}
 	}
 	gateway, err := server.New(server.Options{Snapshot: snapshot, Store: storeDB, ConfigPath: configPath})
 	if err != nil {

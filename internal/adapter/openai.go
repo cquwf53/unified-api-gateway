@@ -176,8 +176,10 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 			switch part["type"] {
 			case "text":
 				text.WriteString(asString(part["text"]))
-			case "thinking", "redacted_thinking":
+			case "thinking":
 				reasoning.WriteString(asString(part["thinking"]))
+			case "redacted_thinking":
+				reasoning.WriteString(asString(part["data"]))
 			case "tool_use":
 				args, _ := json.Marshal(part["input"])
 				toolCalls = append(toolCalls, map[string]any{
@@ -269,7 +271,7 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 		}
 		out["messages"] = append(asSlice(out["messages"]), map[string]any{
 			"role":    m["role"],
-			"content": contentText(m["content"]),
+			"content": anthropicContentToOpenAI(m["content"]),
 		})
 	}
 	b, contentType, err := encodeJSON(out)
@@ -310,6 +312,9 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 		if choice, ok := choices[0].(map[string]any); ok {
 			stopReason = anthropicStopReason(asString(choice["finish_reason"]))
 			if message, ok := choice["message"].(map[string]any); ok {
+				if reasoning := asString(message["reasoning_content"]); reasoning != "" {
+					content = append(content, map[string]any{"type": "thinking", "thinking": reasoning})
+				}
 				if text := asString(message["content"]); text != "" {
 					content = append(content, map[string]any{"type": "text", "text": text})
 				}
@@ -516,6 +521,9 @@ func convertOpenAIContent(value any, role string) any {
 		case "image_url":
 			image, _ := part["image_url"].(map[string]any)
 			result = append(result, map[string]any{"type": "image", "source": anthropicImageSource(asString(image["url"]))})
+		case "input_image":
+			// The Responses API's flat image part.
+			result = append(result, map[string]any{"type": "image", "source": anthropicImageSource(asString(part["image_url"]))})
 		default:
 			if text := asString(part["text"]); text != "" {
 				result = append(result, map[string]any{"type": "text", "text": text})
@@ -541,6 +549,12 @@ func convertOpenAITools(value any) []any {
 			continue
 		}
 		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			// Responses tools are flat: {"type":"function","name",...}.
+			if asString(tool["type"]) == "function" {
+				fn = tool
+			}
+		}
 		name := asString(fn["name"])
 		if name == "" {
 			continue
@@ -592,6 +606,40 @@ func anthropicImageSource(url string) map[string]any {
 		return map[string]any{"type": "url", "url": url}
 	}
 	return map[string]any{"type": "base64", "media_type": mediaType, "data": data}
+}
+
+// anthropicContentToOpenAI converts an Anthropic message body into OpenAI
+// content: text blocks become strings or text parts, image sources become
+// image_url parts (base64 sources round-trip as data: URIs).
+func anthropicContentToOpenAI(value any) any {
+	items := asSlice(value)
+	if len(items) == 0 {
+		return contentText(value)
+	}
+	var parts []any
+	textOnly := true
+	for _, raw := range items {
+		part, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch asString(part["type"]) {
+		case "text":
+			parts = append(parts, map[string]any{"type": "text", "text": part["text"]})
+		case "image":
+			source, _ := part["source"].(map[string]any)
+			url := asString(source["url"])
+			if asString(source["type"]) == "base64" {
+				url = "data:" + asString(source["media_type"]) + ";base64," + asString(source["data"])
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+			textOnly = false
+		}
+	}
+	if textOnly && len(parts) == 1 {
+		return parts[0].(map[string]any)["text"]
+	}
+	return parts
 }
 
 // toolChoiceToAnthropic maps the OpenAI/Responses tool_choice vocabulary

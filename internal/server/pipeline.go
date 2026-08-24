@@ -56,8 +56,8 @@ func buildPipelines(cfg *config.Config) map[string]*compiledPipeline {
 // falling back to a one-shot compilation for profiles assembled outside a
 // configuration snapshot (for example the preview endpoint).
 func (s *Server) compiledRequestSteps(cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
-	if pipelines := s.pipelines.Load(); pipelines != nil {
-		if pipeline, ok := (*pipelines)[profile.Name]; ok {
+	if state := s.state.Load(); state != nil {
+		if pipeline, ok := state.pipelines[profile.Name]; ok {
 			return pipeline.request
 		}
 	}
@@ -65,8 +65,8 @@ func (s *Server) compiledRequestSteps(cfg *config.Config, profile config.Profile
 }
 
 func (s *Server) compiledResponseSteps(cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
-	if pipelines := s.pipelines.Load(); pipelines != nil {
-		if pipeline, ok := (*pipelines)[profile.Name]; ok {
+	if state := s.state.Load(); state != nil {
+		if pipeline, ok := state.pipelines[profile.Name]; ok {
 			return pipeline.response
 		}
 	}

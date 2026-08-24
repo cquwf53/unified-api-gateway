@@ -292,6 +292,11 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
 写入 SQLite，积压时丢弃并告警）；`policies.audit.redact` 列表中的头名称会在预览、
 dry-run 输出和 record 存档中额外脱敏。
 
+`policies.defaults.allow_anonymous_profile_override: false` 可以关闭开放模式下的
+`X-Gateway-Profile` 越权入口（默认 true 以兼容旧行为）。credential `type: api_key`
+将引用的环境变量以 `x-api-key` 头发送（Anthropic 的方案），`env` 则用
+`Authorization: Bearer`。
+
 ## 开发与测试
 
 ```powershell
@@ -342,14 +347,13 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 
 当前实现明确不做（或只做有限支持）的事情：
 
-- **replay 无租户隔离**：录制按 profile + method + path + body 摘要索引，不同
-  client/tenant/config 版本共享同一录制库；
-- **热激活非原子**：`activate` 先写 SQLite 再切换内存快照，两步之间崩溃会留下
-  active 标记与实际内存状态不一致（重启时以 SQLite active 为准恢复）；
-- **交错并行工具流**：Anthropic 的顺序块格式无法表达 OpenAI 流中交错的
-  tool_calls 参数增量，已闭合块的迟到增量会被丢弃（官方 API 的并行工具调用是
-  顺序输出的，不受影响）；
-- **WebSocket 帧无大小上限与空闲 deadline**：依赖操作层保护；
+- **replay 按 client/tenant 隔离，但不按配置版本**：同一 client 的录制跨配置
+  版本共享；
+- **热激活的 SQLite 与内存两步之间仍有崩溃窗口**（内存侧 config/runtimes/
+  pipelines 的发布已是原子的；重启时以 SQLite active 为准恢复）；
+- 交错的 OpenAI 并行工具参数增量会缓冲到流结束再按序重放（无损，但工具参数
+  不再随到随发）；
+- Responses 的 reasoning/summary 事件未做翻译；
 - **readyz 只检查配置已加载**，不做上游探活；
 - `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
 - `transforms` 具名引用存在性、credential 引用可达性等语义校验由

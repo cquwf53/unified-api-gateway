@@ -295,6 +295,9 @@ type PolicyDefaults struct {
 	Burst             int                  `yaml:"burst"`
 	Retry             RetryPolicy          `yaml:"retry"`
 	CircuitBreaker    CircuitBreakerPolicy `yaml:"circuit_breaker"`
+	// AllowAnonymousProfileOverride toggles the open-mode X-Gateway-Profile
+	// override (defaults to true for backward compatibility).
+	AllowAnonymousProfileOverride *bool `yaml:"allow_anonymous_profile_override"`
 }
 
 type RetryPolicy struct {
@@ -491,6 +494,11 @@ func (c *Config) Validate() error {
 		if u.Name != "" {
 			name = u.Name
 		}
+		if u.AuthRef != "" {
+			if _, ok := c.Credentials[u.AuthRef]; !ok {
+				errs = append(errs, fmt.Sprintf("upstream %q: auth_ref %q not found in credentials", name, u.AuthRef))
+			}
+		}
 		base := u.EffectiveURL()
 		if base == "" {
 			errs = append(errs, fmt.Sprintf("upstream %q: base_url is required", name))
@@ -536,6 +544,14 @@ func (c *Config) Validate() error {
 		if p.ShadowUpstream != "" {
 			if _, ok := c.Upstreams[p.ShadowUpstream]; !ok {
 				errs = append(errs, fmt.Sprintf("profile %q: shadow_upstream %q not found", name, p.ShadowUpstream))
+			}
+		}
+		for _, spec := range append(p.AllRequestTransforms(), p.AllResponseTransforms()...) {
+			if spec.Name == "" || spec.IsZero() == false {
+				continue
+			}
+			if _, ok := c.Transforms[spec.Name]; !ok {
+				errs = append(errs, fmt.Sprintf("profile %q: named transform %q not found", name, spec.Name))
 			}
 		}
 		for i, spec := range p.AllRequestTransforms() {

@@ -47,6 +47,14 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadGateway, "grpc", "upstream_not_found", "gRPC upstream is not configured", "")
 		return
 	}
+	if len(profile.AllowedMethods) > 0 && !methodAllowed(profile.AllowedMethods, r.Method) {
+		s.writeError(w, http.StatusMethodNotAllowed, "grpc", "method_not_allowed", "profile does not allow "+r.Method, "")
+		return
+	}
+	if profile.MaxBodyBytes > 0 && r.ContentLength > profile.MaxBodyBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "grpc", "body_too_large", "gRPC message exceeds the profile limit", "")
+		return
+	}
 	finish := s.metrics.Begin()
 	defer finish()
 	started := time.Now()

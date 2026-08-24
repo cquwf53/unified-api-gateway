@@ -37,6 +37,9 @@ type policySet struct {
 	retryAttempts  int
 	idempotentOnly bool
 	breakerCfg     breakerConfig
+	// allowAnonymousProfileOverride keeps the open-mode X-Gateway-Profile
+	// override available; setting it to false closes the escalation path.
+	allowAnonymousProfileOverride bool
 }
 
 type breakerConfig struct {
@@ -45,7 +48,7 @@ type breakerConfig struct {
 }
 
 func defaultPolicySet() policySet {
-	return policySet{retryAttempts: 1, idempotentOnly: true}
+	return policySet{retryAttempts: 1, idempotentOnly: true, allowAnonymousProfileOverride: true}
 }
 
 // decodePolicySet merges policies.defaults (validated against
@@ -95,6 +98,9 @@ func decodePolicySet(cfg *config.Config) policySet {
 	}
 	if d.CircuitBreaker.ResetTimeoutMS > 0 {
 		set.breakerCfg.resetTimeout = time.Duration(d.CircuitBreaker.ResetTimeoutMS) * time.Millisecond
+	}
+	if d.AllowAnonymousProfileOverride != nil {
+		set.allowAnonymousProfileOverride = *d.AllowAnonymousProfileOverride
 	}
 	return set
 }
@@ -279,6 +285,7 @@ func (rt *profileRuntime) beginWebsocketPolicy(ctx context.Context, method strin
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
 	}
 	if rt.bucket != nil && !rt.bucket.allow(now) {
+		rt.breaker.releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
 	}
 	if slots == nil {
@@ -287,11 +294,13 @@ func (rt *profileRuntime) beginWebsocketPolicy(ctx context.Context, method strin
 	select {
 	case slots <- struct{}{}:
 	default:
+		rt.breaker.releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_connection_limit", retryAfter: time.Second}
 	}
 	select {
 	case <-ctx.Done():
 		<-slots
+		rt.breaker.releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_wait_canceled", retryAfter: 0}
 	default:
 	}
@@ -441,11 +450,10 @@ func (s *Server) breakerFor(upstreamName string, cfg breakerConfig) *breaker {
 }
 
 func (s *Server) runtimeFor(profileName string) *profileRuntime {
-	runtimes := s.runtimes.Load()
-	if runtimes == nil {
-		return nil
+	if state := s.state.Load(); state != nil {
+		return state.runtimes[profileName]
 	}
-	return (*runtimes)[profileName]
+	return nil
 }
 
 // executeUpstream performs the buffered upstream call with retry, request

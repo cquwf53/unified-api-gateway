@@ -7,9 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
+
+// toolCallBuffer accumulates one OpenAI tool call before it is replayed as
+// a complete Anthropic tool_use block.
+type toolCallBuffer struct {
+	id   string
+	name string
+	args strings.Builder
+}
 
 // SSEEvent is a parsed Server-Sent Event frame. Data may contain newlines;
 // parsing joins multiple data: lines according to the SSE specification.
@@ -28,9 +37,11 @@ const (
 	maxSSEEvent = 16 << 20
 )
 
-// ReadSSEStream parses events as they arrive and hands each completed event to
-// emit. It returns as soon as emit fails, which lets callers translate and
+// ReadSSEStream parses events as they arrive and hands each completed event
+// to emit. It returns as soon as emit fails, which lets callers translate and
 // flush frame by frame instead of buffering the whole upstream response.
+// Lines and accumulated events are size-bounded so a hostile upstream cannot
+// exhaust memory.
 func ReadSSEStream(r io.Reader, emit func(SSEEvent) error) error {
 	reader := bufio.NewReaderSize(r, 32<<10)
 	var id, event, retry string
@@ -42,22 +53,28 @@ func ReadSSEStream(r io.Reader, emit func(SSEEvent) error) error {
 		}
 		err := emit(SSEEvent{ID: id, Event: event, Data: strings.Join(data, "\n"), Retry: retry})
 		id, event, retry = "", "", ""
-		data = nil
+		data, dataBytes = nil, 0
 		return err
 	}
+	var line []byte
 	for {
-		line, readErr := reader.ReadString('\n')
+		fragment, readErr := reader.ReadSlice('\n')
+		line = append(line, fragment...)
 		if len(line) > maxSSELine {
 			return errors.New("sse: line exceeds maximum event size")
 		}
-		line = strings.TrimSuffix(line, "\n")
-		line = strings.TrimSuffix(line, "\r")
-		if line == "" {
+		if readErr == bufio.ErrBufferFull {
+			continue // long line, keep accumulating within the cap
+		}
+		processed := strings.TrimSuffix(string(line), "\n")
+		processed = strings.TrimSuffix(processed, "\r")
+		line = line[:0]
+		if processed == "" {
 			if err := flush(); err != nil {
 				return err
 			}
-		} else if !strings.HasPrefix(line, ":") {
-			key, value, ok := strings.Cut(line, ":")
+		} else if !strings.HasPrefix(processed, ":") {
+			key, value, ok := strings.Cut(processed, ":")
 			if ok {
 				value = strings.TrimPrefix(value, " ")
 			}
@@ -125,16 +142,18 @@ type SSETranslator struct {
 	from, to string
 
 	// openai -> anthropic state
-	started     bool
-	textOpen    bool
-	nextBlock   int
-	textIndex   int
-	blockByTool map[int]int // OpenAI tool_call index -> Anthropic block index
-	// openToolBlocks tracks Anthropic tool blocks opened but not yet stopped.
-	openToolBlocks []int
-	streamID       string
-	model          string
-	finishSent     bool
+	started   bool
+	textOpen  bool
+	nextBlock int
+	textIndex int
+	// toolBuffers accumulates every tool call (OpenAI tool_calls index ->
+	// call). Anthropic's block format is strictly sequential, so tool calls
+	// are replayed as complete blocks at the end of the stream in index
+	// order; this stays lossless even for interleaved parallel tool deltas.
+	toolBuffers map[int]*toolCallBuffer
+	streamID    string
+	model       string
+	finishSent  bool
 	// createdUnix backs the OpenAI "created" field, which Anthropic streams
 	// never carry; it is stamped when the translator is created.
 	createdUnix int64
@@ -166,9 +185,15 @@ type SSETranslator struct {
 	// respToolItems holds the function_call output items assembled from
 	// Anthropic tool_use blocks, in output order.
 	respToolItems []map[string]any
+	// respPartAdded records whether the text content part was announced;
+	// pure-tool streams skip the part lifecycle entirely.
+	respPartAdded bool
 	// toolCallByItem maps Responses function-call item ids onto OpenAI
-	// tool_calls array positions (responses -> anthropic direction).
+	// tool_calls array positions (responses -> anthropic direction), and
+	// toolArgsSeen records whether deltas already delivered the arguments
+	// (the done event alone must otherwise carry them).
 	toolCallByItem map[string]int
+	toolArgsSeen   map[string]bool
 }
 
 // respEvent stamps the sequence number every Responses protocol event
@@ -185,8 +210,8 @@ func (t *SSETranslator) respEvent(name string, payload map[string]any) SSEEvent 
 func NewSSETranslator(from, to string) *SSETranslator {
 	return &SSETranslator{
 		from: strings.ToLower(from), to: strings.ToLower(to),
-		blockByTool: map[int]int{}, toolCallIndexByBlock: map[int]int{},
-		toolCallByItem: map[string]int{}, nextBlock: -1, createdUnix: time.Now().Unix(),
+		toolBuffers: map[int]*toolCallBuffer{}, toolCallIndexByBlock: map[int]int{},
+		toolCallByItem: map[string]int{}, toolArgsSeen: map[string]bool{}, nextBlock: -1, createdUnix: time.Now().Unix(),
 	}
 }
 
@@ -261,8 +286,8 @@ func (t *SSETranslator) translateDone() []SSEEvent {
 		return []SSEEvent{{Data: "[DONE]"}}
 	}
 	var out []SSEEvent
-	out = append(out, t.closeOpenToolBlocks()...)
 	out = append(out, t.closeTextBlock()...)
+	out = append(out, t.flushBufferedTools()...)
 	out = append(out, sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	return out
 }
@@ -325,11 +350,9 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 				"type": "response.output_item.added", "output_index": 0,
 				"item": t.responsesMessageItem("in_progress"),
 			}),
-			t.respEvent("response.content_part.added", map[string]any{
-				"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
-				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-			}),
 		}
+		// The text content part is announced lazily with the first delta so
+		// pure-tool streams never open a part they cannot close.
 	case "content_block_start":
 		block, _ := payload["content_block"].(map[string]any)
 		if block == nil || asString(block["type"]) != "tool_use" {
@@ -358,6 +381,16 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			}
 			if text := asString(d["text"]); text != "" {
 				t.respText.WriteString(text)
+				if !t.respPartAdded {
+					t.respPartAdded = true
+					part := t.respEvent("response.content_part.added", map[string]any{
+						"type": "response.content_part.added", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
+						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+					})
+					return []SSEEvent{part, t.respEvent("response.output_text.delta", map[string]any{
+						"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
+					})}
+				}
 				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
 					"type": "response.output_text.delta", "item_id": responsesItemID, "output_index": 0, "content_index": 0, "delta": text,
 				})}
@@ -470,7 +503,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 	item := t.responsesMessageItem("completed")
 	output := []any{item}
 	var events []SSEEvent
-	if t.respText.String() != "" || len(t.respToolItems) == 0 {
+	if t.respPartAdded {
 		events = append(events,
 			t.respEvent("response.output_text.done", map[string]any{
 				"type": "response.output_text.done", "item_id": responsesItemID, "output_index": 0, "content_index": 0,
@@ -489,7 +522,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		events = append(events,
 			t.respEvent("response.function_call_arguments.done", map[string]any{
 				"type": "response.function_call_arguments.done", "item_id": toolItem["id"],
-				"output_index": index + 1, "arguments": toolItem["arguments"],
+				"output_index": index + 1, "name": toolItem["name"], "arguments": toolItem["arguments"],
 			}),
 			t.respEvent("response.output_item.done", map[string]any{
 				"type": "response.output_item.done", "output_index": index + 1, "item": toolItem,
@@ -535,11 +568,21 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 		if !known {
 			return nil
 		}
+		t.toolArgsSeen[asString(payload["item_id"])] = true
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
 			"index": position, "function": map[string]any{"arguments": payload["delta"]},
 		}}}}}
 	case "response.function_call_arguments.done":
-		return nil // arguments were accumulated delta by delta
+		// Upstreams that only provide the final arguments on the done event
+		// must not lose them.
+		itemID := asString(payload["item_id"])
+		position, known := t.toolCallByItem[itemID]
+		if !known || t.toolArgsSeen[itemID] {
+			return nil
+		}
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
+			"index": position, "function": map[string]any{"arguments": payload["arguments"]},
+		}}}}}
 	case "response.incomplete":
 		t.doneSent = true
 		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "length"}}}),
@@ -550,7 +593,11 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 				chunk["usage"] = map[string]any{"prompt_tokens": numberOrZero(usage["input_tokens"]), "completion_tokens": numberOrZero(usage["output_tokens"])}
 			}
 		}
-		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}),
+		finishReason := "stop"
+		if len(t.toolCallByItem) > 0 {
+			finishReason = "tool_calls" // maps to Anthropic's tool_use
+		}
+		return append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}}}),
 			t.openAIEventToAnthropic(SSEEvent{Data: ""}, chunk)...)
 	case "response.failed", "error":
 		message := "upstream request failed"
@@ -630,13 +677,13 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 			}))
 		}
 		if calls, ok := d["tool_calls"].([]any); ok {
-			out = append(out, t.translateToolCallDeltas(calls)...)
+			t.accumulateToolCalls(calls)
 		}
 	}
 	if finish != nil && !t.finishSent {
 		out = append(out, t.ensureStarted(payload)...)
-		out = append(out, t.closeOpenToolBlocks()...)
 		out = append(out, t.closeTextBlock()...)
+		out = append(out, t.flushBufferedTools()...)
 		out = append(out, sseEvent("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": mapFinishReason(asString(finish)), "stop_sequence": nil},
@@ -646,17 +693,9 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 	return out
 }
 
-func blockIsOpen(open []int, block int) bool {
-	for _, candidate := range open {
-		if candidate == block {
-			return true
-		}
-	}
-	return false
-}
-
-func (t *SSETranslator) translateToolCallDeltas(calls []any) []SSEEvent {
-	var out []SSEEvent
+// accumulateToolCalls buffers tool-call deltas; the blocks are emitted by
+// flushBufferedTools when the stream completes.
+func (t *SSETranslator) accumulateToolCalls(calls []any) {
 	for _, raw := range calls {
 		call, ok := raw.(map[string]any)
 		if !ok {
@@ -667,35 +706,48 @@ func (t *SSETranslator) translateToolCallDeltas(calls []any) []SSEEvent {
 			index = int(n)
 		}
 		fn, _ := call["function"].(map[string]any)
-		block, seen := t.blockByTool[index]
-		if seen && !blockIsOpen(t.openToolBlocks, block) {
-			// Interleaved parallel-tool streams can deliver late argument
-			// deltas for a block Anthropic's sequential format already
-			// closed; writing into it would produce an invalid sequence.
-			continue
+		buffer := t.toolBuffers[index]
+		if buffer == nil {
+			buffer = &toolCallBuffer{id: asString(call["id"])}
+			t.toolBuffers[index] = buffer
 		}
-		if !seen {
-			t.nextBlock++
-			block = t.nextBlock
-			t.blockByTool[index] = block
-			out = append(out, t.closeOpenToolBlocks()...)
-			out = append(out, t.closeTextBlock()...)
-			t.openToolBlocks = append(t.openToolBlocks, block)
-			start := map[string]any{
-				"type":          "content_block_start",
-				"index":         block,
-				"content_block": map[string]any{"type": "tool_use", "id": asString(call["id"]), "name": asString(fn["name"]), "input": map[string]any{}},
+		if id := asString(call["id"]); id != "" {
+			buffer.id = id
+		}
+		if fn != nil {
+			if name := asString(fn["name"]); name != "" {
+				buffer.name = name
 			}
-			out = append(out, sseEvent("content_block_start", start))
-		}
-		if args := asString(fn["arguments"]); args != "" {
-			out = append(out, sseEvent("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": block,
-				"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
-			}))
+			buffer.args.WriteString(asString(fn["arguments"]))
 		}
 	}
+}
+
+// flushBufferedTools replays every buffered tool call as a complete
+// content_block start/delta/stop triple, in tool_calls index order.
+func (t *SSETranslator) flushBufferedTools() []SSEEvent {
+	indexes := make([]int, 0, len(t.toolBuffers))
+	for index := range t.toolBuffers {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	var out []SSEEvent
+	for _, index := range indexes {
+		buffer := t.toolBuffers[index]
+		t.nextBlock++
+		block := t.nextBlock
+		out = append(out,
+			sseEvent("content_block_start", map[string]any{
+				"type": "content_block_start", "index": block,
+				"content_block": map[string]any{"type": "tool_use", "id": buffer.id, "name": buffer.name, "input": map[string]any{}},
+			}),
+			sseEvent("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": block,
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": buffer.args.String()},
+			}),
+			sseEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": block}))
+	}
+	t.toolBuffers = map[int]*toolCallBuffer{}
 	return out
 }
 
@@ -743,18 +795,6 @@ func (t *SSETranslator) closeTextBlock() []SSEEvent {
 	}
 	t.textOpen = false
 	return []SSEEvent{sseEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": t.textIndex})}
-}
-
-// closeOpenToolBlocks emits content_block_stop for every tool block still
-// open. Anthropic requires every block to be closed; clients usually
-// finalise a tool call's accumulated partial_json on this event.
-func (t *SSETranslator) closeOpenToolBlocks() []SSEEvent {
-	var out []SSEEvent
-	for _, block := range t.openToolBlocks {
-		out = append(out, sseEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": block}))
-	}
-	t.openToolBlocks = nil
-	return out
 }
 
 func (t *SSETranslator) currentTextIndex() int {

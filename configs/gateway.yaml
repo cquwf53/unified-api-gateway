@@ -41,7 +41,9 @@ credentials:
   # The server resolves this reference from the named environment variable.
   # Do not replace it with a real key in a checked-in file.
   anthropic-api-key:
-    type: env
+    # api_key credentials are sent as the x-api-key header (Anthropic's
+    # scheme); env credentials become Authorization: Bearer.
+    type: api_key
     env: ANTHROPIC_API_KEY
   vercel-ai-gateway-key:
     type: env
