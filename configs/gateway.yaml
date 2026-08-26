@@ -257,7 +257,7 @@ policies:
       reset_timeout_ms: 30000
   audit:
     enabled: true
-    redact: [authorization, x-api-key, prompt, response_body]
+    redact: [authorization, x-api-key, x-trace-id]
 
 observability:
   log_level: info

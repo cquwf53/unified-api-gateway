@@ -326,6 +326,7 @@ func MatchRoutes(cfg *config.Config, req Request) []config.Route {
 
 func profilePtr(cfg *config.Config, id string) *config.Profile {
 	p := cfg.Profiles[id]
+	p.RuntimeID = id
 	if p.Name == "" {
 		p.Name = id
 	}
@@ -352,14 +353,27 @@ func profileAllowed(cfg *config.Config, req Request, profile string) bool {
 		if !exists {
 			return false
 		}
-		upstreamOK := false
-		for _, allowed := range client.Upstreams {
-			if allowed == "*" || allowed == selected.Upstream {
-				upstreamOK = true
-				break
+		mode := strings.ToLower(strings.TrimSpace(selected.TrafficMode))
+		needs := []string{}
+		if selected.Upstream != "" && mode != "mock" && mode != "replay" {
+			needs = append(needs, selected.Upstream)
+		}
+		if mode == "shadow" && selected.ShadowUpstream != "" {
+			needs = append(needs, selected.ShadowUpstream)
+		}
+		for _, upstream := range needs {
+			upstreamOK := false
+			for _, allowed := range client.Upstreams {
+				if allowed == "*" || allowed == upstream {
+					upstreamOK = true
+					break
+				}
+			}
+			if !upstreamOK {
+				return false
 			}
 		}
-		if !upstreamOK {
+		if len(needs) == 0 && mode != "mock" && mode != "replay" {
 			return false
 		}
 	}

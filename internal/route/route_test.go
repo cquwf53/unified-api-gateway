@@ -70,6 +70,29 @@ func TestAnonymousOverrideMarker(t *testing.T) {
 	}
 }
 
+func TestClientUpstreamAllowlistIncludesShadow(t *testing.T) {
+	c := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"primary": {}, "shadow": {}},
+		Profiles: map[string]config.Profile{
+			"p": {Name: "p", TrafficMode: "shadow", Upstream: "primary", ShadowUpstream: "shadow"},
+		},
+		Clients: map[string]config.ClientCredential{
+			"client": {Profiles: []string{"p"}, Upstreams: []string{"primary"}},
+		},
+	}
+	_, err := ResolveProfile(c, Request{ClientID: "client", Profile: "p"})
+	if !errors.Is(err, ErrProfileForbidden) {
+		t.Fatalf("shadow upstream outside the allowlist must be forbidden, got %v", err)
+	}
+	client := c.Clients["client"]
+	client.Upstreams = []string{"*"}
+	c.Clients["client"] = client
+	if name, err := ResolveProfile(c, Request{ClientID: "client", Profile: "p"}); err != nil || name != "p" {
+		t.Fatalf("wildcard upstream allowlist should allow shadow profile: %q, %v", name, err)
+	}
+}
+
 func TestNoRoute(t *testing.T) {
 	c := &config.Config{Version: 1, Profiles: map[string]config.Profile{"p": {Name: "p"}}}
 	_, err := ResolveProfile(c, Request{Path: "/none"})

@@ -57,26 +57,29 @@ func TestActivateUnknownVersionFails(t *testing.T) {
 func TestRecordingRoundTripAndFuzzyLookup(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
-	if err := store.SaveRecording(ctx, Recording{Key: "k1", ProfileID: "chat", Method: "POST", Path: "/v1/messages", StatusCode: 200, ContentType: "application/json", Headers: map[string][]string{"Content-Type": {"application/json"}}, Body: []byte(`{"a":1}`), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+	if err := store.SaveRecording(ctx, Recording{Key: "k1", ProfileID: "chat", Method: "POST", Path: "/v1/messages", ConfigID: "cfg-1", StatusCode: 200, ContentType: "application/json", Headers: map[string][]string{"Content-Type": {"application/json"}}, Body: []byte(`{"a":1}`), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond) // distinct created_at for ordering
-	if err := store.SaveRecording(ctx, Recording{Key: "k2", ProfileID: "chat", Method: "POST", Path: "/v1/messages", StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":2}`), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+	if err := store.SaveRecording(ctx, Recording{Key: "k2", ProfileID: "chat", Method: "POST", Path: "/v1/messages", ConfigID: "cfg-1", StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":2}`), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
 		t.Fatal(err)
 	}
-	exact, err := store.GetRecording(ctx, "k1", "", "")
+	exact, err := store.GetRecording(ctx, "k1", "", "", "cfg-1")
 	if err != nil || string(exact.Body) != `{"a":1}` {
 		t.Fatalf("exact=%v err=%v", exact, err)
 	}
-	latest, err := store.LatestRecordingForProfile(ctx, "chat", "POST", "/v1/messages", "", "")
+	latest, err := store.LatestRecordingForProfile(ctx, "chat", "POST", "/v1/messages", "", "", "cfg-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(latest.Body) != `{"a":2}` {
 		t.Fatalf("latest body=%s", latest.Body)
 	}
-	if _, err := store.LatestRecordingForProfile(ctx, "chat", "GET", "/none", "", ""); err == nil {
+	if _, err := store.LatestRecordingForProfile(ctx, "chat", "GET", "/none", "", "", "cfg-1"); err == nil {
 		t.Fatal("expected no recording for unknown method/path")
+	}
+	if _, err := store.GetRecording(ctx, "k1", "", "", "cfg-2"); err == nil {
+		t.Fatal("recordings must not cross configuration versions")
 	}
 }
 

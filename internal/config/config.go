@@ -11,8 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
+	stdpath "path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -154,6 +157,9 @@ func (u Upstream) EffectiveTimeout() time.Duration {
 // pipeline.  Request and Response accept either one mapping or a YAML list;
 // lists are represented by TransformSpec.Steps.
 type Profile struct {
+	// RuntimeID is the profiles map key selected by routing. It is populated
+	// on the request-local copy and never accepted from YAML/JSON.
+	RuntimeID          string                    `yaml:"-" json:"-"`
 	Name               string                    `yaml:"name,omitempty" json:"name,omitempty"`
 	Adapter            string                    `yaml:"adapter,omitempty" json:"adapter,omitempty"`
 	ClientContract     string                    `yaml:"client_contract,omitempty" json:"client_contract,omitempty"`
@@ -334,6 +340,32 @@ func validatePolicyShape(raw map[string]any) error {
 	if err := decoder.Decode(&spec); err != nil {
 		return fmt.Errorf("policies: %w", err)
 	}
+	var errs []string
+	d := spec.Defaults
+	if d.RequestTimeoutMS < 0 {
+		errs = append(errs, "request_timeout_ms must be non-negative")
+	}
+	if d.MaxConcurrency < 0 {
+		errs = append(errs, "max_concurrency must be non-negative")
+	}
+	if d.RequestsPerSecond < 0 || math.IsNaN(d.RequestsPerSecond) || math.IsInf(d.RequestsPerSecond, 0) {
+		errs = append(errs, "requests_per_second must be a finite non-negative number")
+	}
+	if d.Burst < 0 {
+		errs = append(errs, "burst must be non-negative")
+	}
+	if d.Retry.MaxAttempts < 0 {
+		errs = append(errs, "retry.max_attempts must be non-negative")
+	}
+	if d.CircuitBreaker.FailureThreshold < 0 {
+		errs = append(errs, "circuit_breaker.failure_threshold must be non-negative")
+	}
+	if d.CircuitBreaker.ResetTimeoutMS < 0 {
+		errs = append(errs, "circuit_breaker.reset_timeout_ms must be non-negative")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("policies: %s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 
@@ -433,6 +465,10 @@ func NewSnapshot(c *Config, source string) (*ConfigSnapshot, error) {
 		return nil, errors.New("config: nil config")
 	}
 	clone := c.Clone()
+	// Snapshots are content-addressed; normalize defaults before hashing so a
+	// YAML marshal/parse round trip cannot manufacture a different ID merely
+	// because omitted fields were filled on the next load.
+	clone.applyDefaults()
 	if err := clone.Validate(); err != nil {
 		return nil, err
 	}
@@ -507,15 +543,30 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("upstream %q: base_url is required", name))
 		} else if parsed, err := url.Parse(base); err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			errs = append(errs, fmt.Sprintf("upstream %q: invalid base_url %q", name, base))
+		} else if parsed.User != nil {
+			errs = append(errs, fmt.Sprintf("upstream %q: base_url must not contain user credentials; use auth_ref", name))
+		} else if parsed.Fragment != "" {
+			errs = append(errs, fmt.Sprintf("upstream %q: base_url must not contain a fragment", name))
 		} else if !allowedScheme(parsed.Scheme) {
 			errs = append(errs, fmt.Sprintf("upstream %q: unsupported URL scheme %q", name, parsed.Scheme))
 		}
 		if u.TimeoutMS < 0 {
 			errs = append(errs, fmt.Sprintf("upstream %q: timeout_ms must be non-negative", name))
 		}
+		if u.Retries < 0 {
+			errs = append(errs, fmt.Sprintf("upstream %q: retries must be non-negative", name))
+		}
 		if u.Timeout != "" {
 			if d, err := time.ParseDuration(u.Timeout); err != nil || d < 0 {
 				errs = append(errs, fmt.Sprintf("upstream %q: invalid timeout %q", name, u.Timeout))
+			}
+		}
+		for key, value := range u.Headers {
+			if !validHTTPHeaderName(key) {
+				errs = append(errs, fmt.Sprintf("upstream %q: invalid header name %q", name, key))
+			}
+			if strings.ContainsAny(value, "\r\n") {
+				errs = append(errs, fmt.Sprintf("upstream %q: header %q contains a newline", name, key))
 			}
 		}
 	}
@@ -572,6 +623,9 @@ func (c *Config) Validate() error {
 		if p.MaxBodyBytes < 0 {
 			errs = append(errs, fmt.Sprintf("profile %q: max_body_bytes must be non-negative", name))
 		}
+		if mode == "record" && !c.Observability.RecordBody {
+			errs = append(errs, fmt.Sprintf("profile %q: record mode requires observability.record_body: true", name))
+		}
 	}
 	seenRoutes := map[string]bool{}
 	for i, r := range c.Routes {
@@ -593,6 +647,32 @@ func (c *Config) Validate() error {
 		if r.Match.Method != "" && len(r.Match.Methods) > 0 {
 			errs = append(errs, fmt.Sprintf("route %q: specify method or methods, not both", routeLabel(r, i)))
 		}
+		for field, pattern := range map[string]string{
+			"host": r.Match.Host, "client": r.Match.Client, "client_id": r.Match.ClientID,
+			"tenant": r.Match.Tenant, "model": r.Match.Model,
+		} {
+			if err := validateMatcherPattern(pattern); err != nil {
+				errs = append(errs, fmt.Sprintf("route %q: match.%s: %v", routeLabel(r, i), field, err))
+			}
+		}
+		if strings.ContainsAny(r.Match.Path, "*?[") {
+			if _, err := stdpath.Match(r.Match.Path, ""); err != nil {
+				errs = append(errs, fmt.Sprintf("route %q: match.path: invalid glob: %v", routeLabel(r, i), err))
+			}
+		}
+		for key, pattern := range r.Match.Headers {
+			if !validHTTPHeaderName(key) {
+				errs = append(errs, fmt.Sprintf("route %q: invalid header name %q", routeLabel(r, i), key))
+			}
+			if err := validateMatcherPattern(pattern); err != nil {
+				errs = append(errs, fmt.Sprintf("route %q: match.headers[%q]: %v", routeLabel(r, i), key, err))
+			}
+		}
+		for key, pattern := range r.Match.Query {
+			if err := validateMatcherPattern(pattern); err != nil {
+				errs = append(errs, fmt.Sprintf("route %q: match.query[%q]: %v", routeLabel(r, i), key, err))
+			}
+		}
 	}
 	if err := detectDuplicateMatches(c.Routes); err != nil {
 		errs = append(errs, err.Error())
@@ -607,20 +687,53 @@ func (c *Config) Validate() error {
 			continue
 		}
 		for _, p := range client.Profiles {
+			if p == "*" {
+				continue
+			}
 			if _, ok := c.Profiles[p]; !ok {
 				errs = append(errs, fmt.Sprintf("client %q: profile %q not found", id, p))
 			}
 		}
 		for _, u := range client.Upstreams {
+			if u == "*" {
+				continue
+			}
 			if _, ok := c.Upstreams[u]; !ok {
 				errs = append(errs, fmt.Sprintf("client %q: upstream %q not found", id, u))
 			}
+		}
+	}
+	for id, credential := range c.Credentials {
+		switch strings.ToLower(strings.TrimSpace(credential.Type)) {
+		case "", "env", "api_key":
+		default:
+			errs = append(errs, fmt.Sprintf("credential %q: unsupported type %q (known: env, api_key)", id, credential.Type))
 		}
 	}
 	for name, spec := range c.Transforms {
 		if err := spec.Validate(); err != nil {
 			errs = append(errs, fmt.Sprintf("transform %q: %v", name, err))
 		}
+	}
+	if c.Limits.MaxBodyBytes < 0 {
+		errs = append(errs, "limits.max_body_bytes must be non-negative")
+	}
+	if c.Limits.RequestsPerSec < 0 || math.IsNaN(c.Limits.RequestsPerSec) || math.IsInf(c.Limits.RequestsPerSec, 0) {
+		errs = append(errs, "limits.requests_per_second must be a finite non-negative number")
+	}
+	if c.Limits.Burst < 0 {
+		errs = append(errs, "limits.burst must be non-negative")
+	}
+	if c.Limits.Concurrency < 0 {
+		errs = append(errs, "limits.concurrency must be non-negative")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Observability.LogLevel)) {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		errs = append(errs, fmt.Sprintf("observability.log_level %q is invalid", c.Observability.LogLevel))
+	}
+	if c.Observability.RequestIDHeader != "" && !validHTTPHeaderName(c.Observability.RequestIDHeader) {
+		errs = append(errs, fmt.Sprintf("observability.request_id_header %q is not a valid HTTP header name", c.Observability.RequestIDHeader))
 	}
 	if err := validatePolicyShape(c.Policies); err != nil {
 		errs = append(errs, err.Error())
@@ -629,6 +742,37 @@ func (c *Config) Validate() error {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func validateMatcherPattern(pattern string) error {
+	if strings.HasPrefix(pattern, "~") {
+		if _, err := regexp.Compile(strings.TrimPrefix(pattern, "~")); err != nil {
+			return fmt.Errorf("invalid regular expression: %w", err)
+		}
+		return nil
+	}
+	if strings.ContainsAny(pattern, "*?[") {
+		if _, err := stdpath.Match(pattern, ""); err != nil {
+			return fmt.Errorf("invalid glob: %w", err)
+		}
+	}
+	return nil
+}
+
+func validHTTPHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' {
+			continue
+		}
+		if strings.ContainsRune("!#$%&'*+-.^_`|~", char) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (c *Config) applyDefaults() {
@@ -711,16 +855,60 @@ func streamSafeProfile(p Profile) bool {
 func detectDuplicateMatches(routes []Route) error {
 	seen := map[string]string{}
 	for i, r := range routes {
-		key := fmt.Sprintf("%s|%s|%s|%s|%v|%v|%v|%v|%s|%s|%s|%s",
-			r.Match.Host, r.Match.Path, r.Match.PathPrefix, r.Match.Method,
-			r.Match.Methods, r.Match.Headers, r.Match.Query,
-			r.Match.Model, r.Match.Client, r.Match.ClientID, r.Match.Tenant, fmt.Sprint(r.Priority))
+		key := canonicalRouteMatch(r)
 		if first, ok := seen[key]; ok {
 			return fmt.Errorf("routes %q and %q have identical matchers and priority", first, routeLabel(r, i))
 		}
 		seen[key] = routeLabel(r, i)
 	}
 	return nil
+}
+
+// canonicalRouteMatch normalizes fields whose runtime matching semantics are
+// equivalent. This catches method: POST versus methods: [post], reordered
+// method lists and header-key case differences.
+func canonicalRouteMatch(route Route) string {
+	match := route.Match
+	match.Host = strings.ToLower(match.Host)
+	methods := append([]string(nil), match.Methods...)
+	if match.Method != "" {
+		methods = append(methods, match.Method)
+	}
+	for i := range methods {
+		methods[i] = strings.ToUpper(strings.TrimSpace(methods[i]))
+	}
+	sort.Strings(methods)
+	deduped := methods[:0]
+	for _, method := range methods {
+		if method != "" && (len(deduped) == 0 || deduped[len(deduped)-1] != method) {
+			deduped = append(deduped, method)
+		}
+	}
+	match.Method = ""
+	match.Methods = deduped
+	canonicalHeaders := map[string][]string{}
+	if len(match.Headers) > 0 {
+		for key, value := range match.Headers {
+			canonical := strings.ToLower(key)
+			canonicalHeaders[canonical] = append(canonicalHeaders[canonical], value)
+		}
+		for key, values := range canonicalHeaders {
+			sort.Strings(values)
+			unique := values[:0]
+			for _, value := range values {
+				if len(unique) == 0 || unique[len(unique)-1] != value {
+					unique = append(unique, value)
+				}
+			}
+			canonicalHeaders[key] = unique
+		}
+	}
+	match.Headers = nil
+	encoded, _ := json.Marshal(struct {
+		Match   RouteMatch          `json:"match"`
+		Headers map[string][]string `json:"headers,omitempty"`
+	}{Match: match, Headers: canonicalHeaders})
+	return fmt.Sprintf("%d|%s", route.Priority, encoded)
 }
 
 func routeLabel(r Route, i int) string {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"gopkg.in/yaml.v3"
 	"unified-api-gateway/internal/transform"
 )
 
@@ -92,5 +93,28 @@ func TestLoadFile(t *testing.T) {
 	c, err := LoadFile(path)
 	if err != nil || c.Version != 1 {
 		t.Fatalf("LoadFile() = %#v, %v", c, err)
+	}
+}
+
+func TestSnapshotIDStableAcrossYAMLRoundTrip(t *testing.T) {
+	c := &Config{Version: 1, Profiles: map[string]Profile{"p": {Adapter: "transparent", TrafficMode: "dry-run"}}}
+	first, err := NewSnapshot(c, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := yaml.Marshal(first.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewSnapshot(reloaded, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID || first.Hash != second.Hash {
+		t.Fatalf("snapshot changed across round trip: first=%s/%s second=%s/%s", first.ID, first.Hash, second.ID, second.Hash)
 	}
 }

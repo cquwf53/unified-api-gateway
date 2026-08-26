@@ -173,13 +173,15 @@ const (
 // consecutive failures the breaker opens for resetTimeout; the next request
 // after that is a half-open probe and either restores or re-opens it.
 type breaker struct {
-	mu         sync.Mutex
-	threshold  int
-	resetAfter time.Duration
-	failures   int
-	state      int
-	openedAt   time.Time
-	probing    bool
+	mu          sync.Mutex
+	threshold   int
+	resetAfter  time.Duration
+	failures    int
+	state       int
+	openedAt    time.Time
+	probing     bool
+	probeSeq    uint64
+	activeProbe uint64
 }
 
 func newBreaker(cfg breakerConfig) *breaker {
@@ -194,8 +196,16 @@ func newBreaker(cfg breakerConfig) *breaker {
 }
 
 func (b *breaker) allow(now time.Time) bool {
+	allowed, _ := b.allowWithProbe(now)
+	return allowed
+}
+
+// allowWithProbe returns a generation token when it grants the single
+// half-open probe. The token prevents an older request's deferred cleanup
+// from releasing a newer probe after the breaker has cycled open again.
+func (b *breaker) allowWithProbe(now time.Time) (bool, uint64) {
 	if b == nil {
-		return true
+		return true, 0
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -204,18 +214,22 @@ func (b *breaker) allow(now time.Time) bool {
 		if now.Sub(b.openedAt) >= b.resetAfter {
 			b.state = breakerHalfOpen
 			b.probing = true
-			return true
+			b.probeSeq++
+			b.activeProbe = b.probeSeq
+			return true, b.activeProbe
 		}
-		return false
+		return false, 0
 	case breakerHalfOpen:
 		// Only one in-flight probe is allowed; others fail fast.
 		if b.probing {
-			return false
+			return false, 0
 		}
 		b.probing = true
-		return true
+		b.probeSeq++
+		b.activeProbe = b.probeSeq
+		return true, b.activeProbe
 	default:
-		return true
+		return true, 0
 	}
 }
 
@@ -230,6 +244,19 @@ func (b *breaker) releaseProbe() {
 	defer b.mu.Unlock()
 	if b.state == breakerHalfOpen {
 		b.probing = false
+		b.activeProbe = 0
+	}
+}
+
+func (b *breaker) releaseProbeToken(token uint64) {
+	if b == nil || token == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == breakerHalfOpen && b.probing && b.activeProbe == token {
+		b.probing = false
+		b.activeProbe = 0
 	}
 }
 
@@ -257,6 +284,24 @@ func (b *breaker) recordSuccess() {
 	b.failures = 0
 	b.state = breakerClosed
 	b.probing = false
+	b.activeProbe = 0
+}
+
+// recordProbeSuccess resolves a half-open probe after a WebSocket handshake
+// without clearing failures for an ordinary closed-state connection. The
+// full session outcome decides whether consecutive connection failures reset.
+func (b *breaker) recordProbeSuccess() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == breakerHalfOpen {
+		b.failures = 0
+		b.state = breakerClosed
+		b.probing = false
+		b.activeProbe = 0
+	}
 }
 
 func (b *breaker) recordFailure(now time.Time) {
@@ -267,6 +312,7 @@ func (b *breaker) recordFailure(now time.Time) {
 	defer b.mu.Unlock()
 	b.failures++
 	b.probing = false
+	b.activeProbe = 0
 	if b.state == breakerHalfOpen || b.failures >= b.threshold {
 		b.state = breakerOpen
 		b.openedAt = now
@@ -302,30 +348,35 @@ func (rt *profileRuntime) beginWebsocketPolicy(ctx context.Context, method strin
 		return func() {}, nil
 	}
 	now := time.Now()
-	if !rt.breaker.allow(now) {
+	allowed, probeToken := rt.breaker.allowWithProbe(now)
+	if !allowed {
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
 	}
+	releaseProbe := func() { rt.breaker.releaseProbeToken(probeToken) }
 	if rt.bucket != nil && !rt.bucket.allow(now) {
-		rt.breaker.releaseProbe()
+		releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
 	}
 	if slots == nil {
-		return func() {}, nil
+		return releaseProbe, nil
 	}
 	select {
 	case slots <- struct{}{}:
 	default:
-		rt.breaker.releaseProbe()
+		releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_connection_limit", retryAfter: time.Second}
 	}
 	select {
 	case <-ctx.Done():
 		<-slots
-		rt.breaker.releaseProbe()
+		releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "websocket_wait_canceled", retryAfter: 0}
 	default:
 	}
-	return func() { <-slots }, nil
+	return func() {
+		<-slots
+		releaseProbe()
+	}, nil
 }
 
 // beginPolicy applies admission control for one request. The returned release
@@ -336,26 +387,32 @@ func (rt *profileRuntime) beginPolicy(ctx context.Context, method string, header
 		return func() {}, nil
 	}
 	now := time.Now()
-	if willCallUpstream && !rt.breaker.allow(now) {
-		return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
+	probeToken := uint64(0)
+	if willCallUpstream {
+		allowed, token := rt.breaker.allowWithProbe(now)
+		if !allowed {
+			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "circuit_open", retryAfter: rt.breaker.retryAfter()}
+		}
+		probeToken = token
 	}
+	releaseProbe := func() { rt.breaker.releaseProbeToken(probeToken) }
 	if rt.bucket != nil && !rt.bucket.allow(now) {
 		// The breaker may have consumed its single half-open probe above;
 		// leaving it held would wedge the breaker behind a rate rejection.
-		rt.breaker.releaseProbe()
+		releaseProbe()
 		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
 	}
 	if rt.sem != nil {
 		select {
 		case rt.sem <- struct{}{}:
 		default:
-			rt.breaker.releaseProbe()
+			releaseProbe()
 			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_limit", retryAfter: time.Second}
 		}
 		select {
 		case <-ctx.Done():
 			<-rt.sem
-			rt.breaker.releaseProbe()
+			releaseProbe()
 			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_wait_canceled", retryAfter: 0}
 		default:
 		}
@@ -364,6 +421,7 @@ func (rt *profileRuntime) beginPolicy(ctx context.Context, method string, header
 		if rt.sem != nil {
 			<-rt.sem
 		}
+		releaseProbe()
 	}, nil
 }
 

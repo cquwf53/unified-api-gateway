@@ -135,3 +135,196 @@ profiles:
 		t.Fatalf("error: %v", err)
 	}
 }
+
+func TestEquivalentRouteMatchersRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+profiles:
+  p:
+    adapter: transparent
+routes:
+  - id: one
+    priority: 10
+    match:
+      host: API.EXAMPLE
+      method: post
+      headers:
+        X-Tenant: acme
+    profile: p
+  - id: two
+    priority: 10
+    match:
+      host: api.example
+      methods: [POST]
+      headers:
+        x-tenant: acme
+    profile: p
+`))
+	if err == nil || !strings.Contains(err.Error(), "identical matchers") {
+		t.Fatalf("semantically equivalent routes must be rejected, got %v", err)
+	}
+}
+
+func TestEquivalentDuplicateCaseHeaderConstraintsRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+profiles:
+  p:
+    adapter: transparent
+routes:
+  - id: repeated
+    priority: 1
+    match:
+      path: /thing
+      headers:
+        X-Tenant: acme
+        x-tenant: acme
+    profile: p
+  - id: single
+    priority: 1
+    match:
+      path: /thing
+      headers:
+        x-tenant: acme
+    profile: p
+`))
+	if err == nil || !strings.Contains(err.Error(), "identical matchers") {
+		t.Fatalf("duplicate case-insensitive header constraints must canonicalize deterministically, got %v", err)
+	}
+}
+
+func TestClientWildcardAllowlistsAreValid(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+clients:
+  all:
+    profiles: ["*"]
+    upstreams: ["*"]
+`))
+	if err != nil {
+		t.Fatalf("wildcard allowlists must validate: %v", err)
+	}
+}
+
+func TestNegativeOperationalValuesRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+upstreams:
+  u:
+    base_url: https://example.test
+    retries: -1
+profiles:
+  p:
+    traffic_mode: dry-run
+limits:
+  max_body_bytes: -1
+  requests_per_second: -2
+  burst: -1
+  concurrency: -1
+policies:
+  defaults:
+    request_timeout_ms: -1
+    max_concurrency: -1
+    requests_per_second: -1
+    burst: -1
+    retry:
+      max_attempts: -1
+    circuit_breaker:
+      failure_threshold: -1
+      reset_timeout_ms: -1
+observability:
+  log_level: loud
+`))
+	if err == nil {
+		t.Fatal("negative/invalid operational values must be rejected")
+	}
+	for _, want := range []string{"retries", "limits.max_body_bytes", "limits.requests_per_second", "request_timeout_ms", "retry.max_attempts", "failure_threshold", "log_level"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestRecordModeRequiresRecordBodyAtValidation(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+upstreams:
+  u:
+    base_url: https://example.test
+profiles:
+  p:
+    traffic_mode: record
+    upstream: u
+`))
+	if err == nil || !strings.Contains(err.Error(), "record_body") {
+		t.Fatalf("record mode without storage consent must fail validation, got %v", err)
+	}
+}
+
+func TestInvalidRoutePatternsRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+profiles:
+  p:
+    traffic_mode: dry-run
+routes:
+  - id: broken
+    match:
+      path: "/v1/["
+      headers:
+        X-Tenant: "~["
+    profile: p
+`))
+	if err == nil || !strings.Contains(err.Error(), "invalid glob") || !strings.Contains(err.Error(), "invalid regular expression") {
+		t.Fatalf("invalid route patterns must fail activation, got %v", err)
+	}
+}
+
+func TestUnknownCredentialTypeRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+credentials:
+  broken:
+    type: api_ke
+    env: API_KEY
+`))
+	if err == nil || !strings.Contains(err.Error(), "unsupported type") {
+		t.Fatalf("credential type typo must fail activation, got %v", err)
+	}
+}
+
+func TestInvalidHeaderNamesRejected(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+upstreams:
+  u:
+    base_url: https://example.test
+    headers:
+      "Bad Header": value
+profiles:
+  p:
+    traffic_mode: dry-run
+routes:
+  - match:
+      headers:
+        "Also Bad": value
+    profile: p
+observability:
+  request_id_header: "Bad Request ID"
+`))
+	if err == nil || !strings.Contains(err.Error(), "invalid header name") || !strings.Contains(err.Error(), "request_id_header") {
+		t.Fatalf("invalid HTTP header names must fail activation, got %v", err)
+	}
+}
+
+func TestUpstreamURLRejectsEmbeddedCredentials(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+upstreams:
+  u:
+    base_url: https://user:secret@example.test/api#fragment
+`))
+	if err == nil || !strings.Contains(err.Error(), "must not contain user credentials") {
+		t.Fatalf("embedded upstream credentials must fail validation, got %v", err)
+	}
+}

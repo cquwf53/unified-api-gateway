@@ -18,11 +18,11 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
       - name: Build
-        run: go build ./...
+        run: go build -trimpath -ldflags="-X unified-api-gateway/internal/server.BuildVersion=${GITHUB_SHA}" ./...
 
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t unified-api-gateway:ci .
+        run: docker build --build-arg VERSION=${GITHUB_SHA} -t unified-api-gateway:ci .

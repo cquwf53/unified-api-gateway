@@ -31,13 +31,15 @@ go run ./cmd/gateway --config configs/gateway.yaml
 
 存在 SQLite active 版本时，启动默认恢复它而非 `--config` 文件（两者不一致会打
 印 warning）；需要强制使用文件时加 `--prefer-file`。CLI 热激活收到管理面
-401/403 时会直接报错退出，不再静默写本地库假装成功。
+任何非 2xx 响应时都会直接报错退出，不再静默写本地库假装成功；只有管理面无法
+连接时才会保存到本地库供下次启动。
 
 也可以使用 Makefile 或 Docker：
 
 ```powershell
 make run
 make validate
+make health
 docker build -t unified-api-gateway .
 docker run --rm -p 8780:8780 -p 127.0.0.1:8781:8781 `
   -e ANTHROPIC_API_KEY=$env:ANTHROPIC_API_KEY `
@@ -45,7 +47,8 @@ docker run --rm -p 8780:8780 -p 127.0.0.1:8781:8781 `
 ```
 
 如果当前系统没有 `make`，直接使用上面的 `go run` 命令即可。容器默认以只读配置
-启动；需要热激活时，将自己的配置目录挂载到 `/app/configs`。
+启动，`/app/data` 是 SQLite 持久卷；需要替换初始配置时，将自己的配置目录挂载到
+`/app/configs`。容器健康检查调用管理面的 `/readyz`，不是只校验镜像内 YAML。
 
 ## 第一个请求
 
@@ -92,7 +95,7 @@ YAML 明文。
 - `credentials` / `clients`：上游密钥引用、客户端凭据和 profile 白名单；
 - `observability`：日志级别、请求 ID 头、指标和 trace 设置。`log_level` 与
   `request_id_header` 已生效；`metrics: false` 可关闭 `/metrics` 端点（默认开启）；
-  `trace`/`redact_prompts` 为预留字段。
+  `redact_prompts: true` 会隐藏 preview/dry-run 中的请求正文；`trace` 仍为预留字段。
 
 一个 profile 可以写成：
 
@@ -224,6 +227,11 @@ dry-run 预览每一阶段的 envelope diff，发布后可通过管理 API 回�
 `{"type":"error",...}`）返回，不会被伪装成空的"成功"响应。启用 `record` 时还必须
 显式设置 `observability.record_body: true`。
 
+record fixture 同时按 client、tenant 和完整配置版本 ID 隔离。切换到另一个
+配置版本后不会跨版本误回放；需要回放时，可在同一配置中定义 `record` 与
+`replay` 两个 profile，使用相同的 `name` 作为 fixture 命名空间，并用不同
+route 选择它们。
+
 `shadow` 模式可以用 profile 的 `shadow_upstream` 字段指定独立的影子上游；不指定时
 镜像请求会发往主上游（注意双倍计费）。影子上限 64 个并发，超出即丢弃并记录警告，
 且影子结果不影响熔断器。`replay` 先按请求摘要精确匹配录制；未命中时回退到同一
@@ -316,6 +324,8 @@ make validate
 
 ```powershell
 go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://127.0.0.1:8781
+go run ./cmd/gateway health --admin-url http://127.0.0.1:8781
+go run ./cmd/gateway version
 ```
 
 测试夹具位于 `tests/fixtures`，每个 fixture 都标注输入契约、期望的上游 envelope
@@ -337,8 +347,10 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
   独立的连接数预算（默认 256），长连接不会占满 HTTP 请求并发额度；
 - 改写后的响应由网关重新分帧（Content-Length 自动重算），客户端不会读到
   与声明长度不符的截断响应；
-- Authorization、API key、prompt、响应正文和工具参数默认脱敏，`policies.audit.redact`
-  可扩展脱敏名单；
+- Authorization、API key、Cookie 等标准敏感头默认脱敏，`policies.audit.redact`
+  可扩展需要脱敏的 header 名单；`redact_prompts` 隐藏 preview/dry-run 请求正文；
+- `record` fixture 为了可回放会持久化转换后的响应正文；只应在受控环境显式开启
+  `record_body`，不要录制不应落盘的数据；
 - 客户端密钥与管理令牌使用常量时间比较，避免时序侧信道；
 - 入站 `X-Request-Id`（或配置的 `observability.request_id_header`）只接受保守字符集，
   非法值会被替换为网关生成的 ID，防止日志/响应头注入；
@@ -354,14 +366,16 @@ go run ./cmd/gateway activate --config configs/gateway.yaml --admin-url http://1
 
 当前实现明确不做（或只做有限支持）的事情：
 
-- **replay 按 client/tenant 隔离，但不按配置版本**：同一 client 的录制跨配置
-  版本共享；
 - **热激活的 SQLite 与内存两步之间仍有崩溃窗口**（内存侧 config/runtimes/
   pipelines 的发布已是原子的；重启时以 SQLite active 为准恢复）；
 - 交错的 OpenAI 并行工具参数增量会缓冲到流结束再按序重放（无损，但工具参数
   不再随到随发）；
 - Responses 的 reasoning/summary 事件未做翻译；
-- **readyz 只检查配置已加载**，不做上游探活；
+- Responses 适配当前聚焦文本、图片和自定义 function call；内置 tools、远程 MCP、
+  audio/refusal 等专用 item 不做语义翻译；
+- gRPC 面当前是有界缓冲的 unary HTTP 透明代理，不实现 bidi 流，也不自带原生 h2c
+  终结；需要部署在 HTTP/2/h2c 终结器之后；
+- **readyz 检查配置与 SQLite 可用性，但不做上游探活**；
 - `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
 - route 校验拒绝完全相同的 matcher+priority 组合，但**包含关系**冲突（如同
   path 前缀的宽窄规则叠加）仍不检测；

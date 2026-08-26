@@ -62,6 +62,11 @@ func run(args []string) error {
 		return nil
 	case "status":
 		return printStatus(*dbPath)
+	case "health":
+		return health(*adminURL)
+	case "version":
+		fmt.Println(server.BuildVersion)
+		return nil
 	case "rollback":
 		if *versionID == "" {
 			return errors.New("rollback requires --id")
@@ -74,7 +79,7 @@ func run(args []string) error {
 	case "serve":
 		return serve(*configPath, *dbPath, *httpAddr, *adminAddr, *preferFile)
 	default:
-		return fmt.Errorf("unknown command %q (use serve, validate, preview, activate, rollback, or status)", command)
+		return fmt.Errorf("unknown command %q (use serve, validate, preview, activate, rollback, status, health, or version)", command)
 	}
 }
 
@@ -115,14 +120,18 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	// on-disk config file. data must follow the snapshot: saving the file
 	// YAML under the restored version's id would overwrite the stored
 	// configuration (SaveVersion is INSERT OR REPLACE).
-	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 && !preferFile && !fileLoadFailed {
-		if active.SHA256 != "" && active.SHA256 != baseSnapshot.Hash {
+	if active, activeErr := storeDB.Active(context.Background()); activeErr == nil && len(active.YAML) > 0 && !preferFile {
+		if baseSnapshot != nil && active.SHA256 != "" && active.SHA256 != baseSnapshot.Hash {
 			slog.Warn("stored active configuration differs from the config file; the stored version wins (use --prefer-file to change this)", "stored_id", active.ID, "file_id", baseSnapshot.ID)
 		}
 		if activeCfg, parseErr := config.Parse(active.YAML); parseErr == nil {
 			if activeSnapshot, snapErr := config.NewSnapshot(activeCfg, "store:"+active.ID); snapErr == nil {
-				baseSnapshot, data = activeSnapshot, active.YAML
-				slog.Info("restored configuration saved by a previous activation", "id", active.ID, "created_by", active.CreatedBy)
+				if active.SHA256 != "" && active.SHA256 != activeSnapshot.Hash || active.ID != activeSnapshot.ID {
+					slog.Warn("stored active configuration failed its content-address integrity check; using the config file", "stored_id", active.ID, "computed_id", activeSnapshot.ID)
+				} else {
+					baseSnapshot, data = activeSnapshot, active.YAML
+					slog.Info("restored configuration saved by a previous activation", "id", active.ID, "created_by", active.CreatedBy)
+				}
 			}
 		} else {
 			slog.Warn("stored active configuration no longer parses; using the config file", "id", active.ID, "error", parseErr)
@@ -193,12 +202,13 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var serveErr error
 	select {
 	case <-ctx.Done():
 		slog.Info("shutting down")
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+			serveErr = err
 		}
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -208,7 +218,7 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	if grpcServer != nil {
 		_ = grpcServer.Shutdown(shutdownCtx)
 	}
-	return nil
+	return serveErr
 }
 
 func activate(configPath, dbPath, adminURL, adminToken string) error {
@@ -221,24 +231,29 @@ func activate(configPath, dbPath, adminURL, adminToken string) error {
 	}
 	payload, _ := json.Marshal(map[string]any{"yaml": string(data), "description": "CLI activation", "actor": "cli"})
 	fallbackReason := "running management API was unavailable"
-	if request, requestErr := http.NewRequest(http.MethodPost, strings.TrimRight(adminURL, "/")+"/admin/v1/config/activate", bytes.NewReader(payload)); requestErr == nil {
-		request.Header.Set("Content-Type", "application/json")
-		if adminToken != "" {
-			request.Header.Set("X-Admin-Token", adminToken)
+	request, requestErr := http.NewRequest(http.MethodPost, strings.TrimRight(adminURL, "/")+"/admin/v1/config/activate", bytes.NewReader(payload))
+	if requestErr != nil {
+		return fmt.Errorf("build management API request: %w", requestErr)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if adminToken != "" {
+		request.Header.Set("X-Admin-Token", adminToken)
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if response, doErr := client.Do(request); doErr == nil {
+		defer response.Body.Close()
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			fmt.Printf("hot activated %s\n", snapshot.ID)
+			return nil
 		}
-		if response, doErr := (&http.Client{Timeout: 5 * time.Second}).Do(request); doErr == nil {
-			defer response.Body.Close()
-			if response.StatusCode >= 200 && response.StatusCode < 300 {
-				fmt.Printf("hot activated %s\n", snapshot.ID)
-				return nil
-			}
-			if response.StatusCode >= 400 {
-				// Any definitive management-plane rejection (auth,
-				// validation, conflict, internal error) must not degrade
-				// into a silent local save that pretends success.
-				return fmt.Errorf("management API rejected the activation (HTTP %d); nothing was saved", response.StatusCode)
-			}
-		}
+		// Any definitive management-plane reply outside 2xx—including a
+		// redirect—must not degrade into a local save that pretends success.
+		return fmt.Errorf("management API rejected the activation (HTTP %d); nothing was saved", response.StatusCode)
 	}
 	db, err := store.Open(dbPath)
 	if err != nil {
@@ -273,6 +288,9 @@ func rollback(dbPath, id string) error {
 	if err != nil {
 		return err
 	}
+	if version.ID != snapshot.ID || version.SHA256 != "" && version.SHA256 != snapshot.Hash {
+		return fmt.Errorf("stored version %q failed its content-address integrity check", id)
+	}
 	if err := db.Activate(context.Background(), id); err != nil {
 		return err
 	}
@@ -302,6 +320,31 @@ func printStatus(dbPath string) error {
 	}
 	b, _ := json.MarshalIndent(map[string]any{"gateway_version": server.BuildVersion, "versions": items}, "", "  ")
 	fmt.Println(string(b))
+	return nil
+}
+
+func health(rawURL string) error {
+	if strings.TrimSpace(rawURL) == "" {
+		rawURL = "http://127.0.0.1:8781"
+	}
+	rawURL = strings.TrimRight(rawURL, "/")
+	if !strings.HasSuffix(rawURL, "/readyz") {
+		rawURL += "/readyz"
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Get(rawURL)
+	if err != nil {
+		return fmt.Errorf("health check failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("health check failed: HTTP %d", response.StatusCode)
+	}
 	return nil
 }
 

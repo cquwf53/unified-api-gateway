@@ -308,6 +308,12 @@ func (t *SSETranslator) translateDone() []SSEEvent {
 	var out []SSEEvent
 	out = append(out, t.closeTextBlock()...)
 	out = append(out, t.flushBufferedTools()...)
+	if t.toolOverflow {
+		// The overflow error is terminal. A normal message_stop afterwards
+		// would disguise the failed tool call as a successful completion.
+		t.finishSent = true
+		return out
+	}
 	out = append(out, sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 	return out
 }
@@ -710,6 +716,13 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 		out = append(out, t.ensureStarted(payload)...)
 		out = append(out, t.closeTextBlock()...)
 		out = append(out, t.flushBufferedTools()...)
+		if t.toolOverflow {
+			// Suppress both the normal finish event and any later [DONE]/Finish
+			// terminator after the terminal translation error.
+			t.doneSent = true
+			t.finishSent = true
+			return out
+		}
 		out = append(out, sseEvent("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": mapFinishReason(asString(finish)), "stop_sequence": nil},

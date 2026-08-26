@@ -4,9 +4,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"unified-api-gateway/internal/config"
+	"unified-api-gateway/internal/store"
 )
 
 func testGateway(t *testing.T, configure func(*config.Config)) *Server {
@@ -102,6 +104,76 @@ func TestInboundRequestIDValidated(t *testing.T) {
 	}
 }
 
+func TestSecureEqualHandlesDifferentLengths(t *testing.T) {
+	if !secureEqual("same-secret", "same-secret") {
+		t.Fatal("equal secrets must compare equal")
+	}
+	if secureEqual("short", "a much longer secret") {
+		t.Fatal("different secrets must not compare equal")
+	}
+}
+
+func TestDisabledClientKeyCannotAuthenticate(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{
+		Version: 1,
+		Clients: map[string]config.ClientCredential{
+			"disabled": {Key: "disabled-secret", Enabled: &disabled},
+		},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("X-API-Key", "disabled-secret")
+	if got := gateway.callClientKey(snapshot.Config, request); got != "" {
+		t.Fatalf("disabled credential authenticated as %q", got)
+	}
+}
+
+func TestGlobalFallbackCannotBypassConfiguredClientKey(t *testing.T) {
+	t.Setenv("GATEWAY_CLIENT_API_KEY", "global-secret")
+	cfg := &config.Config{
+		Version: 1,
+		Clients: map[string]config.ClientCredential{
+			"local": {Key: "configured-secret"},
+		},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("X-API-Key", "global-secret")
+	if got := gateway.callClientKey(snapshot.Config, request); got != "" {
+		t.Fatalf("global fallback bypassed configured client key as %q", got)
+	}
+}
+
+func TestConnectionNominatedHopHeadersAreFiltered(t *testing.T) {
+	in := http.Header{
+		"Connection":     {"keep-alive, X-Internal-Hop"},
+		"X-Internal-Hop": {"must-not-forward"},
+		"X-End-To-End":   {"keep"},
+	}
+	filtered := filteredRequestHeaders(in)
+	if filtered.Get("X-Internal-Hop") != "" || filtered.Get("Connection") != "" {
+		t.Fatalf("hop-by-hop headers leaked: %#v", filtered)
+	}
+	if filtered.Get("X-End-To-End") != "keep" {
+		t.Fatalf("end-to-end header lost: %#v", filtered)
+	}
+}
+
 func TestCustomRequestIDHeaderHonoured(t *testing.T) {
 	gateway := testGateway(t, func(cfg *config.Config) {
 		cfg.Observability.RequestIDHeader = "X-Correlation-Id"
@@ -134,4 +206,58 @@ func TestConfiguredAuditRedactionsHideExtraHeaders(t *testing.T) {
 	if !auditEnabled(cfg) {
 		t.Fatal("audit should be enabled")
 	}
+}
+
+func TestRedactConfigHidesLikelyAndConfiguredSecretHeaders(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1,
+		Policies: map[string]any{
+			"audit": map[string]any{"redact": []any{"x-private-context"}},
+		},
+		Upstreams: map[string]config.Upstream{
+			"u": {BaseURL: "https://example.test", Headers: map[string]string{
+				"X-Service-Token":     "token-value",
+				"X-Private-Context":   "private-value",
+				"X-Public-Request-ID": "request-id",
+			}},
+		},
+	}
+	redacted := redactConfig(cfg)
+	headers := redacted.Upstreams["u"].Headers
+	if headers["X-Service-Token"] != "[REDACTED]" || headers["X-Private-Context"] != "[REDACTED]" {
+		t.Fatalf("secret headers leaked: %#v", headers)
+	}
+	if headers["X-Public-Request-ID"] != "request-id" {
+		t.Fatalf("public header was over-redacted: %#v", headers)
+	}
+}
+
+func TestCloseIsIdempotentWithConcurrentAuditSubmissions(t *testing.T) {
+	cfg := &config.Config{Version: 1}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.TempDir() + "/gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gateway, err := New(Options{Snapshot: snapshot, Store: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				gateway.submitAudit(store.AuditEvent{Action: "test", Actor: "test"})
+			}
+		}()
+	}
+	gateway.Close()
+	gateway.Close()
+	wg.Wait()
 }

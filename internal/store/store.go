@@ -101,6 +101,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at D
 CREATE TABLE IF NOT EXISTS recordings (
   key TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  client_id TEXT NOT NULL DEFAULT '',
+  tenant TEXT NOT NULL DEFAULT '',
+  config_id TEXT NOT NULL DEFAULT '',
   status_code INTEGER NOT NULL,
   content_type TEXT NOT NULL DEFAULT '',
   headers_json TEXT NOT NULL DEFAULT '{}',
@@ -120,12 +125,17 @@ CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC)
 		`ALTER TABLE recordings ADD COLUMN path TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE recordings ADD COLUMN client_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE recordings ADD COLUMN tenant TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE recordings ADD COLUMN config_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			if !strings.Contains(err.Error(), "duplicate column") {
 				return fmt.Errorf("migrate sqlite store: %w", err)
 			}
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_recordings_replay
+ON recordings(config_id, profile_id, method, path, client_id, tenant, created_at DESC)`); err != nil {
+		return fmt.Errorf("migrate sqlite store: %w", err)
 	}
 	return s.pragmas(ctx)
 }
@@ -277,6 +287,7 @@ type Recording struct {
 	Path        string              `json:"path,omitempty"`
 	ClientID    string              `json:"client_id,omitempty"`
 	Tenant      string              `json:"tenant,omitempty"`
+	ConfigID    string              `json:"config_id,omitempty"`
 	StatusCode  int                 `json:"status_code"`
 	ContentType string              `json:"content_type,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
@@ -299,17 +310,18 @@ func (s *Store) SaveRecording(ctx context.Context, recording Recording) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO recordings
- (key, profile_id, method, path, client_id, tenant, status_code, content_type, headers_json, body, created_at)
- VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, recording.Key, recording.ProfileID, recording.Method, recording.Path,
-		recording.ClientID, recording.Tenant, recording.StatusCode, recording.ContentType, string(headers), recording.Body, recording.CreatedAt)
+	 (key, profile_id, method, path, client_id, tenant, config_id, status_code, content_type, headers_json, body, created_at)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, recording.Key, recording.ProfileID, recording.Method, recording.Path,
+		recording.ClientID, recording.Tenant, recording.ConfigID, recording.StatusCode, recording.ContentType, string(headers), recording.Body, recording.CreatedAt)
 	return err
 }
 
-func (s *Store) GetRecording(ctx context.Context, key string, clientID, tenant string) (Recording, error) {
+func (s *Store) GetRecording(ctx context.Context, key string, clientID, tenant, configID string) (Recording, error) {
 	var recording Recording
 	var headers string
-	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, status_code, content_type, headers_json, body, created_at
-FROM recordings WHERE key = ? AND client_id = ? AND tenant = ?`, key, clientID, tenant).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, client_id, tenant, config_id, status_code, content_type, headers_json, body, created_at
+	FROM recordings WHERE key = ? AND client_id = ? AND tenant = ? AND config_id = ?`, key, clientID, tenant, configID).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+		&recording.ClientID, &recording.Tenant, &recording.ConfigID,
 		&recording.StatusCode, &recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
 	if err != nil {
 		return Recording{}, err
@@ -324,12 +336,13 @@ FROM recordings WHERE key = ? AND client_id = ? AND tenant = ?`, key, clientID, 
 // method and path for a profile. It backs the fuzzy replay fallback: exact
 // request hashes rarely match twice for chat workloads where the body
 // changes on every call.
-func (s *Store) LatestRecordingForProfile(ctx context.Context, profileID, method, path, clientID, tenant string) (Recording, error) {
+func (s *Store) LatestRecordingForProfile(ctx context.Context, profileID, method, path, clientID, tenant, configID string) (Recording, error) {
 	var recording Recording
 	var headers string
-	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, status_code, content_type, headers_json, body, created_at
-FROM recordings WHERE profile_id = ? AND method = ? AND path = ? AND client_id = ? AND tenant = ?
-ORDER BY created_at DESC LIMIT 1`, profileID, method, path, clientID, tenant).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+	err := s.db.QueryRowContext(ctx, `SELECT key, profile_id, method, path, client_id, tenant, config_id, status_code, content_type, headers_json, body, created_at
+	FROM recordings WHERE profile_id = ? AND method = ? AND path = ? AND client_id = ? AND tenant = ? AND config_id = ?
+	ORDER BY created_at DESC LIMIT 1`, profileID, method, path, clientID, tenant, configID).Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path,
+		&recording.ClientID, &recording.Tenant, &recording.ConfigID,
 		&recording.StatusCode, &recording.ContentType, &headers, &recording.Body, &recording.CreatedAt)
 	if err != nil {
 		return Recording{}, err
@@ -344,7 +357,7 @@ func (s *Store) ListRecordings(ctx context.Context, limit int) ([]Recording, err
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT key, profile_id, method, path, client_id, tenant, status_code, content_type, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT key, profile_id, method, path, client_id, tenant, config_id, status_code, content_type, created_at
 FROM recordings ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -353,7 +366,7 @@ FROM recordings ORDER BY created_at DESC LIMIT ?`, limit)
 	var result []Recording
 	for rows.Next() {
 		var recording Recording
-		if err := rows.Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path, &recording.ClientID, &recording.Tenant, &recording.StatusCode, &recording.ContentType, &recording.CreatedAt); err != nil {
+		if err := rows.Scan(&recording.Key, &recording.ProfileID, &recording.Method, &recording.Path, &recording.ClientID, &recording.Tenant, &recording.ConfigID, &recording.StatusCode, &recording.ContentType, &recording.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, recording)

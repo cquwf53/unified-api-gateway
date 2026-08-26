@@ -328,6 +328,41 @@ func TestBreakerProbeNotWedgedByRateLimit(t *testing.T) {
 	}
 }
 
+func TestProbeTokenCannotReleaseNewProbe(t *testing.T) {
+	breaker := newBreaker(breakerConfig{failureThreshold: 1, resetTimeout: time.Millisecond})
+	breaker.recordFailure(time.Now().Add(-time.Second))
+	allowed, first := breaker.allowWithProbe(time.Now())
+	if !allowed || first == 0 {
+		t.Fatal("first half-open probe should be granted")
+	}
+	breaker.recordFailure(time.Now().Add(-time.Second))
+	allowed, second := breaker.allowWithProbe(time.Now())
+	if !allowed || second == 0 || second == first {
+		t.Fatalf("second probe not granted with a new token: first=%d second=%d", first, second)
+	}
+	breaker.releaseProbeToken(first)
+	if breaker.allow(time.Now()) {
+		t.Fatal("stale release freed the newer active probe")
+	}
+	breaker.releaseProbeToken(second)
+	if !breaker.allow(time.Now()) {
+		t.Fatal("current probe token should release the half-open slot")
+	}
+}
+
+func TestWebsocketReleaseClearsUnresolvedHalfOpenProbe(t *testing.T) {
+	rt := &profileRuntime{breaker: newBreaker(breakerConfig{failureThreshold: 1, resetTimeout: time.Millisecond})}
+	rt.breaker.recordFailure(time.Now().Add(-time.Second))
+	release, rejection := rt.beginWebsocketPolicy(context.Background(), http.MethodGet, nil, nil)
+	if rejection != nil {
+		t.Fatalf("probe rejected: %+v", rejection)
+	}
+	release()
+	if !rt.breaker.allow(time.Now()) {
+		t.Fatal("closing before an upstream result must release the probe")
+	}
+}
+
 // TestStreamUpstreamErrorCountsAsBreakerFailure pins that a forwarded 5xx
 // stream status is a breaker failure, not a success.
 func TestStreamUpstreamErrorCountsAsBreakerFailure(t *testing.T) {

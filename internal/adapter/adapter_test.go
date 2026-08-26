@@ -328,3 +328,83 @@ func TestResponsesFunctionCallOutputBecomesToolResult(t *testing.T) {
 		t.Fatalf("tool_result=%#v", result)
 	}
 }
+
+func TestOpenAIResponsesNonStreamingKeepsFunctionCalls(t *testing.T) {
+	input := Envelope{Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"id":"msg_42","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"Oslo"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}`)}
+	output, err := (OpenAIResponsesToAnthropic{}).AdaptResponse(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	items := body["output"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("output=%#v", items)
+	}
+	if !strings.HasPrefix(body["id"].(string), "resp_") || body["created_at"] == nil {
+		t.Fatalf("response identity=%#v", body)
+	}
+	message := items[0].(map[string]any)
+	if message["type"] != "message" || message["status"] != "completed" {
+		t.Fatalf("message=%#v", message)
+	}
+	call := items[1].(map[string]any)
+	if call["type"] != "function_call" || call["call_id"] != "call_1" || call["name"] != "get_weather" || call["arguments"] != `{"city":"Oslo"}` || call["status"] != "completed" {
+		t.Fatalf("function_call=%#v", call)
+	}
+	usage := body["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(3) || usage["output_tokens"] != float64(4) || usage["total_tokens"] != float64(7) {
+		t.Fatalf("usage=%#v", usage)
+	}
+}
+
+func TestOpenAIResponsesNonStreamingLengthIsIncomplete(t *testing.T) {
+	input := Envelope{Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"id":"msg_42","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens","usage":{"input_tokens":3,"output_tokens":4}}`)}
+	output, err := (OpenAIResponsesToAnthropic{}).AdaptResponse(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "incomplete" || body["incomplete_details"].(map[string]any)["reason"] != "max_output_tokens" {
+		t.Fatalf("response=%#v", body)
+	}
+	item := body["output"].([]any)[0].(map[string]any)
+	if item["status"] != "incomplete" || body["output_text"] != "partial" {
+		t.Fatalf("item=%#v response=%#v", item, body)
+	}
+}
+
+func TestAnthropicMixedToolResultPrecedesMultimodalFollowup(t *testing.T) {
+	input := Envelope{Method: http.MethodPost, Header: http.Header{"Content-Type": []string{"application/json"}}, ContentType: "application/json", Body: []byte(`{"model":"gpt","max_tokens":8,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"},{"type":"text","text":"describe this"},{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}]}`)}
+	output, err := (AnthropicToOpenAIChat{}).AdaptRequest(input, config.Profile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(output.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	if messages[0].(map[string]any)["role"] != "assistant" || messages[1].(map[string]any)["role"] != "tool" || messages[2].(map[string]any)["role"] != "user" {
+		t.Fatalf("message order=%#v", messages)
+	}
+	if messages[1].(map[string]any)["tool_call_id"] != "toolu_1" {
+		t.Fatalf("tool message=%#v", messages[1])
+	}
+	parts := messages[2].(map[string]any)["content"].([]any)
+	if len(parts) != 2 || parts[0].(map[string]any)["text"] != "describe this" {
+		t.Fatalf("user content=%#v", parts)
+	}
+	image := parts[1].(map[string]any)["image_url"].(map[string]any)
+	if image["url"] != "https://example.test/image.png" {
+		t.Fatalf("image=%#v", image)
+	}
+}

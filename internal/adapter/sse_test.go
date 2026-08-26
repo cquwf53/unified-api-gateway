@@ -323,3 +323,38 @@ func TestInterleavedToolArgumentsPreserved(t *testing.T) {
 		t.Fatalf("tool block lifecycle incomplete: starts=%d stops=%d", starts, stops)
 	}
 }
+
+func TestBufferedToolOverflowIsTerminal(t *testing.T) {
+	translator := NewSSETranslator("openai-chat", "anthropic-messages")
+	translator.accumulateToolCalls([]any{map[string]any{
+		"index": 0, "id": "call_large",
+		"function": map[string]any{"name": "large", "arguments": strings.Repeat("x", maxBufferedToolArgs+1)},
+	}})
+	if !translator.toolOverflow {
+		t.Fatal("expected tool argument overflow")
+	}
+	finish, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"}}})
+	events, err := translator.Translate(SSEEvent{Data: string(finish)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawError := false
+	for _, event := range events {
+		if strings.Contains(event.Data, `"type":"error"`) {
+			sawError = true
+		}
+		if strings.Contains(event.Data, `"type":"message_delta"`) || strings.Contains(event.Data, `"type":"message_stop"`) {
+			t.Fatalf("normal finish followed overflow: %s", EncodeSSE(events))
+		}
+	}
+	if !sawError {
+		t.Fatalf("missing terminal overflow error: %s", EncodeSSE(events))
+	}
+	late, err := translator.Translate(SSEEvent{Data: "[DONE]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(late) != 0 || len(translator.Finish()) != 0 {
+		t.Fatalf("overflow was followed by a normal terminator: %s", EncodeSSE(late))
+	}
+}

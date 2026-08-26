@@ -90,6 +90,89 @@ body:
 	}
 }
 
+func TestUpstreamBaseQueryIsPreserved(t *testing.T) {
+	receivedQuery := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL + "/base?api-version=2026-01-01"}},
+		Profiles:  map[string]config.Profile{"p": {Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/thing"}, Profile: "p"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/thing?tenant=acme", strings.NewReader("{}")))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(receivedQuery, "api-version=2026-01-01") || !strings.Contains(receivedQuery, "tenant=acme") {
+		t.Fatalf("upstream query=%q", receivedQuery)
+	}
+}
+
+func TestUpstreamClientKeepsDefaultTimeoutForBufferedCalls(t *testing.T) {
+	cfg := &config.Config{Version: 1}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &http.Client{Timeout: 17 * time.Second}
+	gateway, err := New(Options{Snapshot: snapshot, HTTPClient: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gateway.upstreamClient(config.Upstream{}, false).Timeout; got != base.Timeout {
+		t.Fatalf("buffered timeout=%s want=%s", got, base.Timeout)
+	}
+	if got := gateway.upstreamClient(config.Upstream{}, true).Timeout; got != 0 {
+		t.Fatalf("stream timeout=%s want=0", got)
+	}
+}
+
+func TestUpstreamRedirectIsNotFollowed(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: source.URL}},
+		Profiles:  map[string]config.Profile{"p": {Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/thing"}, Profile: "p"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodGet, "/thing", nil))
+	if recorder.Code != http.StatusFound || redirected {
+		t.Fatalf("redirect status=%d followed=%v", recorder.Code, redirected)
+	}
+}
+
 func TestOpenAIAnthropicRoundTrip(t *testing.T) {
 	var receivedPath string
 	var received map[string]any
@@ -244,6 +327,41 @@ func TestDryRunDoesNotCallUpstream(t *testing.T) {
 	}
 }
 
+func TestDryRunStreamingUsesClientContract(t *testing.T) {
+	for _, testCase := range []struct {
+		name, contract, want, forbidden string
+	}{
+		{name: "anthropic", contract: "anthropic-messages", want: `"type":"message_stop"`, forbidden: "[DONE]"},
+		{name: "responses", contract: "openai-responses", want: `"type":"response.completed"`, forbidden: "[DONE]"},
+		{name: "chat", contract: "openai-chat", want: "chat.completion.chunk", forbidden: `"type":"message_stop"`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Version:  1,
+				Profiles: map[string]config.Profile{"p": {Name: "p", Adapter: "transparent", ClientContract: testCase.contract, TrafficMode: "dry-run"}},
+				Routes:   []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/dry"}, Profile: "p"}},
+			}
+			snapshot, err := config.NewSnapshot(cfg, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway, err := New(Options{Snapshot: snapshot})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/dry", strings.NewReader(`{"stream":true}`))
+			gateway.ServeDataHTTP(recorder, request)
+			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
+				t.Fatalf("status=%d content-type=%s", recorder.Code, recorder.Header().Get("Content-Type"))
+			}
+			if !strings.Contains(recorder.Body.String(), testCase.want) || strings.Contains(recorder.Body.String(), testCase.forbidden) {
+				t.Fatalf("stream=%s", recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestProfileOverrideRequiresAllowlist(t *testing.T) {
 	cfg := &config.Config{
 		Version:         1,
@@ -271,6 +389,47 @@ func TestProfileOverrideRequiresAllowlist(t *testing.T) {
 	gateway.ServeDataHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCustomProfileNameStillUsesRuntimePolicyAndPipeline(t *testing.T) {
+	receivedPath := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles: map[string]config.Profile{
+			"internal-id": {
+				Name: "display-name", Adapter: "transparent", TrafficMode: "live", Upstream: "u",
+				Request: transformSpec("path: /rewritten"),
+			},
+		},
+		Routes:   []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/input"}, Profile: "internal-id"}},
+		Policies: map[string]any{"defaults": map[string]any{"max_concurrency": 1}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/input", strings.NewReader("{}")))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if receivedPath != "/rewritten" {
+		t.Fatalf("compiled pipeline was bypassed, path=%q", receivedPath)
+	}
+	if runtime := gateway.runtimeFor("internal-id"); runtime == nil || runtime.sem == nil {
+		t.Fatal("custom display name bypassed the keyed policy runtime")
 	}
 }
 
@@ -361,7 +520,19 @@ func TestRecordAndReplay(t *testing.T) {
 		_, _ = io.WriteString(w, `{"value":"from-upstream"}`)
 	}))
 	defer upstream.Close()
-	cfg := &config.Config{Version: 1, Observability: config.Observability{RecordBody: true}, Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}}, Profiles: map[string]config.Profile{"record": {Name: "record", Adapter: "transparent", TrafficMode: "record", Upstream: "u"}}, Routes: []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/record"}, Profile: "record"}}}
+	cfg := &config.Config{
+		Version:       1,
+		Observability: config.Observability{RecordBody: true},
+		Upstreams:     map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles: map[string]config.Profile{
+			"record": {Name: "fixture", Adapter: "transparent", TrafficMode: "record", Upstream: "u"},
+			"replay": {Name: "fixture", Adapter: "transparent", TrafficMode: "replay", Upstream: "u"},
+		},
+		Routes: []config.Route{
+			{ID: "record", Match: config.RouteMatch{Path: "/record", Headers: map[string]string{"X-Fixture-Mode": "record"}}, Profile: "record"},
+			{ID: "replay", Match: config.RouteMatch{Path: "/record", Headers: map[string]string{"X-Fixture-Mode": "replay"}}, Profile: "replay"},
+		},
+	}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -375,26 +546,124 @@ func TestRecordAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := func() *httptest.ResponseRecorder {
+	call := func(mode string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
-		gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/record", strings.NewReader(`{"hello":"world"}`)))
+		request := httptest.NewRequest(http.MethodPost, "/record", strings.NewReader(`{"hello":"world"}`))
+		request.Header.Set("X-Fixture-Mode", mode)
+		gateway.ServeDataHTTP(recorder, request)
 		return recorder
 	}
-	first := call()
+	first := call("record")
 	if first.Code != http.StatusOK || calls != 1 {
 		t.Fatalf("record status=%d calls=%d body=%s", first.Code, calls, first.Body.String())
 	}
-	cfg.Profiles["record"] = config.Profile{Name: "record", Adapter: "transparent", TrafficMode: "replay", Upstream: "u"}
-	replaySnapshot, err := config.NewSnapshot(cfg, "replay")
+	second := call("replay")
+	if second.Code != http.StatusOK || calls != 1 || second.Body.String() != first.Body.String() {
+		t.Fatalf("replay status=%d calls=%d first=%s second=%s", second.Code, calls, first.Body.String(), second.Body.String())
+	}
+}
+
+func TestReplayDoesNotCrossConfigVersions(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{\"value\":\"recorded\"}")
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:       1,
+		Observability: config.Observability{RecordBody: true},
+		Upstreams:     map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:      map[string]config.Profile{"p": {Name: "p", Adapter: "transparent", TrafficMode: "record", Upstream: "u"}},
+		Routes:        []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/record"}, Profile: "p"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "record")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.TempDir() + "/gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gateway, err := New(Options{Snapshot: snapshot, Store: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorded, httptest.NewRequest(http.MethodPost, "/record", strings.NewReader("{\"hello\":\"world\"}")))
+	if recorded.Code != http.StatusOK {
+		t.Fatalf("record status=%d body=%s", recorded.Code, recorded.Body.String())
+	}
+
+	// Even a mode-only change creates a different content-addressed version;
+	// recordings must never bleed into it.
+	profile := cfg.Profiles["p"]
+	profile.TrafficMode = "replay"
+	cfg.Profiles["p"] = profile
+	replaySnapshot, err := config.NewSnapshot(cfg, "changed")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := gateway.Activate(replaySnapshot); err != nil {
 		t.Fatal(err)
 	}
-	second := call()
-	if second.Code != http.StatusOK || calls != 1 || second.Body.String() != first.Body.String() {
-		t.Fatalf("replay status=%d calls=%d first=%s second=%s", second.Code, calls, first.Body.String(), second.Body.String())
+	replayed := httptest.NewRecorder()
+	gateway.ServeDataHTTP(replayed, httptest.NewRequest(http.MethodPost, "/record", strings.NewReader("{\"hello\":\"world\"}")))
+	if replayed.Code != http.StatusNotFound || !strings.Contains(replayed.Body.String(), "recording_not_found") {
+		t.Fatalf("cross-version replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+}
+
+func TestReplayProfileDoesNotRequireUpstream(t *testing.T) {
+	cfg := &config.Config{
+		Version:  1,
+		Profiles: map[string]config.Profile{"replay": {Name: "fixture", Adapter: "transparent", TrafficMode: "replay"}},
+		Routes:   []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/replay"}, Profile: "replay"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.TempDir() + "/gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gateway, err := New(Options{Snapshot: snapshot, Store: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/replay", strings.NewReader("{}")))
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "recording_not_found") {
+		t.Fatalf("replay without upstream status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRecordModeRequiresStore(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream must not be called when recording storage is unavailable")
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:       1,
+		Observability: config.Observability{RecordBody: true},
+		Upstreams:     map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:      map[string]config.Profile{"record": {Adapter: "transparent", TrafficMode: "record", Upstream: "u"}},
+		Routes:        []config.Route{{ID: "r", Match: config.RouteMatch{Path: "/record"}, Profile: "record"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	gateway.ServeDataHTTP(recorder, httptest.NewRequest(http.MethodPost, "/record", strings.NewReader("{}")))
+	if recorder.Code != http.StatusNotImplemented || !strings.Contains(recorder.Body.String(), "record_not_configured") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

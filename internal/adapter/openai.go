@@ -270,6 +270,10 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 			continue
 		}
 		converted, role, extras := anthropicMessageToOpenAI(m)
+		// Anthropic may combine tool_result blocks with follow-up user
+		// content. OpenAI requires tool-role messages immediately after the
+		// assistant tool_calls, before that user content.
+		out["messages"] = append(asSlice(out["messages"]), extras...)
 		if role != "" {
 			if message, ok := converted.(map[string]any); ok {
 				// A complete OpenAI message (assistant with tool_calls).
@@ -281,7 +285,6 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 				})
 			}
 		}
-		out["messages"] = append(asSlice(out["messages"]), extras...)
 	}
 	b, contentType, err := encodeJSON(out)
 	if err != nil {
@@ -442,29 +445,89 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 	}
 	choices := asSlice(body["choices"])
 	text := ""
+	var toolCalls []any
 	if len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
 			if msg, ok := choice["message"].(map[string]any); ok {
 				text = asString(msg["content"])
+				toolCalls = asSlice(msg["tool_calls"])
 			}
 		}
 	}
 	result := chat.Clone()
+	responseID := responsesResponseID(asString(body["id"]))
+	if strings.HasPrefix(responseID, "chatcmpl_") {
+		responseID = "resp_" + strings.TrimPrefix(responseID, "chatcmpl_")
+	}
+	if responseID == "" {
+		responseID = "resp-gateway"
+	}
 	responseModel := body["model"]
 	if responseModel == nil {
 		responseModel = "gateway"
 	}
-	result.Body, _ = json.Marshal(map[string]any{
-		"id":     body["id"],
-		"object": "response",
-		"status": "completed",
-		"model":  responseModel,
-		"output": []any{map[string]any{
-			"type": "message", "role": "assistant",
-			"content": []any{map[string]any{"type": "output_text", "text": text}},
-		}},
-		"usage": body["usage"],
-	})
+	createdAt := body["created"]
+	if createdAt == nil {
+		createdAt = time.Now().Unix()
+	}
+	output := make([]any, 0, 1+len(toolCalls))
+	if text != "" || len(toolCalls) == 0 {
+		output = append(output, map[string]any{
+			"id": nextResponsesItemID(), "type": "message", "status": "completed", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+		})
+	}
+	for index, raw := range toolCalls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, _ := call["function"].(map[string]any)
+		callID := asString(call["id"])
+		itemID := "fc_" + callID
+		if callID == "" {
+			callID = fmt.Sprintf("call_gateway_%d", index)
+			itemID = fmt.Sprintf("fc_gateway_%d", index)
+		}
+		output = append(output, map[string]any{
+			"id": itemID, "type": "function_call", "status": "completed", "call_id": callID,
+			"name": fn["name"], "arguments": asString(fn["arguments"]),
+		})
+	}
+	usage := body["usage"]
+	if chatUsage, ok := body["usage"].(map[string]any); ok {
+		inputTokens := numberOrZero(chatUsage["prompt_tokens"])
+		outputTokens := numberOrZero(chatUsage["completion_tokens"])
+		totalTokens, present := numberValueOK(chatUsage["total_tokens"])
+		if !present {
+			totalTokens = inputTokens + outputTokens
+		}
+		usage = map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": totalTokens}
+	}
+	status := "completed"
+	response := map[string]any{
+		"id": responseID, "object": "response", "status": status, "model": responseModel,
+		"output": output, "created_at": createdAt,
+	}
+	if len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok && asString(choice["finish_reason"]) == "length" {
+			status = "incomplete"
+			response["status"] = status
+			response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+			for _, raw := range output {
+				if item, ok := raw.(map[string]any); ok {
+					item["status"] = status
+				}
+			}
+		}
+	}
+	if text != "" {
+		response["output_text"] = text
+	}
+	if usage != nil {
+		response["usage"] = usage
+	}
+	result.Body, _ = json.Marshal(response)
 	result.Protocol = "openai-responses"
 	return result, nil
 }
@@ -629,8 +692,8 @@ func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
 	role := asString(m["role"])
 	switch role {
 	case "user":
-		// tool_result blocks become their own tool-role messages appended
-		// after the (remaining) user content.
+		// tool_result blocks become their own tool-role messages. The caller
+		// emits them before any remaining user follow-up content.
 		var results []any
 		var rest []any
 		for _, raw := range asSlice(m["content"]) {
@@ -639,10 +702,11 @@ func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
 				continue
 			}
 			if asString(part["type"]) == "tool_result" {
+				toolContent := anthropicContentToOpenAI(part["content"])
 				results = append(results, map[string]any{
 					"role":         "tool",
 					"tool_call_id": part["tool_use_id"],
-					"content":      contentText(part["content"]),
+					"content":      toolContent,
 				})
 				continue
 			}
@@ -830,18 +894,26 @@ func responsesInputToMessages(input, instructions any) []any {
 		switch asString(item["type"]) {
 		case "function_call":
 			// A previous assistant tool call, replayed as history.
+			callID := item["call_id"]
+			if asString(callID) == "" {
+				callID = item["id"]
+			}
 			result = append(result, map[string]any{
 				"role": "assistant",
 				"content": []any{map[string]any{
-					"type": "tool_use", "id": item["call_id"], "name": item["name"],
+					"type": "tool_use", "id": callID, "name": item["name"],
 					"input": decodeJSONObject(asString(item["arguments"])),
 				}},
 			})
 		case "function_call_output":
+			callID := item["call_id"]
+			if asString(callID) == "" {
+				callID = item["id"]
+			}
 			result = append(result, map[string]any{
 				"role": "user",
 				"content": []any{map[string]any{
-					"type": "tool_result", "tool_use_id": item["call_id"],
+					"type": "tool_result", "tool_use_id": callID,
 					"content": item["output"],
 				}},
 			})

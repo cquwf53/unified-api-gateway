@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -45,8 +48,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	var selectedRoute *config.Route
 	upstreamName := ""
 	status := http.StatusSwitchingProtocols
+	stage, code := "", ""
 	defer func() {
-		s.observe(requestID, started, r, selectedRoute, profile, upstreamName, status, "", "")
+		s.observe(snapshot.Config, requestID, started, r, selectedRoute, profile, upstreamName, status, stage, code)
 	}()
 
 	cfg := snapshot.Config
@@ -72,7 +76,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	profile, selectedRoute, err = route.SelectProfile(cfg, match)
 	if err != nil {
 		status = http.StatusNotFound
-		if err == route.ErrProfileForbidden {
+		if errors.Is(err, route.ErrProfileForbidden) {
 			status = http.StatusForbidden
 		}
 		s.writeError(w, status, "route", "websocket_profile_failed", err.Error(), requestID)
@@ -112,7 +116,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	// per-profile HTTP semaphore: a pile of idle sockets must not starve
 	// request concurrency. Rate limiting and the breaker still apply at
 	// establishment time.
-	rt := pinned.runtimes[profile.Name]
+	rt := pinned.runtimes[profileRuntimeID(*profile)]
 	release, rejection := rt.beginWebsocketPolicy(r.Context(), r.Method, r.Header, s.wsSlots())
 	if rejection != nil {
 		if rejection.retryAfter > 0 {
@@ -127,12 +131,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	base, err := url.Parse(upstream.EffectiveURL())
 	if err != nil {
 		status = http.StatusBadGateway
-		s.writeError(w, status, "upstream", "websocket_upstream_invalid", err.Error(), requestID)
+		s.writeError(w, status, "upstream", "websocket_upstream_invalid", "websocket upstream URL is invalid", requestID)
 		return
 	}
 	base.Scheme = websocketScheme(base.Scheme)
 	base.Path = joinURLPath(base.Path, r.URL.Path)
-	base.RawQuery = r.URL.RawQuery
+	base.RawQuery = joinRawQuery(base.RawQuery, r.URL.RawQuery)
 	requestHeaders := filteredRequestHeaders(r.Header)
 	applyUpstreamAuth(requestHeaders, cfg, upstream)
 	requestHeaders.Set("X-Gateway-Request-Id", requestID)
@@ -142,16 +146,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	}
 	upstreamConn, upstreamResponse, err := dialer.DialContext(r.Context(), base.String(), requestHeaders)
 	if err != nil {
-		message := err.Error()
+		message := "websocket upstream connection failed"
 		if upstreamResponse != nil {
 			message = fmt.Sprintf("upstream returned %s", upstreamResponse.Status)
+			if upstreamResponse.Body != nil {
+				_, _ = io.Copy(io.Discard, upstreamResponse.Body)
+				_ = upstreamResponse.Body.Close()
+			}
 		}
 		rt.recordUpstreamResult(false)
 		status = http.StatusBadGateway
+		stage, code = "upstream", "websocket_dial_failed"
 		s.writeError(w, status, "upstream", "websocket_dial_failed", message, requestID)
 		return
 	}
-	rt.recordUpstreamResult(true)
 	defer upstreamConn.Close()
 	negotiated := []string{}
 	if upstreamResponse != nil {
@@ -167,9 +175,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	if err != nil {
 		// Upgrade already wrote the error response.
 		status = http.StatusInternalServerError
+		stage, code = "client", "websocket_upgrade_failed"
 		return
 	}
 	defer clientConn.Close()
+	// Resolve a half-open probe after both handshakes, but do not clear
+	// closed-state failure history until the connection itself ends cleanly.
+	rt.breaker.recordProbeSuccess()
 	const wsReadLimit = 8 << 20
 	const wsIdleTimeout = 10 * time.Minute
 	clientConn.SetReadLimit(wsReadLimit)
@@ -181,40 +193,94 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	}
 	refreshRead(clientConn)
 	refreshRead(upstreamConn)
-	writeDeadline := func() time.Time { return time.Now().Add(30 * time.Second) }
+	clientWriter := &lockedWebSocketWriter{conn: clientConn}
+	upstreamWriter := &lockedWebSocketWriter{conn: upstreamConn}
 	// Ping handlers answer with a pong (peers use it for liveness) and
-	// refresh that connection's own idle deadline.
-	pongHandler := func(conn *websocket.Conn) func(string) error {
-		return func(appData string) error {
-			refreshRead(conn)
-			_ = conn.WriteControl(websocket.PongMessage, []byte(appData), writeDeadline())
-			return nil
-		}
-	}
-	clientConn.SetPingHandler(pongHandler(clientConn))
-	upstreamConn.SetPingHandler(pongHandler(upstreamConn))
+	// refresh that connection's own idle deadline. Control and data writes
+	// share one lock per connection.
+	clientConn.SetPongHandler(func(string) error {
+		refreshRead(clientConn)
+		return nil
+	})
+	upstreamConn.SetPongHandler(func(string) error {
+		refreshRead(upstreamConn)
+		return nil
+	})
+	clientConn.SetPingHandler(func(appData string) error {
+		refreshRead(clientConn)
+		return clientWriter.writeControl(websocket.PongMessage, []byte(appData))
+	})
+	upstreamConn.SetPingHandler(func(appData string) error {
+		refreshRead(upstreamConn)
+		return upstreamWriter.writeControl(websocket.PongMessage, []byte(appData))
+	})
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var once sync.Once
 	closeBoth := func() { once.Do(func() { _ = clientConn.Close(); _ = upstreamConn.Close(); cancel() }) }
-	copyFrames := func(dst, src *websocket.Conn) {
-		defer closeBoth()
+	type wsCopyResult struct {
+		upstreamFault bool
+		err           error
+	}
+	results := make(chan wsCopyResult, 2)
+	copyFrames := func(dstWriter *lockedWebSocketWriter, src *websocket.Conn, sourceIsUpstream bool) {
+		var result wsCopyResult
 		for {
 			messageType, payload, readErr := src.ReadMessage()
 			if readErr != nil {
-				return
+				result.err = readErr
+				result.upstreamFault = sourceIsUpstream
+				break
 			}
 			refreshRead(src)
-			_ = dst.SetWriteDeadline(writeDeadline())
-			if writeErr := dst.WriteMessage(messageType, payload); writeErr != nil {
-				return
+			if writeErr := dstWriter.writeMessage(messageType, payload); writeErr != nil {
+				result.err = writeErr
+				result.upstreamFault = !sourceIsUpstream
+				break
 			}
 		}
+		results <- result
+		closeBoth()
 	}
-	go copyFrames(upstreamConn, clientConn)
-	go copyFrames(clientConn, upstreamConn)
+	go copyFrames(upstreamWriter, clientConn, false)
+	go copyFrames(clientWriter, upstreamConn, true)
+	result := <-results
+	if result.upstreamFault && !normalWSClosure(result.err) {
+		rt.recordUpstreamResult(false)
+		stage, code = "upstream", "websocket_connection_failed"
+	} else if normalWSClosure(result.err) {
+		rt.recordUpstreamResult(true)
+	}
 	<-ctx.Done()
+}
+
+// lockedWebSocketWriter serializes data/control writes on one connection.
+type lockedWebSocketWriter struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (w *lockedWebSocketWriter) writeMessage(messageType int, payload []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return err
+	}
+	return w.conn.WriteMessage(messageType, payload)
+}
+
+func (w *lockedWebSocketWriter) writeControl(messageType int, payload []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteControl(messageType, payload, time.Now().Add(30*time.Second))
+}
+
+func normalWSClosure(err error) bool {
+	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }
 
 func websocketScheme(scheme string) string {

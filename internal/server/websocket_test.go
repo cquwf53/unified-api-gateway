@@ -1,9 +1,11 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +115,279 @@ func TestWebSocketUpstreamFailureCountsAsFailure(t *testing.T) {
 	if metrics.RequestsFailed != 1 || metrics.RequestsTotal != 1 {
 		t.Fatalf("metrics=%+v", metrics)
 	}
+}
+
+func TestWebSocketWrappedProfileForbiddenReturns403(t *testing.T) {
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: "http://127.0.0.1:1"}},
+		Profiles: map[string]config.Profile{
+			"one": {Name: "one", Adapter: "transparent", TrafficMode: "live", Upstream: "u"},
+			"two": {Name: "two", Adapter: "transparent", TrafficMode: "live", Upstream: "u"},
+		},
+		Clients: map[string]config.ClientCredential{
+			"client": {Key: "secret", Profiles: []string{"one"}, Upstreams: []string{"u"}},
+		},
+		Routes: []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "one"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/socket", nil)
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	request.Header.Set("X-API-Key", "secret")
+	request.Header.Set("X-Gateway-Profile", "two")
+	gateway.ServeDataHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestWebSocketConcurrentPingAndDataWrites(t *testing.T) {
+	upstreamPong := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var writerMu sync.Mutex
+		conn.SetPongHandler(func(string) error {
+			select {
+			case upstreamPong <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		stopPing := make(chan struct{})
+		defer close(stopPing)
+		go func() {
+			for i := 0; i < 50; i++ {
+				select {
+				case <-stopPing:
+					return
+				default:
+				}
+				writerMu.Lock()
+				_ = conn.WriteControl(websocket.PingMessage, []byte("upstream"), time.Now().Add(time.Second))
+				writerMu.Unlock()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		for {
+			messageType, payload, readErr := conn.ReadMessage()
+			if readErr != nil {
+				return
+			}
+			writerMu.Lock()
+			writeErr := conn.WriteMessage(messageType, payload)
+			writerMu.Unlock()
+			if writeErr != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:  map[string]config.Profile{"ws": {Name: "ws", Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "ws"}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServer := httptest.NewServer(http.HandlerFunc(gateway.ServeDataHTTP))
+	defer gatewayServer.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gatewayServer.URL, "http")+"/socket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	clientPong := make(chan struct{}, 1)
+	conn.SetPongHandler(func(string) error {
+		select {
+		case clientPong <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	for i := 0; i < 50; i++ {
+		if err := conn.WriteControl(websocket.PingMessage, []byte("client"), time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("message-%d", i)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(want)); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(payload) != want {
+			t.Fatalf("echo=%q want=%q", payload, want)
+		}
+	}
+	select {
+	case <-clientPong:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not receive a pong through the gateway")
+	}
+	select {
+	case <-upstreamPong:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not receive a pong through the gateway")
+	}
+}
+
+func TestWebSocketAbnormalUpstreamClosureTripsBreaker(t *testing.T) {
+	drop := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-drop
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:  map[string]config.Profile{"ws": {Name: "ws", Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "ws"}},
+		Policies: map[string]any{
+			"defaults": map[string]any{
+				"circuit_breaker": map[string]any{"failure_threshold": 1, "reset_timeout_ms": 60000},
+			},
+		},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServer := httptest.NewServer(http.HandlerFunc(gateway.ServeDataHTTP))
+	defer gatewayServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/socket"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(drop)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, _ = conn.ReadMessage()
+	_ = conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		breaker := gateway.runtimeFor("ws").breaker
+		breaker.mu.Lock()
+		state := breaker.state
+		breaker.mu.Unlock()
+		if state == breakerOpen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("abnormal upstream closure did not open the breaker")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("open breaker unexpectedly allowed another websocket")
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		if response != nil {
+			defer response.Body.Close()
+		}
+		t.Fatalf("breaker response=%v err=%v", response, err)
+	}
+	response.Body.Close()
+}
+
+func TestWebSocketAbnormalClosuresAccumulatePastOne(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:  map[string]config.Profile{"ws": {Name: "ws", Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "ws"}},
+		Policies: map[string]any{
+			"defaults": map[string]any{
+				"circuit_breaker": map[string]any{"failure_threshold": 2, "reset_timeout_ms": 60000},
+			},
+		},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServer := httptest.NewServer(http.HandlerFunc(gateway.ServeDataHTTP))
+	defer gatewayServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/socket"
+	for attempt := 1; attempt <= 2; attempt++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatalf("attempt %d handshake: %v", attempt, err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, _, _ = conn.ReadMessage()
+		_ = conn.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			breaker := gateway.runtimeFor("ws").breaker
+			breaker.mu.Lock()
+			failures, state := breaker.failures, breaker.state
+			breaker.mu.Unlock()
+			if failures >= attempt || state == breakerOpen {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("attempt %d was not counted: failures=%d state=%d", attempt, failures, state)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("two consecutive abnormal sessions did not open the breaker")
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("breaker response=%v err=%v", response, err)
+	}
+	response.Body.Close()
 }
 
 // TestMetricsTotalEqualsOkPlusFailed fires early-rejected and successful

@@ -3,6 +3,8 @@
 .gomodcache
 data
 bin
+*.exe
+unified-api-gateway
 *.db
 *.db-shm
 *.db-wal

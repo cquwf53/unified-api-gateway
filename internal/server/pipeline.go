@@ -65,7 +65,7 @@ func buildPipelines(cfg *config.Config) map[string]*compiledPipeline {
 // configuration snapshot (for example the preview endpoint).
 func (s *Server) compiledRequestSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
 	if pinned != nil {
-		if pipeline, ok := pinned.pipelines[profile.Name]; ok {
+		if pipeline, ok := pinned.pipelines[profileRuntimeID(profile)]; ok {
 			return pipeline.request
 		}
 	}
@@ -74,9 +74,16 @@ func (s *Server) compiledRequestSteps(pinned *gatewayState, cfg *config.Config, 
 
 func (s *Server) compiledResponseSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
 	if pinned != nil {
-		if pipeline, ok := pinned.pipelines[profile.Name]; ok {
+		if pipeline, ok := pinned.pipelines[profileRuntimeID(profile)]; ok {
 			return pipeline.response
 		}
 	}
 	return compileSteps(resolveSpecs(cfg, profile.AllResponseTransforms()))
+}
+
+func profileRuntimeID(profile config.Profile) string {
+	if profile.RuntimeID != "" {
+		return profile.RuntimeID
+	}
+	return profile.Name
 }

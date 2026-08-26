@@ -30,7 +30,7 @@ func buildUpstreamRequest(ctx context.Context, cfg *config.Config, upstream conf
 	}
 	target := *base
 	target.Path = joinURLPath(base.Path, in.Path)
-	target.RawQuery = in.Query.Encode()
+	target.RawQuery = joinRawQuery(base.RawQuery, in.Query.Encode())
 	request, err := http.NewRequestWithContext(ctx, in.Method, target.String(), strings.NewReader(string(in.Body)))
 	if err != nil {
 		return nil, err
@@ -42,6 +42,18 @@ func buildUpstreamRequest(ctx context.Context, cfg *config.Config, upstream conf
 		request.ContentLength = int64(len(in.Body))
 	}
 	return request, nil
+}
+
+func joinRawQuery(baseQuery, requestQuery string) string {
+	baseQuery = strings.Trim(baseQuery, "&")
+	requestQuery = strings.Trim(requestQuery, "&")
+	if baseQuery == "" {
+		return requestQuery
+	}
+	if requestQuery == "" {
+		return baseQuery
+	}
+	return baseQuery + "&" + requestQuery
 }
 
 // streamUpstream forwards a transparent streaming response as it arrives.
@@ -241,8 +253,9 @@ func applyUpstreamAuth(header http.Header, cfg *config.Config, upstream config.U
 }
 
 func copyResponseHeaders(w http.ResponseWriter, headers http.Header) {
+	connectionHeaders := connectionHeaderNames(headers)
 	for key, values := range headers {
-		if isHopByHopHeader(key) {
+		if isHopByHopHeader(key) || connectionHeaders[strings.ToLower(key)] || strings.EqualFold(key, "Set-Cookie") {
 			continue
 		}
 		for _, value := range values {
