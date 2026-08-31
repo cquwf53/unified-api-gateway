@@ -38,6 +38,26 @@ var KnownAdapters = map[string]bool{
 	"openai-responses-to-anthropic": true,
 }
 
+// KnownContracts lists the built-in wire contracts accepted by profile
+// client_contract and upstream_contract. Empty contracts remain valid for
+// compatibility with profiles that do not declare a protocol explicitly.
+var KnownContracts = map[string]bool{
+	"generic-json":       true,
+	"openai-chat":        true,
+	"openai-responses":   true,
+	"anthropic-messages": true,
+}
+
+// adapterContractDirection describes the client-to-upstream contract direction
+// implemented by a semantic adapter. Transparent profiles are handled
+// separately because they may omit contracts or use the same contract on both
+// sides.
+var adapterContractDirection = map[string][2]string{
+	"openai-chat-to-anthropic":      {"openai-chat", "anthropic-messages"},
+	"anthropic-to-openai-chat":      {"anthropic-messages", "openai-chat"},
+	"openai-responses-to-anthropic": {"openai-responses", "anthropic-messages"},
+}
+
 // Config is the complete user-facing gateway configuration.
 type Config struct {
 	Version         int                                `yaml:"version,omitempty" json:"version"`
@@ -276,6 +296,57 @@ type Credential struct {
 	Ref   string `yaml:"ref,omitempty" json:"ref,omitempty"`
 	Type  string `yaml:"type,omitempty" json:"type,omitempty"`
 	Env   string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// ValidatePersistable rejects literal credentials before a configuration is
+// written to version history. Runtime-only configurations may still use
+// literals for local development, but rollbackable history stores references
+// rather than plaintext secrets.
+func (c *Config) ValidatePersistable() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	var errs []string
+	for id, credential := range c.Credentials {
+		if strings.TrimSpace(credential.Value) != "" {
+			errs = append(errs, fmt.Sprintf("credential %q: value is a literal secret; use env/ref", id))
+		}
+		if ref := strings.TrimSpace(credential.Ref); ref != "" && !isSecretReference(ref) && strings.TrimSpace(credential.Env) == "" && (strings.EqualFold(credential.Type, "") || !strings.EqualFold(credential.Type, "env") && !strings.EqualFold(credential.Type, "api_key")) {
+			errs = append(errs, fmt.Sprintf("credential %q: ref is a literal secret; use env:NAME or env", id))
+		}
+	}
+	for id, client := range c.Clients {
+		if strings.TrimSpace(client.Key) != "" {
+			errs = append(errs, fmt.Sprintf("client %q: key is a literal secret; use key_env or env: key_ref", id))
+		}
+		if ref := strings.TrimSpace(client.KeyRef); ref != "" && !isSecretReference(ref) {
+			errs = append(errs, fmt.Sprintf("client %q: key_ref is a literal secret; use env:NAME", id))
+		}
+	}
+	for id, upstream := range c.Upstreams {
+		for header, value := range upstream.Headers {
+			if persistSensitiveHeader(header) && strings.TrimSpace(value) != "" && !isSecretReference(strings.TrimSpace(value)) {
+				errs = append(errs, fmt.Sprintf("upstream %q: sensitive header %q is literal; use env:NAME", id, header))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func isSecretReference(value string) bool {
+	return strings.HasPrefix(value, "env:") || strings.HasPrefix(value, "$ENV:")
+}
+
+func persistSensitiveHeader(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	switch normalized {
+	case "authorization", "proxy-authorization", "x-api-key", "x-admin-token", "cookie", "set-cookie":
+		return true
+	}
+	return strings.Contains(normalized, "api-key") || strings.HasSuffix(normalized, "-token") || strings.HasSuffix(normalized, "-secret") || strings.HasSuffix(normalized, "-password")
 }
 
 type Limits struct {
@@ -578,10 +649,31 @@ func (c *Config) Validate() error {
 		// Reject unknown adapter names at load time: a typo here would
 		// otherwise pass every precheck and turn into runtime 422s for the
 		// whole profile the moment it is activated.
-		if adapterName := strings.ToLower(strings.TrimSpace(p.Adapter)); adapterName != "" && !KnownAdapters[adapterName] {
+		adapterName := strings.ToLower(strings.TrimSpace(p.Adapter))
+		if adapterName == "" {
+			adapterName = "transparent"
+		}
+		if !KnownAdapters[adapterName] {
 			errs = append(errs, fmt.Sprintf("profile %q: unknown adapter %q (known: %s)", name, p.Adapter, strings.Join(sortedAdapterNames(), ", ")))
 		}
+		clientContract := strings.ToLower(strings.TrimSpace(p.ClientContract))
+		upstreamContract := strings.ToLower(strings.TrimSpace(p.UpstreamContract))
+		if clientContract != "" && !KnownContracts[clientContract] {
+			errs = append(errs, fmt.Sprintf("profile %q: unknown client_contract %q (known: %s)", name, p.ClientContract, strings.Join(sortedContractNames(), ", ")))
+		}
+		if upstreamContract != "" && !KnownContracts[upstreamContract] {
+			errs = append(errs, fmt.Sprintf("profile %q: unknown upstream_contract %q (known: %s)", name, p.UpstreamContract, strings.Join(sortedContractNames(), ", ")))
+		}
+		if expected, semantic := adapterContractDirection[adapterName]; semantic {
+			if clientContract != expected[0] || upstreamContract != expected[1] {
+				errs = append(errs, fmt.Sprintf("profile %q: adapter %q requires client_contract %q and upstream_contract %q (got %q and %q)", name, adapterName, expected[0], expected[1], p.ClientContract, p.UpstreamContract))
+			}
+		} else if adapterName == "transparent" && clientContract != "" && upstreamContract != "" && clientContract != upstreamContract {
+
+			errs = append(errs, fmt.Sprintf("profile %q: transparent adapter requires matching contracts, got client_contract %q and upstream_contract %q", name, p.ClientContract, p.UpstreamContract))
+		}
 		mode := strings.ToLower(strings.TrimSpace(p.TrafficMode))
+
 		if mode == "" {
 			mode = "live"
 		}
@@ -655,6 +747,9 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Sprintf("route %q: match.%s: %v", routeLabel(r, i), field, err))
 			}
 		}
+		if r.Match.PathPrefix != "" && !strings.HasPrefix(r.Match.PathPrefix, "/") {
+			errs = append(errs, fmt.Sprintf("route %q: match.path_prefix must start with /", routeLabel(r, i)))
+		}
 		if strings.ContainsAny(r.Match.Path, "*?[") {
 			if _, err := stdpath.Match(r.Match.Path, ""); err != nil {
 				errs = append(errs, fmt.Sprintf("route %q: match.path: invalid glob: %v", routeLabel(r, i), err))
@@ -714,6 +809,9 @@ func (c *Config) Validate() error {
 		if err := spec.Validate(); err != nil {
 			errs = append(errs, fmt.Sprintf("transform %q: %v", name, err))
 		}
+		if err := validateTransformReferences(c.Transforms, spec, []string{name}); err != nil {
+			errs = append(errs, fmt.Sprintf("transform %q: %v", name, err))
+		}
 	}
 	if c.Limits.MaxBodyBytes < 0 {
 		errs = append(errs, "limits.max_body_bytes must be non-negative")
@@ -740,6 +838,27 @@ func (c *Config) Validate() error {
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func validateTransformReferences(available map[string]transform.TransformSpec, spec transform.TransformSpec, stack []string) error {
+	if name := strings.TrimSpace(spec.Name); name != "" {
+		for _, previous := range stack {
+			if previous == name {
+				return fmt.Errorf("transform reference cycle: %s", strings.Join(append(stack, name), " -> "))
+			}
+		}
+		next, ok := available[name]
+		if !ok {
+			return fmt.Errorf("named transform %q not found", name)
+		}
+		return validateTransformReferences(available, next, append(stack, name))
+	}
+	for index, step := range spec.Steps {
+		if err := validateTransformReferences(available, step, stack); err != nil {
+			return fmt.Errorf("step %d: %w", index, err)
+		}
 	}
 	return nil
 }
@@ -933,6 +1052,15 @@ func allowedScheme(s string) bool {
 func sortedAdapterNames() []string {
 	names := make([]string, 0, len(KnownAdapters))
 	for name := range KnownAdapters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedContractNames() []string {
+	names := make([]string, 0, len(KnownContracts))
+	for name := range KnownContracts {
 		names = append(names, name)
 	}
 	sort.Strings(names)

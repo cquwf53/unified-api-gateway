@@ -28,19 +28,21 @@ type RequestRecord struct {
 }
 
 type Snapshot struct {
-	RequestsTotal  uint64          `json:"requests_total"`
-	RequestsOK     uint64          `json:"requests_ok"`
-	RequestsFailed uint64          `json:"requests_failed"`
-	Active         int64           `json:"active_requests"`
-	Recent         []RequestRecord `json:"recent"`
+	RequestsTotal      uint64          `json:"requests_total"`
+	RequestsOK         uint64          `json:"requests_ok"`
+	RequestsFailed     uint64          `json:"requests_failed"`
+	AuditEventsDropped uint64          `json:"audit_events_dropped"`
+	Active             int64           `json:"active_requests"`
+	Recent             []RequestRecord `json:"recent"`
 }
 
 type Metrics struct {
-	total  atomic.Uint64
-	ok     atomic.Uint64
-	fail   atomic.Uint64
-	active atomic.Int64
-	mu     sync.RWMutex
+	total        atomic.Uint64
+	ok           atomic.Uint64
+	fail         atomic.Uint64
+	auditDropped atomic.Uint64
+	active       atomic.Int64
+	mu           sync.RWMutex
 	// recent is a ring buffer: new records overwrite the oldest slot instead
 	// of re-allocating the whole slice on every observation.
 	recent []RequestRecord
@@ -61,6 +63,8 @@ func (m *Metrics) Begin() func() {
 	m.active.Add(1)
 	return func() { m.active.Add(-1) }
 }
+
+func (m *Metrics) AuditDropped() { m.auditDropped.Add(1) }
 
 func (m *Metrics) Observe(record RequestRecord) {
 	// 101 Switching Protocols is the success status of a proxied WebSocket
@@ -90,17 +94,18 @@ func (m *Metrics) Snapshot() Snapshot {
 	}
 	m.mu.RUnlock()
 	return Snapshot{
-		RequestsTotal:  m.total.Load(),
-		RequestsOK:     m.ok.Load(),
-		RequestsFailed: m.fail.Load(),
-		Active:         m.active.Load(),
-		Recent:         out,
+		RequestsTotal:      m.total.Load(),
+		RequestsOK:         m.ok.Load(),
+		RequestsFailed:     m.fail.Load(),
+		AuditEventsDropped: m.auditDropped.Load(),
+		Active:             m.active.Load(),
+		Recent:             out,
 	}
 }
 
 func (m *Metrics) Prometheus() string {
 	s := m.Snapshot()
-	return fmt.Sprintf("# TYPE gateway_requests_total counter\ngateway_requests_total %d\n# TYPE gateway_requests_ok counter\ngateway_requests_ok %d\n# TYPE gateway_requests_failed counter\ngateway_requests_failed %d\n# TYPE gateway_active_requests gauge\ngateway_active_requests %d\n", s.RequestsTotal, s.RequestsOK, s.RequestsFailed, s.Active)
+	return fmt.Sprintf("# TYPE gateway_requests_total counter\ngateway_requests_total %d\n# TYPE gateway_requests_ok counter\ngateway_requests_ok %d\n# TYPE gateway_requests_failed counter\ngateway_requests_failed %d\n# TYPE gateway_audit_events_dropped_total counter\ngateway_audit_events_dropped_total %d\n# TYPE gateway_active_requests gauge\ngateway_active_requests %d\n", s.RequestsTotal, s.RequestsOK, s.RequestsFailed, s.AuditEventsDropped, s.Active)
 }
 
 func (m *Metrics) SortRecentByDuration() []RequestRecord {

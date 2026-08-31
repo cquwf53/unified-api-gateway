@@ -9,4 +9,5 @@ unified-api-gateway
 *.db-shm
 *.db-wal
 *.log
+coverage.out
 tmp

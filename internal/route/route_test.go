@@ -47,6 +47,47 @@ func TestMatchHostQueryAndRegex(t *testing.T) {
 	}
 }
 
+func TestHostWithoutPortNormalizesIPv4AndIPv6(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"api.example.com:443", "api.example.com"},
+		{"API.EXAMPLE.COM.", "api.example.com"},
+		{"[2001:0DB8:0:0:0:0:0:1]:8443", "2001:db8::1"},
+		{"[2001:DB8::1]", "2001:db8::1"},
+		{"2001:0DB8:0:0:0:0:0:1", "2001:db8::1"},
+	}
+	for _, test := range tests {
+		if got := hostWithoutPort(test.input); got != test.want {
+			t.Errorf("hostWithoutPort(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestMatchBracketedIPv6Host(t *testing.T) {
+	r := config.Route{Match: config.RouteMatch{Host: "2001:db8::1"}}
+	for _, host := range []string{"[2001:0DB8::1]:443", "[2001:db8::1]", "2001:db8::1"} {
+		if !Match(r, Request{Host: host}) {
+			t.Errorf("route did not match IPv6 host %q", host)
+		}
+	}
+}
+
+func TestResolveProfileReturnsRuntimeIDNotDisplayName(t *testing.T) {
+	cfg := &config.Config{
+		Version:         1,
+		Profiles:        map[string]config.Profile{"runtime-key": {Name: "Display Name"}},
+		DefaultsProfile: "runtime-key",
+	}
+	got, err := ResolveProfile(cfg, Request{})
+	if err != nil {
+		t.Fatalf("ResolveProfile() error = %v", err)
+	}
+	if got != "runtime-key" {
+		t.Fatalf("ResolveProfile() = %q, want runtime ID %q", got, "runtime-key")
+	}
+}
+
 func TestExplicitProfileAuthorization(t *testing.T) {
 	allowed := true
 	c := &config.Config{

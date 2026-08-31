@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -45,6 +46,32 @@ type Envelope struct {
 // RawEnvelope is an alias retained for adapter implementations that use the
 // terminology from the gateway design document.
 type RawEnvelope = Envelope
+
+// EffectiveContentType returns the envelope's effective media type. An
+// explicitly populated ContentType takes precedence; otherwise the
+// Content-Type header is used for compatibility with HTTP-shaped callers.
+func EffectiveContentType(env Envelope) string {
+	if contentType := strings.TrimSpace(env.ContentType); contentType != "" {
+		return contentType
+	}
+	if env.Headers == nil {
+		return ""
+	}
+	return strings.TrimSpace(env.Headers.Get("Content-Type"))
+}
+
+// IsJSONContentType reports whether contentType is JSON or an application
+// media type with a +json structured suffix. Media type parameters are parsed
+// and ignored, so values such as application/json; charset=utf-8 are accepted.
+func IsJSONContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(contentType))
+	if err != nil {
+		return false
+	}
+	mediaType = strings.ToLower(mediaType)
+	return mediaType == "application/json" ||
+		(strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json"))
+}
 
 // HeaderSpec describes header changes.  Set replaces an existing value,
 // Add appends a value, Rename is case-insensitive, and Delete removes a key.
@@ -392,7 +419,7 @@ func applySpec(ctx context.Context, spec TransformSpec, env *Envelope) error {
 		}
 	}
 	if hasBodyOps(spec.Body) {
-		if err := applyBody(&env.Body, spec.Body); err != nil {
+		if err := applyBody(&env.Body, EffectiveContentType(*env), spec.Body); err != nil {
 			return err
 		}
 	}
@@ -484,9 +511,12 @@ func applyQuery(q url.Values, spec QuerySpec) {
 	}
 }
 
-func applyBody(raw *[]byte, spec BodySpec) error {
+func applyBody(raw *[]byte, contentType string, spec BodySpec) error {
 	if raw == nil {
 		return &TransformError{Stage: "body", Code: "nil_body"}
+	}
+	if strings.TrimSpace(contentType) != "" && !IsJSONContentType(contentType) {
+		return &TransformError{Stage: "body", Code: "unsupported_content_type", Err: fmt.Errorf("body transform requires JSON content type, got %q", contentType)}
 	}
 	if len(bytes.TrimSpace(*raw)) == 0 {
 		return &TransformError{Stage: "body", Code: "invalid_json", Err: errors.New("empty body")}

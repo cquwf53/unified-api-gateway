@@ -120,22 +120,36 @@ func New(options Options) (*Server, error) {
 		s.auditWG.Add(1)
 		go s.drainAuditEvents()
 	}
-	s.publishState(options.Snapshot)
+	if err := s.publishState(options.Snapshot); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
-// publishState derives runtimes and pipelines for a snapshot and swaps the
-// whole state in one atomic store.
-func (s *Server) publishState(snapshot *config.ConfigSnapshot) {
+// publishState derives every runtime view before swapping the single state
+// pointer. A failed pipeline compile must never publish a partially enforced
+// configuration.
+func (s *Server) publishState(snapshot *config.ConfigSnapshot) error {
+	if snapshot == nil || snapshot.Config == nil {
+		return errors.New("server: config snapshot is required")
+	}
 	cfg := snapshot.Config
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("server: invalid configuration: %w", err)
+	}
+	pipelines, err := buildPipelines(cfg)
+	if err != nil {
+		return err
+	}
 	state := &gatewayState{
 		snapshot:  snapshot,
 		runtimes:  s.buildRuntimes(cfg),
-		pipelines: buildPipelines(cfg),
+		pipelines: pipelines,
 		policy:    decodePolicySet(cfg),
 	}
 	s.warnInsecureUpstreams(cfg)
 	s.state.Store(state)
+	return nil
 }
 
 // clientKey identifies a derived HTTP client by the properties that affect
@@ -402,6 +416,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// whole request: a concurrent activation must not mix versions mid-flight
 	// or strip policy enforcement from an in-flight request.
 	pinned := s.state.Load()
+	if pinned == nil {
+		observeFailure(http.StatusServiceUnavailable, "config", "not_ready", "no active configuration")
+		return
+	}
 	snapshot := pinned.snapshot
 	if snapshot == nil || snapshot.Config == nil {
 		observeFailure(http.StatusServiceUnavailable, "config", "not_ready", "no active configuration")
@@ -412,7 +430,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// fail answers and observes in one step so every early return keeps
 	// requests_total == requests_ok + requests_failed.
 	fail := func(status int, stage, code, message string) {
-		s.writeError(w, status, stage, code, message, requestID)
+		s.writeErrorForProfile(w, status, stage, code, message, requestID, profile)
 		s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, status, stage, code)
 	}
 	w.Header().Set("X-Request-Id", requestID)
@@ -517,13 +535,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	in := transform.Envelope{
-		Method:  r.Method,
-		Scheme:  requestScheme(r),
-		Host:    r.Host,
-		Path:    r.URL.Path,
-		Query:   r.URL.Query(),
-		Headers: r.Header.Clone(),
-		Body:    body,
+		Method:      r.Method,
+		Scheme:      requestScheme(r),
+		Host:        r.Host,
+		Path:        r.URL.Path,
+		Query:       r.URL.Query(),
+		Headers:     r.Header.Clone(),
+		Body:        body,
+		ContentType: r.Header.Get("Content-Type"),
 		Metadata: map[string]any{
 			"request_id":    requestID,
 			"client_id":     clientID,
@@ -550,6 +569,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			fail(http.StatusBadGateway, "transform", "mock_response_failed", safeError(err))
 			return
 		}
+		if err := enforceResponseLimit(cfg, *profile, response); err != nil {
+			fail(http.StatusBadGateway, "egress", "response_too_large", safeError(err))
+			return
+		}
 		s.writeEnvelope(w, response)
 		s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, response.StatusCode, "", "")
 		return
@@ -560,11 +583,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		clientID, tenant, configID := recordingDimensions(prepared)
-		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(profile.Name, prepared), clientID, tenant, configID)
+		recording, replayErr := s.store.GetRecording(r.Context(), recordingKey(recordingNamespace(*profile), prepared), clientID, tenant, configID)
 		if replayErr == nil {
 			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
 			response.Headers = response.Headers.Clone()
 			response.Headers.Set("X-Gateway-Replay", "exact")
+			if err := enforceResponseLimit(cfg, *profile, response); err != nil {
+				fail(http.StatusBadGateway, "egress", "response_too_large", safeError(err))
+				return
+			}
 			s.writeEnvelope(w, response)
 			s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, recording.StatusCode, "", "")
 			return
@@ -572,10 +599,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Exact hashes rarely match twice for chat traffic, so fall back to
 		// the most recent recording of the same profile, method and path and
 		// label the response so clients can tell.
-		if recording, fuzzyErr := s.store.LatestRecordingForProfile(r.Context(), profile.Name, prepared.Method, prepared.Path, clientID, tenant, configID); fuzzyErr == nil {
+		if recording, fuzzyErr := s.store.LatestRecordingForProfile(r.Context(), recordingNamespace(*profile), prepared.Method, prepared.Path, clientID, tenant, configID); fuzzyErr == nil {
 			response := transform.Envelope{StatusCode: recording.StatusCode, Headers: headersFromValues(recording.Headers), Body: recording.Body, ContentType: recording.ContentType}
 			response.Headers = response.Headers.Clone()
 			response.Headers.Set("X-Gateway-Replay", "approximate")
+			if err := enforceResponseLimit(cfg, *profile, response); err != nil {
+				fail(http.StatusBadGateway, "egress", "response_too_large", safeError(err))
+				return
+			}
 			s.writeEnvelope(w, response)
 			s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, recording.StatusCode, "", "")
 			return
@@ -588,10 +619,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "live" && wantsStreamFromEnvelope(prepared) && canDirectStream(*profile) {
-		status, headersSent, streamErr := s.streamUpstream(r.Context(), cfg, upstream, *profile, prepared, requestID, w)
+		status, headersSent, streamErr := s.streamUpstream(r.Context(), pinned, cfg, upstream, *profile, prepared, requestID, w)
 		recordStreamResult(rt, headersSent, status, streamErr)
 		if streamErr != nil && !headersSent {
-			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
+			s.writeErrorForProfile(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID, profile)
 		}
 		s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, status, streamErrorStage(headersSent, streamErr), streamErrorCode(streamErr))
 		return
@@ -604,7 +635,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		status, headersSent, streamErr := s.streamTranslatedUpstream(r.Context(), pinned, cfg, upstream, *profile, prepared, requestID, w)
 		recordStreamResult(rt, headersSent, status, streamErr)
 		if streamErr != nil && !headersSent {
-			s.writeError(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID)
+			s.writeErrorForProfile(w, upstreamStatus(streamErr), "upstream", upstreamCode(streamErr), safeError(streamErr), requestID, profile)
 		}
 		s.observe(cfg, requestID, started, r, selectedRoute, profile, upstreamName, status, streamErrorStage(headersSent, streamErr), streamErrorCode(streamErr))
 		return
@@ -633,9 +664,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadGateway, "transform", "response_transform_failed", safeError(err))
 		return
 	}
+	if err := enforceResponseLimit(cfg, *profile, response); err != nil {
+		fail(http.StatusBadGateway, "egress", "response_too_large", safeError(err))
+		return
+	}
 	if mode == "record" && s.store != nil {
 		recordingClient, recordingTenant, recordingConfig := recordingDimensions(prepared)
-		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(profile.Name, prepared), ProfileID: profile.Name, Method: prepared.Method, Path: prepared.Path, ClientID: recordingClient, Tenant: recordingTenant, ConfigID: recordingConfig, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
+		if saveErr := s.store.SaveRecording(r.Context(), store.Recording{Key: recordingKey(recordingNamespace(*profile), prepared), ProfileID: recordingNamespace(*profile), Method: prepared.Method, Path: prepared.Path, ClientID: recordingClient, Tenant: recordingTenant, ConfigID: recordingConfig, StatusCode: response.StatusCode, ContentType: response.ContentType, Headers: redactHeadersWith(response.Headers, configuredRedactions(cfg)), Body: response.Body}); saveErr != nil {
 			fail(http.StatusInternalServerError, "record", "record_save_failed", saveErr.Error())
 			return
 		}
@@ -645,7 +680,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func canDirectStream(profile config.Profile) bool {
-	return strings.EqualFold(profile.Adapter, "transparent") && len(profile.AllResponseTransforms()) == 0
+	if !strings.EqualFold(profile.Adapter, "transparent") || len(profile.AllResponseTransforms()) != 0 {
+		return false
+	}
+	if !profile.IsStreamSafe() {
+		return false
+	}
+	clientContract := strings.ToLower(strings.TrimSpace(profile.ClientContract))
+	upstreamContract := strings.ToLower(strings.TrimSpace(profile.UpstreamContract))
+	return clientContract == "" || upstreamContract == "" || clientContract == upstreamContract
 }
 
 // methodAllowed enforces profile.allowed_methods when it is set; an empty
@@ -718,6 +761,10 @@ func (s *Server) prepareRequest(ctx context.Context, pinned *gatewayState, cfg *
 		return transform.Envelope{}, err
 	}
 	in.Method, in.Body, in.Headers = converted.Method, converted.Body, converted.Header
+	in.ContentType = converted.ContentType
+	if in.ContentType == "" {
+		in.ContentType = in.Headers.Get("Content-Type")
+	}
 	if converted.URL != nil && converted.URL.Path != "" {
 		in.Path = converted.URL.Path
 	}
@@ -746,7 +793,7 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 	if !ok {
 		return transform.Envelope{}, fmt.Errorf("unknown adapter %q", profile.Adapter)
 	}
-	if strings.Contains(strings.ToLower(response.ContentType), "text/event-stream") {
+	if strings.Contains(strings.ToLower(transform.EffectiveContentType(response)), "text/event-stream") {
 		events, err := adapter.ParseSSE(bytes.NewReader(response.Body))
 		if err != nil {
 			return transform.Envelope{}, fmt.Errorf("parse upstream SSE: %w", err)
@@ -775,11 +822,13 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 			response = changed
 		}
 		if clientWantsStream {
-			// The transform chain may have rewritten the JSON; re-wrap the
-			// final body as a single-frame SSE stream with a terminator.
+			streamBody, err := adapter.EncodeBufferedSSE(response.Body, profile.ClientContract)
+			if err != nil {
+				return transform.Envelope{}, err
+			}
 			response.Headers.Set("Content-Type", "text/event-stream")
 			response.ContentType = "text/event-stream"
-			response.Body = adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(response.Body)}, {Data: "[DONE]"}})
+			response.Body = streamBody
 		}
 		return response, nil
 	}
@@ -796,11 +845,15 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 		}
 		response = changed
 	}
-	if wantsStreamFromEnvelope(in) && !strings.Contains(strings.ToLower(response.ContentType), "event-stream") {
+	if wantsStreamFromEnvelope(in) && !strings.Contains(strings.ToLower(transform.EffectiveContentType(response)), "event-stream") {
+		streamBody, err := adapter.EncodeBufferedSSE(response.Body, profile.ClientContract)
+		if err != nil {
+			return transform.Envelope{}, err
+		}
 		response.Headers = response.Headers.Clone()
 		response.Headers.Set("Content-Type", "text/event-stream")
 		response.ContentType = "text/event-stream"
-		response.Body = adapter.EncodeSSE([]adapter.SSEEvent{{Data: string(response.Body)}, {Data: "[DONE]"}})
+		response.Body = streamBody
 	}
 	return response, nil
 }
@@ -903,7 +956,7 @@ func (s *Server) callUpstream(ctx context.Context, cfg *config.Config, upstream 
 		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_request_failed", err: err}
 	}
 	defer response.Body.Close()
-	return readUpstreamResponse(profile, response)
+	return readUpstreamResponse(cfg, profile, response)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -973,19 +1026,31 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 // stored active marker. Memory is authoritative for the running process;
 // the DB marker only matters for the next boot.
 func (s *Server) commitConfig(snapshot *config.ConfigSnapshot, data []byte, createdBy, description string) error {
+	if snapshot == nil || snapshot.Config == nil {
+		return errors.New("config snapshot is required")
+	}
 	if err := validateRuntimeRequirements(snapshot.Config); err != nil {
 		return err
 	}
+	if s.store != nil {
+		if err := snapshot.Config.ValidatePersistable(); err != nil {
+			return fmt.Errorf("config_not_persistable: %w", err)
+		}
+	}
 	previous := s.state.Load()
-	alreadyActive := previous != nil && previous.snapshot != nil && previous.snapshot.ID == snapshot.ID
 	if s.store != nil {
 		// Save as inactive first. Marking it active here would make a crash
 		// before publishState resurrect a configuration that never ran.
-		if err := s.store.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: createdBy, Active: alreadyActive, SHA256: snapshot.Hash, Description: description, YAML: data}); err != nil {
+		if err := s.store.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: createdBy, SHA256: snapshot.Hash, Description: description, YAML: data}); err != nil {
 			return err
 		}
 	}
-	s.publishState(snapshot)
+	if err := s.publishState(snapshot); err != nil {
+		if previous != nil {
+			s.state.Store(previous)
+		}
+		return fmt.Errorf("publish configuration state: %w", err)
+	}
 	if s.store != nil {
 		if err := s.store.Activate(context.Background(), snapshot.ID); err != nil {
 			// Keep the running and restart state consistent. The newly saved
@@ -997,7 +1062,8 @@ func (s *Server) commitConfig(snapshot *config.ConfigSnapshot, data []byte, crea
 				// token buckets used by in-flight requests.
 				oldPolicy := decodePolicySet(previous.snapshot.Config)
 				for _, profile := range previous.snapshot.Config.Profiles {
-					s.breakerFor(profile.Upstream, oldPolicy.breakerCfg)
+					upstream := previous.snapshot.Config.Upstreams[profile.Upstream]
+					s.breakerFor(breakerIdentity(profile.Upstream, upstream), oldPolicy.breakerCfg)
 				}
 			}
 			return fmt.Errorf("activate stored version: %w", err)
@@ -1569,6 +1635,7 @@ func (s *Server) submitAudit(event store.AuditEvent) {
 	select {
 	case s.auditCh <- event:
 	default:
+		s.metrics.AuditDropped()
 		slog.Warn("audit event dropped", "action", event.Action, "reason", "audit_backlog")
 	}
 }
@@ -1589,12 +1656,21 @@ func configuredRedactions(cfg *config.Config) map[string]bool {
 		return out
 	}
 	audit, _ := cfg.Policies["audit"].(map[string]any)
-	list, _ := audit["redact"].([]any)
-	for _, item := range list {
-		if text, ok := item.(string); ok {
-			if name := strings.ToLower(strings.TrimSpace(text)); name != "" {
-				out[name] = true
+	add := func(text string) {
+		if name := strings.ToLower(strings.TrimSpace(text)); name != "" {
+			out[name] = true
+		}
+	}
+	switch list := audit["redact"].(type) {
+	case []any:
+		for _, item := range list {
+			if text, ok := item.(string); ok {
+				add(text)
 			}
+		}
+	case []string:
+		for _, text := range list {
+			add(text)
 		}
 	}
 	return out
@@ -1669,6 +1745,13 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func enforceResponseLimit(cfg *config.Config, profile config.Profile, env transform.Envelope) error {
+	if int64(len(env.Body)) > responseLimit(cfg, profile) {
+		return upstreamError{status: http.StatusBadGateway, code: "response_too_large", err: errors.New("response exceeded configured limit after conversion")}
+	}
+	return nil
+}
+
 func (s *Server) writeEnvelope(w http.ResponseWriter, env transform.Envelope) {
 	connectionHeaders := connectionHeaderNames(env.Headers)
 	for key, values := range env.Headers {
@@ -1694,10 +1777,19 @@ func (s *Server) writeEnvelope(w http.ResponseWriter, env transform.Envelope) {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, status int, stage, code, message, requestID string) {
+	s.writeErrorForProfile(w, status, stage, code, message, requestID, nil)
+}
+
+func (s *Server) writeErrorForProfile(w http.ResponseWriter, status int, stage, code, message, requestID string, profile *config.Profile) {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
-	s.writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "gateway_error", "code": code, "stage": stage, "request_id": requestID}})
+	details := map[string]any{"message": message, "type": "gateway_error", "code": code, "stage": stage, "request_id": requestID}
+	if profile != nil && strings.Contains(strings.ToLower(profile.ClientContract), "anthropic") {
+		s.writeJSON(w, status, map[string]any{"type": "error", "error": details})
+		return
+	}
+	s.writeJSON(w, status, map[string]any{"error": details})
 }
 
 func (s *Server) newRequestID() string {
@@ -1737,6 +1829,13 @@ func headersFromValues(values map[string][]string) http.Header {
 		}
 	}
 	return h
+}
+
+func recordingNamespace(profile config.Profile) string {
+	if strings.TrimSpace(profile.Name) != "" {
+		return profile.Name
+	}
+	return profileRuntimeID(profile)
 }
 
 func recordingKey(profile string, env transform.Envelope) string {

@@ -21,6 +21,30 @@ type Store struct {
 	db *sql.DB
 }
 
+// ErrMultipleActiveVersions reports a corrupted history containing more than
+// one active configuration version. Callers can use errors.Is to distinguish
+// this from a database or missing-row error.
+var ErrMultipleActiveVersions = errors.New("store: multiple active configuration versions")
+
+// ErrLiteralSecret reports YAML that would persist a credential or sensitive
+// header value literally. Secret values must remain references so rollback can
+// retain the original persisted configuration without redacting it.
+var ErrLiteralSecret = errors.New("store: literal secret cannot be persisted")
+
+// LiteralSecretError identifies the YAML path that contained a literal secret.
+type LiteralSecretError struct {
+	Path string
+}
+
+func (e *LiteralSecretError) Error() string {
+	if e == nil || e.Path == "" {
+		return ErrLiteralSecret.Error()
+	}
+	return fmt.Sprintf("%s at %s", ErrLiteralSecret, e.Path)
+}
+
+func (e *LiteralSecretError) Unwrap() error { return ErrLiteralSecret }
+
 type Version struct {
 	ID          string `json:"id"`
 	CreatedAt   string `json:"created_at"`
@@ -137,7 +161,35 @@ CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC)
 ON recordings(config_id, profile_id, method, path, client_id, tenant, created_at DESC)`); err != nil {
 		return fmt.Errorf("migrate sqlite store: %w", err)
 	}
+	if err := s.ensureSingleActiveIndex(ctx); err != nil {
+		return fmt.Errorf("migrate sqlite store: %w", err)
+	}
 	return s.pragmas(ctx)
+}
+
+// ensureSingleActiveIndex adds the invariant for new and already-consistent
+// stores. Older stores may contain multiple active rows; migration must remain
+// usable for those stores so Active can report the corruption instead of
+// silently choosing a row or making the database unopenable. Once an operator
+// or a normal activation repairs the duplicate state, the index is added on
+// the next migration.
+func (s *Store) ensureSingleActiveIndex(ctx context.Context) error {
+	var activeCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM config_versions WHERE active <> 0`).Scan(&activeCount); err != nil {
+		return err
+	}
+	if activeCount > 1 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_config_versions_single_active
+ON config_versions(active) WHERE active <> 0`)
+	return err
+}
+
+func ensureSingleActiveIndexTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_config_versions_single_active
+ON config_versions(active) WHERE active <> 0`)
+	return err
 }
 
 // Ping verifies the database connection is still usable.
@@ -165,11 +217,60 @@ func (s *Store) SaveVersion(ctx context.Context, version Version) error {
 	if version.CreatedBy == "" {
 		version.CreatedBy = "system"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO config_versions
+	if version.Active {
+		return s.SaveVersionAndActivate(ctx, version)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO config_versions
  (id, created_at, created_by, active, sha256, description, yaml)
- VALUES (?, ?, ?, ?, ?, ?, ?)`, version.ID, version.CreatedAt, version.CreatedBy,
-		boolInt(version.Active), version.SHA256, version.Description, version.YAML)
+ VALUES (?, ?, ?, 0, ?, ?, ?)
+ ON CONFLICT(id) DO UPDATE SET
+   created_at = excluded.created_at,
+   created_by = excluded.created_by,
+   sha256 = excluded.sha256,
+   description = excluded.description,
+   yaml = excluded.yaml`, version.ID, version.CreatedAt, version.CreatedBy,
+		version.SHA256, version.Description, version.YAML)
 	return err
+}
+
+// SaveVersionAndActivate persists a candidate and flips the single active
+// marker in one transaction. A crash or statement failure therefore leaves the
+// previously active version intact.
+func (s *Store) SaveVersionAndActivate(ctx context.Context, version Version) error {
+	if version.ID == "" {
+		return fmt.Errorf("version id is required")
+	}
+	if version.CreatedAt == "" {
+		version.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if version.CreatedBy == "" {
+		version.CreatedBy = "system"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO config_versions
+ (id, created_at, created_by, active, sha256, description, yaml)
+ VALUES (?, ?, ?, 0, ?, ?, ?)`, version.ID, version.CreatedAt, version.CreatedBy,
+		version.SHA256, version.Description, version.YAML); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE config_versions SET active = 0`); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE config_versions SET active = 1 WHERE id = ?`, version.ID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return fmt.Errorf("configuration version %q not found", version.ID)
+	}
+	if err := ensureSingleActiveIndexTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Activate(ctx context.Context, id string) error {
@@ -188,12 +289,39 @@ func (s *Store) Activate(ctx context.Context, id string) error {
 	if count, _ := result.RowsAffected(); count != 1 {
 		return fmt.Errorf("configuration version %q not found", id)
 	}
+	if err := ensureSingleActiveIndexTx(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 func (s *Store) Active(ctx context.Context) (Version, error) {
-	return s.get(ctx, `SELECT id, created_at, created_by, active, sha256, description, yaml
-FROM config_versions WHERE active = 1 ORDER BY created_at DESC LIMIT 1`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, created_at, created_by, active, sha256, description, yaml
+FROM config_versions WHERE active = 1 ORDER BY created_at DESC LIMIT 2`)
+	if err != nil {
+		return Version{}, err
+	}
+	defer rows.Close()
+	var versions []Version
+	for rows.Next() {
+		var v Version
+		var active int
+		if err := rows.Scan(&v.ID, &v.CreatedAt, &v.CreatedBy, &active, &v.SHA256, &v.Description, &v.YAML); err != nil {
+			return Version{}, err
+		}
+		v.Active = active != 0
+		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		return Version{}, err
+	}
+	if len(versions) == 0 {
+		return Version{}, sql.ErrNoRows
+	}
+	if len(versions) > 1 {
+		return Version{}, ErrMultipleActiveVersions
+	}
+	return versions[0], nil
 }
 
 func (s *Store) GetVersion(ctx context.Context, id string) (Version, error) {

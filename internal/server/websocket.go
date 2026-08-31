@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -23,17 +24,109 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 // sameOrigin allows browser connections only when the Origin matches the
-// request host, so a web page cannot drive the gateway's WebSocket plane from
-// another site. Non-browser clients (no Origin header) are always allowed.
-func sameOrigin(origin, host string) bool {
+// request's scheme, canonical host, and effective port, so a web page cannot
+// drive the gateway's WebSocket plane from another origin. Non-browser clients
+// (no Origin header) are always allowed. The variadic scheme keeps the helper
+// convenient for older unit callers; production callers always pass the
+// request scheme derived from TLS, never from forwarded headers.
+func sameOrigin(origin, host string, requestScheme ...string) bool {
 	if origin == "" {
 		return true
 	}
-	parsed, err := url.Parse(origin)
-	if err != nil {
+	parsed, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
-	return strings.EqualFold(parsed.Host, host)
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if len(requestScheme) > 0 && strings.TrimSpace(requestScheme[0]) != "" {
+		expectedScheme := strings.ToLower(strings.TrimSpace(requestScheme[0]))
+		if scheme != expectedScheme {
+			return false
+		}
+	} else {
+		// Keep the two-argument helper useful for package tests that do not have
+		// an HTTP request. The actual handler passes the request scheme above.
+		requestScheme = []string{scheme}
+	}
+	originAuthority, ok := canonicalWebSocketAuthority(parsed.Host, scheme)
+	if !ok {
+		return false
+	}
+	requestAuthority, ok := canonicalWebSocketAuthority(host, requestScheme[0])
+	if !ok {
+		return false
+	}
+	return originAuthority == requestAuthority
+}
+
+type websocketAuthority struct {
+	host string
+	port int
+}
+
+// canonicalWebSocketAuthority parses both URL authorities and net/http Host
+// values. It deliberately only considers the supplied authority: forwarded
+// headers are not consulted here or by the caller.
+func canonicalWebSocketAuthority(rawHost, scheme string) (websocketAuthority, bool) {
+	rawHost = strings.TrimSpace(rawHost)
+	if rawHost == "" {
+		return websocketAuthority{}, false
+	}
+	host, portText, hasPort := rawHost, "", false
+	if parsedHost, parsedPort, err := net.SplitHostPort(rawHost); err == nil {
+		host, portText, hasPort = parsedHost, parsedPort, true
+	} else if strings.HasPrefix(rawHost, "[") {
+		if !strings.HasSuffix(rawHost, "]") {
+			return websocketAuthority{}, false
+		}
+		host = rawHost[1 : len(rawHost)-1]
+	}
+	canonicalHost, ok := canonicalWebSocketHost(host)
+	if !ok {
+		return websocketAuthority{}, false
+	}
+	port := 0
+	if hasPort {
+		if portText == "" {
+			return websocketAuthority{}, false
+		}
+		for _, digit := range portText {
+			if digit < '0' || digit > '9' {
+				return websocketAuthority{}, false
+			}
+			port = port*10 + int(digit-'0')
+			if port > 65535 {
+				return websocketAuthority{}, false
+			}
+		}
+	} else {
+		switch strings.ToLower(strings.TrimSpace(scheme)) {
+		case "http":
+			port = 80
+		case "https":
+			port = 443
+		default:
+			return websocketAuthority{}, false
+		}
+	}
+	return websocketAuthority{host: canonicalHost, port: port}, true
+}
+
+func canonicalWebSocketHost(host string) (string, bool) {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.ContainsAny(host, "[]/\\ \t\r\n") {
+		return "", false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return strings.ToLower(addr.String()), true
+	}
+	// A colon is only valid in an IPv6 literal. Reject malformed authorities
+	// such as "example.test:not-a-port" instead of treating the whole value as
+	// a DNS hostname.
+	if strings.Contains(host, ":") {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.ToLower(host), "."), true
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned *gatewayState, requestID string) {
@@ -99,7 +192,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	}
 	// Reject cross-site browser upgrades before touching the upstream; the
 	// gorilla upgrader's own check would only run after a successful dial.
-	if !sameOrigin(r.Header.Get("Origin"), r.Host) {
+	if !sameOrigin(r.Header.Get("Origin"), r.Host, requestScheme(r)) {
 		status = http.StatusForbidden
 		s.writeError(w, status, "auth", "origin_rejected", "cross-origin WebSocket upgrades are not allowed", requestID)
 		return
@@ -154,7 +247,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 				_ = upstreamResponse.Body.Close()
 			}
 		}
-		rt.recordUpstreamResult(false)
+		rt.recordUpstreamResult(websocketHandshakeSucceeded(upstreamResponse))
 		status = http.StatusBadGateway
 		stage, code = "upstream", "websocket_dial_failed"
 		s.writeError(w, status, "upstream", "websocket_dial_failed", message, requestID)
@@ -169,7 +262,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 		ReadBufferSize:  32 << 10,
 		WriteBufferSize: 32 << 10,
 		Subprotocols:    negotiated,
-		CheckOrigin:     func(request *http.Request) bool { return sameOrigin(request.Header.Get("Origin"), request.Host) },
+		CheckOrigin: func(request *http.Request) bool {
+			return sameOrigin(request.Header.Get("Origin"), request.Host, requestScheme(request))
+		},
 	}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -281,6 +376,15 @@ func normalWSClosure(err error) bool {
 		return true
 	}
 	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
+}
+
+// websocketHandshakeSucceeded classifies a failed upstream handshake using
+// the same status boundary as the HTTP and gRPC paths. Caller/business errors
+// (4xx) are successful from an upstream-availability perspective; 5xx
+// responses and missing responses (network, TLS, or dial errors) count as
+// failures.
+func websocketHandshakeSucceeded(response *http.Response) bool {
+	return response != nil && response.StatusCode < http.StatusInternalServerError
 }
 
 func websocketScheme(scheme string) string {

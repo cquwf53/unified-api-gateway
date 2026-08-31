@@ -497,7 +497,9 @@ func (s *Server) buildRuntimes(cfg *config.Config) map[string]*profileRuntime {
 	}
 	policy := decodePolicySet(cfg)
 	runtimes := make(map[string]*profileRuntime, len(cfg.Profiles))
+	activeBreakers := map[string]bool{}
 	for name := range cfg.Profiles {
+		profile := cfg.Profiles[name]
 		rt := &profileRuntime{policy: policy}
 		if policy.maxConcurrency > 0 {
 			rt.sem = make(chan struct{}, policy.maxConcurrency)
@@ -505,10 +507,37 @@ func (s *Server) buildRuntimes(cfg *config.Config) map[string]*profileRuntime {
 		if policy.ratePerSecond > 0 {
 			rt.bucket = newTokenBucket(policy.ratePerSecond, policy.burst)
 		}
-		rt.breaker = s.breakerFor(cfg.Profiles[name].Upstream, policy.breakerCfg)
+		identity := breakerIdentity(profile.Upstream, cfg.Upstreams[profile.Upstream])
+		activeBreakers[identity] = true
+		rt.breaker = s.breakerFor(identity, policy.breakerCfg)
 		runtimes[name] = rt
 	}
+	s.pruneBreakers(activeBreakers)
 	return runtimes
+}
+
+func breakerIdentity(upstreamName string, upstream config.Upstream) string {
+	endpoint := strings.TrimSpace(upstream.EffectiveURL())
+	if endpoint == "" {
+		return upstreamName
+	}
+	return upstreamName + "|" + endpoint
+}
+
+func (s *Server) pruneBreakers(active map[string]bool) {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	for identity, candidate := range s.breakers {
+		if active[identity] || candidate == nil {
+			continue
+		}
+		candidate.mu.Lock()
+		removable := candidate.state == breakerClosed && !candidate.probing
+		candidate.mu.Unlock()
+		if removable {
+			delete(s.breakers, identity)
+		}
+	}
 }
 
 func (s *Server) breakerFor(upstreamName string, cfg breakerConfig) *breaker {

@@ -1,7 +1,8 @@
 package server
 
 import (
-	"log/slog"
+	"fmt"
+	"strings"
 
 	"unified-api-gateway/internal/config"
 	"unified-api-gateway/internal/transform"
@@ -15,61 +16,105 @@ type compiledPipeline struct {
 	response []*transform.CompiledTransform
 }
 
-// resolveSpecs replaces named references with the reusable transforms from
-// the configuration before compilation.
-func resolveSpecs(cfg *config.Config, specs []transform.TransformSpec) []transform.TransformSpec {
-	out := make([]transform.TransformSpec, 0, len(specs))
-	for _, spec := range specs {
-		if spec.Name != "" {
-			if reusable, exists := cfg.Transforms[spec.Name]; exists {
-				spec = reusable
+// resolveSpecs recursively expands named references before compilation. A
+// missing reference or cycle is an activation error: silently retaining a
+// named spec would turn a security-sensitive rule into a no-op.
+func resolveSpecs(cfg *config.Config, specs []transform.TransformSpec) ([]transform.TransformSpec, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("transform: config is nil")
+	}
+	var resolve func(transform.TransformSpec, []string) (transform.TransformSpec, error)
+	resolve = func(spec transform.TransformSpec, stack []string) (transform.TransformSpec, error) {
+		name := strings.TrimSpace(spec.Name)
+		if name == "" {
+			for i := range spec.Steps {
+				step, err := resolve(spec.Steps[i], stack)
+				if err != nil {
+					return transform.TransformSpec{}, err
+				}
+				spec.Steps[i] = step
+			}
+			return spec, nil
+		}
+		for _, previous := range stack {
+			if previous == name {
+				return transform.TransformSpec{}, fmt.Errorf("transform reference cycle: %s -> %s", strings.Join(append(stack, name), " -> "), name)
 			}
 		}
-		out = append(out, spec)
+		reusable, ok := cfg.Transforms[name]
+		if !ok {
+			return transform.TransformSpec{}, fmt.Errorf("named transform %q not found", name)
+		}
+		return resolve(reusable, append(stack, name))
 	}
-	return out
+	out := make([]transform.TransformSpec, 0, len(specs))
+	for _, spec := range specs {
+		resolved, err := resolve(spec, nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resolved)
+	}
+	return out, nil
 }
 
-func compileSteps(specs []transform.TransformSpec) []*transform.CompiledTransform {
+func compileSteps(specs []transform.TransformSpec) ([]*transform.CompiledTransform, error) {
 	out := make([]*transform.CompiledTransform, 0, len(specs))
-	for _, spec := range specs {
+	for index, spec := range specs {
 		compiled, err := transform.Compile(spec)
 		if err != nil {
-			// Configuration validation should make this unreachable;
-			// dropping a step silently (for example a header-deletion rule)
-			// would be a security hole, so log loudly.
-			slog.Warn("transform step failed to compile and was skipped", "name", spec.Name, "error", err)
-			continue
+			return nil, fmt.Errorf("transform step %d (%q): %w", index, spec.Name, err)
 		}
 		out = append(out, compiled)
 	}
-	return out
+	return out, nil
 }
 
-func buildPipelines(cfg *config.Config) map[string]*compiledPipeline {
+func buildPipelines(cfg *config.Config) (map[string]*compiledPipeline, error) {
 	if cfg == nil {
-		return map[string]*compiledPipeline{}
+		return map[string]*compiledPipeline{}, nil
 	}
 	pipelines := make(map[string]*compiledPipeline, len(cfg.Profiles))
 	for name, profile := range cfg.Profiles {
-		pipelines[name] = &compiledPipeline{
-			request:  compileSteps(resolveSpecs(cfg, profile.AllRequestTransforms())),
-			response: compileSteps(resolveSpecs(cfg, profile.AllResponseTransforms())),
+		requestSpecs, err := resolveSpecs(cfg, profile.AllRequestTransforms())
+		if err != nil {
+			return nil, fmt.Errorf("profile %q request transforms: %w", name, err)
 		}
+		responseSpecs, err := resolveSpecs(cfg, profile.AllResponseTransforms())
+		if err != nil {
+			return nil, fmt.Errorf("profile %q response transforms: %w", name, err)
+		}
+		request, err := compileSteps(requestSpecs)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q request transforms: %w", name, err)
+		}
+		response, err := compileSteps(responseSpecs)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q response transforms: %w", name, err)
+		}
+		pipelines[name] = &compiledPipeline{request: request, response: response}
 	}
-	return pipelines
+	return pipelines, nil
 }
 
 // compiledRequestSteps returns the cached request chain for a profile,
-// falling back to a one-shot compilation for profiles assembled outside a
-// configuration snapshot (for example the preview endpoint).
+// falling back to strict one-shot compilation for preview callers that use a
+// profile assembled outside the published snapshot.
 func (s *Server) compiledRequestSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
 	if pinned != nil {
 		if pipeline, ok := pinned.pipelines[profileRuntimeID(profile)]; ok {
 			return pipeline.request
 		}
 	}
-	return compileSteps(resolveSpecs(cfg, profile.AllRequestTransforms()))
+	resolved, err := resolveSpecs(cfg, profile.AllRequestTransforms())
+	if err != nil {
+		return nil
+	}
+	compiled, err := compileSteps(resolved)
+	if err != nil {
+		return nil
+	}
+	return compiled
 }
 
 func (s *Server) compiledResponseSteps(pinned *gatewayState, cfg *config.Config, profile config.Profile) []*transform.CompiledTransform {
@@ -78,7 +123,15 @@ func (s *Server) compiledResponseSteps(pinned *gatewayState, cfg *config.Config,
 			return pipeline.response
 		}
 	}
-	return compileSteps(resolveSpecs(cfg, profile.AllResponseTransforms()))
+	resolved, err := resolveSpecs(cfg, profile.AllResponseTransforms())
+	if err != nil {
+		return nil
+	}
+	compiled, err := compileSteps(resolved)
+	if err != nil {
+		return nil
+	}
+	return compiled
 }
 
 func profileRuntimeID(profile config.Profile) string {

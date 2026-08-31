@@ -6,7 +6,9 @@ package route
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"regexp"
@@ -179,14 +181,33 @@ func matchString(pattern, value string, insensitive bool) bool {
 }
 
 func hostWithoutPort(host string) string {
-	if i := strings.LastIndex(host, ":"); i > -1 && !strings.Contains(host[i+1:], "]") {
-		// IPv6 literals are enclosed in brackets; only strip a conventional
-		// host:port suffix.
-		if strings.Count(host, ":") == 1 {
-			return host[:i]
-		}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
 	}
-	return strings.Trim(host, "[]")
+	// SplitHostPort handles bracketed IPv6 literals as well as ordinary
+	// host:port values. A missing port is not an error worth exposing to route
+	// matching, so fall through to the host-only normalization below.
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		return normalizeHost(parsedHost)
+	}
+	// A bracketed host without a port is valid in Host headers and should match
+	// its canonical literal form.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return normalizeHost(host[1 : len(host)-1])
+	}
+	// Unbracketed IPv6 literals cannot carry an unambiguous port. Preserve the
+	// literal (apart from accidental surrounding brackets) rather than dropping
+	// its final hextet.
+	return normalizeHost(host)
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.String()
+	}
+	return strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
 }
 
 func firstNonEmpty(values ...string) string {
@@ -310,7 +331,7 @@ func ResolveProfile(cfg *config.Config, req Request) (string, error) {
 	if p == nil {
 		return "", ErrNoProfile
 	}
-	return p.Name, nil
+	return p.RuntimeID, nil
 }
 
 // MatchRoutes returns matching routes in selection order, useful for a route

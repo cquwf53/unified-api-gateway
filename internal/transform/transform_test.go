@@ -6,10 +6,80 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestContentTypeHelpers(t *testing.T) {
+	cases := []struct {
+		name, contentType string
+		want              bool
+	}{
+		{"empty", "", false},
+		{"json", "application/json", true},
+		{"json parameters", "Application/JSON; charset=utf-8", true},
+		{"vendor json", "application/vnd.example.resource+json; charset=utf-8", true},
+		{"text json suffix", "text/example+json", false},
+		{"plain text", "text/plain", false},
+		{"malformed", "application/json; charset=", false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := IsJSONContentType(testCase.contentType); got != testCase.want {
+				t.Fatalf("IsJSONContentType(%q)=%v, want %v", testCase.contentType, got, testCase.want)
+			}
+		})
+	}
+	fromHeader := Envelope{Headers: http.Header{"Content-Type": {"application/vnd.example+json; charset=utf-8"}}}
+	if got := EffectiveContentType(fromHeader); got != "application/vnd.example+json; charset=utf-8" {
+		t.Fatalf("header fallback=%q", got)
+	}
+	fromField := Envelope{ContentType: " application/json; charset=utf-8 ", Headers: http.Header{"Content-Type": {"text/plain"}}}
+	if got := EffectiveContentType(fromField); got != "application/json; charset=utf-8" {
+		t.Fatalf("explicit content type precedence=%q", got)
+	}
+}
+
+func TestBodyTransformRejectsExplicitNonJSONContentType(t *testing.T) {
+	_, err := Apply(context.Background(), Envelope{
+		ContentType: "text/plain; charset=utf-8",
+		Body:        []byte(`{"ok":true}`),
+	}, TransformSpec{Body: BodySpec{Set: map[string]any{"x": 1}}})
+	if err == nil {
+		t.Fatal("expected non-JSON content type error")
+	}
+	var te *TransformError
+	if !errors.As(err, &te) || te.Code != "unsupported_content_type" {
+		t.Fatalf("expected unsupported_content_type, got %T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "text/plain") || !strings.Contains(err.Error(), "JSON") {
+		t.Fatalf("error should explain content type requirement: %v", err)
+	}
+}
+
+func TestBodyTransformUsesHeaderContentTypeAndEmptyRemainsCompatible(t *testing.T) {
+	_, err := Apply(context.Background(), Envelope{
+		Headers: http.Header{"Content-Type": {"text/plain"}},
+		Body:    []byte(`{"ok":true}`),
+	}, TransformSpec{Body: BodySpec{Set: map[string]any{"x": 1}}})
+	if err == nil {
+		t.Fatal("expected header content type error")
+	}
+	var te *TransformError
+	if !errors.As(err, &te) || te.Code != "unsupported_content_type" {
+		t.Fatalf("expected unsupported_content_type, got %T %v", err, err)
+	}
+	out, err := Apply(context.Background(), Envelope{Body: []byte(`{"ok":true}`)}, TransformSpec{Body: BodySpec{Set: map[string]any{"x": 1}}})
+	if err != nil {
+		t.Fatalf("empty Content-Type should preserve compatibility: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(out.Body, &body); err != nil || body["x"] != float64(1) {
+		t.Fatalf("body transform with empty Content-Type failed: %s, %v", out.Body, err)
+	}
+}
 
 func TestApplyRequestRulesDoesNotMutateInput(t *testing.T) {
 	in := Envelope{

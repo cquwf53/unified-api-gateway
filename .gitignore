@@ -10,3 +10,4 @@ data/*.db-wal
 .gomodcache/
 .env
 *.log
+coverage.out

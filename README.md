@@ -73,8 +73,10 @@ curl.exe http://127.0.0.1:8780/v1/chat/completions `
   -d '{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":64}'
 ```
 
-客户端密钥由网关验证；上游密钥只从环境变量或受保护的 secret 引用读取，不应写入
-YAML 明文。
+客户端密钥由网关验证；上游密钥只从环境变量或受保护的 secret 引用读取。带 SQLite
+版本历史启动或热激活时，网关会拒绝 `credentials.*.value`、`clients.*.key` 和非环境
+引用的 `key_ref`，避免明文凭据进入数据库/WAL/备份；无 Store 的本地开发仍可使用
+literal 值。
 
 如果配置中启用了可解析的 `clients.*.key_ref`/`key_env`，数据面会要求
 `X-API-Key` 或 `Authorization: Bearer <client-key>`。本地开发可以不设置对应环境变量，
@@ -366,11 +368,12 @@ go run ./cmd/gateway version
 
 当前实现明确不做（或只做有限支持）的事情：
 
-- **热激活的 SQLite 与内存两步之间仍有崩溃窗口**（内存侧 config/runtimes/
-  pipelines 的发布已是原子的；重启时以 SQLite active 为准恢复）；
+- SQLite 的 version 保存与 active marker 已在单事务内切换；运行中仍是“先发布完整
+  内存 state、再提交重启 marker”，数据库提交失败会恢复旧内存 state；
 - 交错的 OpenAI 并行工具参数增量会缓冲到流结束再按序重放（无损，但工具参数
-  不再随到随发）；
-- Responses 的 reasoning/summary 事件未做翻译；
+  不再随到随发，且有单调用与整流总量上限）；
+- Responses reasoning 的文本增量可保留为网关兼容 reasoning item；供应商专有
+  summary/signature/redacted-thinking 语义仍可能降级；
 - Responses 适配当前聚焦文本、图片和自定义 function call；内置 tools、远程 MCP、
   audio/refusal 等专用 item 不做语义翻译；
 - gRPC 面当前是有界缓冲的 unary HTTP 透明代理，不实现 bidi 流，也不自带原生 h2c

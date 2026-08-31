@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,6 +37,9 @@ func buildUpstreamRequest(ctx context.Context, cfg *config.Config, upstream conf
 		return nil, err
 	}
 	request.Header = filteredRequestHeaders(in.Headers)
+	if request.Header.Get("Content-Type") == "" && in.ContentType != "" {
+		request.Header.Set("Content-Type", in.ContentType)
+	}
 	applyUpstreamAuth(request.Header, cfg, upstream)
 	request.Header.Set("X-Gateway-Request-Id", requestID)
 	if len(in.Body) > 0 {
@@ -58,9 +62,9 @@ func joinRawQuery(baseQuery, requestQuery string) string {
 
 // streamUpstream forwards a transparent streaming response as it arrives.
 // The caller must only use it when no response-body transform or protocol
-// adapter needs the complete stream. Once headers are written, errors are
-// reported to telemetry but cannot be replaced with a new HTTP status.
-func (s *Server) streamUpstream(ctx context.Context, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, w http.ResponseWriter) (status int, headersSent bool, err error) {
+// adapter needs the complete stream. Non-SSE responses are buffered before
+// headers are written and use the normal response pipeline.
+func (s *Server) streamUpstream(ctx context.Context, pinned *gatewayState, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, w http.ResponseWriter) (status int, headersSent bool, err error) {
 	request, err := buildUpstreamRequest(ctx, cfg, upstream, in, requestID)
 	if err != nil {
 		return 0, false, upstreamError{status: http.StatusBadGateway, code: "build_upstream_request", err: err}
@@ -70,12 +74,28 @@ func (s *Server) streamUpstream(ctx context.Context, cfg *config.Config, upstrea
 		return 0, false, upstreamError{status: http.StatusBadGateway, code: "upstream_request_failed", err: err}
 	}
 	defer response.Body.Close()
+	if !isEventStreamResponse(response) {
+		buffered, bufErr := readUpstreamResponse(cfg, profile, response)
+		if bufErr != nil {
+			return response.StatusCode, false, bufErr
+		}
+		buffered.Metadata = in.Metadata
+		out, prepErr := s.prepareResponse(ctx, pinned, cfg, profile, buffered)
+		if prepErr != nil {
+			return http.StatusBadGateway, false, prepErr
+		}
+		if limitErr := enforceResponseLimit(cfg, profile, out); limitErr != nil {
+			return http.StatusBadGateway, false, limitErr
+		}
+		s.writeEnvelope(w, out)
+		return out.StatusCode, false, nil
+	}
 	copyResponseHeaders(w, response.Header)
 	status = response.StatusCode
 	w.WriteHeader(status)
 	headersSent = true
 	flusher, _ := w.(http.Flusher)
-	max := responseLimit(profile)
+	max := responseLimit(cfg, profile)
 	var total int64
 	buffer := make([]byte, 32<<10)
 	for {
@@ -102,10 +122,8 @@ func (s *Server) streamUpstream(ctx context.Context, cfg *config.Config, upstrea
 }
 
 // streamTranslatedUpstream serves streaming requests through a semantic
-// adapter: each upstream SSE frame is translated and flushed as it arrives so
-// the client sees a real-time stream instead of a buffered burst. When the
-// upstream answers with a non-event-stream body (typically an error JSON),
-// the response falls back to the buffered conversion pipeline.
+// adapter. Only a successful event-stream response is sent through the live
+// translator; all other responses use the buffered conversion pipeline.
 func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewayState, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, w http.ResponseWriter) (status int, headersSent bool, err error) {
 	request, err := buildUpstreamRequest(ctx, cfg, upstream, in, requestID)
 	if err != nil {
@@ -118,13 +136,17 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 	defer response.Body.Close()
 
 	if !isEventStreamResponse(response) {
-		buffered, bufErr := readUpstreamResponse(profile, response)
+		buffered, bufErr := readUpstreamResponse(cfg, profile, response)
 		if bufErr != nil {
 			return response.StatusCode, false, bufErr
 		}
+		buffered.Metadata = in.Metadata
 		out, prepErr := s.prepareResponse(ctx, pinned, cfg, profile, buffered)
 		if prepErr != nil {
 			return http.StatusBadGateway, false, prepErr
+		}
+		if limitErr := enforceResponseLimit(cfg, profile, out); limitErr != nil {
+			return http.StatusBadGateway, false, limitErr
 		}
 		s.writeEnvelope(w, out)
 		return out.StatusCode, false, nil
@@ -141,9 +163,8 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 	headersSent = true
 	flusher, _ := w.(http.Flusher)
 	translator := adapter.NewSSETranslator(profile.UpstreamContract, profile.ClientContract)
-	max := responseLimit(profile)
+	max := responseLimit(cfg, profile)
 	var total int64
-	var upstreamReadFailed bool
 	streamErr := adapter.ReadSSEStream(response.Body, func(event adapter.SSEEvent) error {
 		outEvents, translateErr := translator.Translate(event)
 		if translateErr != nil {
@@ -166,23 +187,19 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 		return nil
 	})
 	if streamErr != nil {
-		// A read failure must not leave the client without a terminator:
-		// emit whatever closing events the target protocol requires before
-		// reporting the error for telemetry.
-		upstreamReadFailed = true
-		if finishing := translator.Finish(); len(finishing) > 0 {
-			_, _ = w.Write(adapter.EncodeSSE(finishing))
-			if flusher != nil {
-				flusher.Flush()
+		// A parser, translator, size, or upstream read failure is not a clean
+		// completion. Emit an explicit target-protocol failure when the client is
+		// still writable, but never call Finish and fabricate success.
+		if upstreamCode(streamErr) != "client_stream_write_failed" {
+			if failure := translator.Fail("upstream stream terminated unexpectedly"); len(failure) > 0 {
+				_, _ = w.Write(adapter.EncodeSSE(failure))
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
 		}
-		_ = upstreamReadFailed
 		return status, headersSent, streamErr
 	}
-	// Emit the client contract's terminator when the upstream stream ended
-	// without one (Anthropic never sends [DONE]; OpenAI never sends
-	// message_stop). A failed write is reported so telemetry does not count
-	// a broken client connection as a successful stream.
 	if finishing := translator.Finish(); len(finishing) > 0 {
 		if _, writeErr := w.Write(adapter.EncodeSSE(finishing)); writeErr != nil {
 			return status, headersSent, upstreamError{status: status, code: "client_stream_write_failed", err: writeErr}
@@ -195,25 +212,46 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 }
 
 func isEventStreamResponse(response *http.Response) bool {
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
+	if response == nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 		return false
 	}
 	return strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
 }
 
 // responseLimit is the bounded size an upstream response may reach before the
-// gateway aborts with a recognisable error.
-func responseLimit(profile config.Profile) int64 {
+// gateway aborts with a recognisable error. Profile limits retain the existing
+// four-times response allowance, while a configured global limit is also a cap.
+func responseLimit(cfg *config.Config, profile config.Profile) int64 {
 	max := defaultMaxBody * 4
-	if profile.MaxBodyBytes > 0 && profile.MaxBodyBytes*4 < max {
-		max = profile.MaxBodyBytes * 4
+	if cfg != nil && cfg.Limits.MaxBodyBytes > 0 {
+		max = minPositiveLimit(max, cfg.Limits.MaxBodyBytes)
+	}
+	if profile.MaxBodyBytes > 0 {
+		max = minPositiveLimit(max, safeMultiplyLimit(profile.MaxBodyBytes, 4))
 	}
 	return max
 }
 
+func safeMultiplyLimit(value, factor int64) int64 {
+	if value <= 0 || factor <= 0 || value > math.MaxInt64/factor {
+		return math.MaxInt64
+	}
+	return value * factor
+}
+
+func minPositiveLimit(a, b int64) int64 {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
+}
+
 // readUpstreamResponse buffers a bounded upstream response into an envelope.
-func readUpstreamResponse(profile config.Profile, response *http.Response) (transform.Envelope, error) {
-	max := responseLimit(profile)
+func readUpstreamResponse(cfg *config.Config, profile config.Profile, response *http.Response) (transform.Envelope, error) {
+	max := responseLimit(cfg, profile)
 	body, err := io.ReadAll(io.LimitReader(response.Body, max+1))
 	if err != nil {
 		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_body_failed", err: err}
@@ -230,13 +268,12 @@ func readUpstreamResponse(profile config.Profile, response *http.Response) (tran
 }
 
 // applyUpstreamAuth stamps an outbound request with the upstream's static
-// headers and credential. It is shared by the HTTP, WebSocket and gRPC
-// planes so none of them can forget the auth injection.
+// headers and credential. It is shared by the HTTP, WebSocket and gRPC planes.
 func applyUpstreamAuth(header http.Header, cfg *config.Config, upstream config.Upstream) {
 	for key, value := range upstream.Headers {
 		header.Set(key, resolveSecretValue(value))
 	}
-	if upstream.AuthRef == "" {
+	if upstream.AuthRef == "" || cfg == nil {
 		return
 	}
 	credential, ok := cfg.Credentials[upstream.AuthRef]

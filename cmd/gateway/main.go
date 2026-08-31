@@ -146,12 +146,12 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	}
 	// Persist the version exactly as it will run; listener overrides below
 	// are process-local and deliberately excluded from the stored YAML.
+	if err := baseSnapshot.Config.ValidatePersistable(); err != nil {
+		return fmt.Errorf("configuration cannot be persisted: %w", err)
+	}
 	applyLogLevel(baseSnapshot.Config.Observability.LogLevel)
 	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", baseSnapshot.ID)
-	if err := storeDB.SaveVersion(context.Background(), store.Version{ID: baseSnapshot.ID, CreatedBy: "startup", Active: true, SHA256: baseSnapshot.Hash, YAML: data}); err != nil {
-		slog.Warn("save startup version", "error", err)
-	}
-	if err := storeDB.Activate(context.Background(), baseSnapshot.ID); err != nil {
+	if err := storeDB.SaveVersionAndActivate(context.Background(), store.Version{ID: baseSnapshot.ID, CreatedBy: "startup", SHA256: baseSnapshot.Hash, YAML: data}); err != nil {
 		slog.Warn("activate startup version in history", "error", err)
 	}
 	// Command-line listener overrides are re-applied after the restore so
@@ -260,10 +260,10 @@ func activate(configPath, dbPath, adminURL, adminToken string) error {
 		return err
 	}
 	defer db.Close()
-	if err := db.SaveVersion(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: "cli", Active: true, SHA256: snapshot.Hash, YAML: data}); err != nil {
-		return err
+	if err := snapshot.Config.ValidatePersistable(); err != nil {
+		return fmt.Errorf("configuration cannot be persisted: %w", err)
 	}
-	if err := db.Activate(context.Background(), snapshot.ID); err != nil {
+	if err := db.SaveVersionAndActivate(context.Background(), store.Version{ID: snapshot.ID, CreatedBy: "cli", SHA256: snapshot.Hash, YAML: data}); err != nil {
 		return err
 	}
 	fmt.Printf("saved %s for next startup (%s)\n", snapshot.ID, fallbackReason)

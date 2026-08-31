@@ -93,6 +93,20 @@ func (Transparent) AdaptResponse(in Envelope, _ config.Profile) (Envelope, error
 	return in.Clone(), nil
 }
 
+func isJSONEnvelope(in Envelope) bool {
+	contentType := strings.TrimSpace(in.ContentType)
+	if contentType == "" {
+		contentType = strings.TrimSpace(in.Header.Get("Content-Type"))
+	}
+	if contentType == "" {
+		// Keep compatibility for hand-built envelopes that contain JSON but no
+		// media type; the decoder remains the final validity check.
+		return true
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
 func decodeJSON(body []byte) (map[string]any, error) {
 	var value map[string]any
 	if len(body) == 0 {

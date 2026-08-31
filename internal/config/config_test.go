@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -57,6 +58,73 @@ routes:
 `))
 	if err == nil {
 		t.Fatal("expected validation error")
+	}
+}
+
+func TestProfileContractsValidateAgainstAdapterDirections(t *testing.T) {
+	valid := []struct {
+		name, adapter, client, upstream string
+	}{
+		{"transparent empty", "transparent", "", ""},
+		{"transparent generic", "transparent", "generic-json", "generic-json"},
+		{"transparent chat", "transparent", "openai-chat", "openai-chat"},
+		{"transparent responses", "transparent", "openai-responses", "openai-responses"},
+		{"transparent anthropic", "transparent", "anthropic-messages", "anthropic-messages"},
+		{"chat to anthropic", "openai-chat-to-anthropic", "openai-chat", "anthropic-messages"},
+		{"anthropic to chat", "anthropic-to-openai-chat", "anthropic-messages", "openai-chat"},
+		{"responses to anthropic", "openai-responses-to-anthropic", "openai-responses", "anthropic-messages"},
+	}
+	for _, testCase := range valid {
+		t.Run(testCase.name, func(t *testing.T) {
+			data := []byte("version: 1\nprofiles:\n  p:\n    adapter: " + testCase.adapter + "\n    traffic_mode: dry-run\n")
+			if testCase.client != "" {
+				data = append(data, []byte("    client_contract: "+testCase.client+"\n    upstream_contract: "+testCase.upstream+"\n")...)
+			}
+			if _, err := Parse(data); err != nil {
+				t.Fatalf("valid contract mapping rejected: %v", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name, yaml, want string
+	}{
+		{
+			name: "unknown client contract",
+			yaml: "version: 1\nprofiles:\n  p:\n    adapter: transparent\n    client_contract: made-up\n    upstream_contract: made-up\n    traffic_mode: dry-run\n",
+			want: "unknown client_contract",
+		},
+		{
+			name: "unknown upstream contract",
+			yaml: "version: 1\nprofiles:\n  p:\n    adapter: transparent\n    client_contract: generic-json\n    upstream_contract: made-up\n    traffic_mode: dry-run\n",
+			want: "unknown upstream_contract",
+		},
+		{
+			name: "transparent mismatch",
+			yaml: "version: 1\nprofiles:\n  p:\n    adapter: transparent\n    client_contract: openai-chat\n    upstream_contract: anthropic-messages\n    traffic_mode: dry-run\n",
+			want: "transparent adapter requires matching contracts",
+		},
+		{
+			name: "semantic direction mismatch",
+			yaml: "version: 1\nprofiles:\n  p:\n    adapter: openai-chat-to-anthropic\n    client_contract: anthropic-messages\n    upstream_contract: openai-chat\n    traffic_mode: dry-run\n",
+			want: "requires client_contract \"openai-chat\"",
+		},
+		{
+			name: "semantic contracts required",
+			yaml: "version: 1\nprofiles:\n  p:\n    adapter: openai-responses-to-anthropic\n    traffic_mode: dry-run\n",
+			want: "requires client_contract \"openai-responses\"",
+		},
+	}
+	for _, testCase := range invalid {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := Parse([]byte(testCase.yaml))
+			if err == nil {
+				t.Fatal("invalid contract mapping was accepted")
+			}
+			if !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("error %q does not contain %q", err, testCase.want)
+			}
+		})
 	}
 }
 

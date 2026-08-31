@@ -65,20 +65,28 @@ body:
 // while allowing non-browser clients that send no Origin at all.
 func TestSameOrigin(t *testing.T) {
 	cases := []struct {
-		origin, host string
-		allowed      bool
+		name, origin, host, scheme string
+		allowed                    bool
 	}{
-		{"", "api.example.com", true},
-		{"https://api.example.com", "api.example.com", true},
-		{"https://api.example.com:8780", "api.example.com:8780", true},
-		{"https://evil.example.net", "api.example.com", false},
-		{"https://evil.example.net", "api.example.com:8780", false},
-		{"::not a url::", "api.example.com", false},
+		{"no origin", "", "api.example.com", "http", true},
+		{"default http port omitted", "http://API.EXAMPLE.COM", "api.example.com:80", "http", true},
+		{"default https port omitted", "https://api.example.com", "api.example.com:443", "https", true},
+		{"explicit port", "https://api.example.com:8780", "api.example.com:8780", "https", true},
+		{"scheme mismatch", "https://api.example.com", "api.example.com", "http", false},
+		{"nondefault port mismatch", "https://api.example.com:443", "api.example.com:8780", "https", false},
+		{"dns case and trailing dot", "https://API.EXAMPLE.COM.", "api.example.com:443", "https", true},
+		{"ipv6 canonical", "http://[2001:0DB8:0:0:0:0:0:1]", "[2001:db8::1]:80", "http", true},
+		{"evil host", "https://evil.example.net", "api.example.com", "https", false},
+		{"path not origin", "https://api.example.com/path", "api.example.com", "https", false},
+		{"forwarded headers unavailable", "https://api.example.com", "evil.example.net", "https", false},
+		{"malformed authority", "https://api.example.com:not-a-port", "api.example.com", "https", false},
 	}
 	for _, testCase := range cases {
-		if got := sameOrigin(testCase.origin, testCase.host); got != testCase.allowed {
-			t.Errorf("sameOrigin(%q, %q) = %v, want %v", testCase.origin, testCase.host, got, testCase.allowed)
-		}
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := sameOrigin(testCase.origin, testCase.host, testCase.scheme); got != testCase.allowed {
+				t.Errorf("sameOrigin(%q, %q, %q) = %v, want %v", testCase.origin, testCase.host, testCase.scheme, got, testCase.allowed)
+			}
+		})
 	}
 }
 

@@ -15,8 +15,21 @@ jobs:
           go-version-file: go.mod
       - name: Vet
         run: go vet ./...
+      - name: Test
+        run: go test ./...
       - name: Test with race detector
         run: go test -race ./...
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out ./...
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          awk -v total="$total" 'BEGIN { if (total < 60) { printf "coverage %.1f%% is below 60%%\n", total; exit 1 } }'
+      - name: Short fuzz smoke
+        run: |
+          go test ./internal/adapter -run='^$' -fuzz=FuzzSSEParser -fuzztime=5s
+          go test ./internal/config -run='^$' -fuzz=FuzzParseConfig -fuzztime=5s
+      - name: Validate example config
+        run: go run ./cmd/gateway validate --config configs/gateway.yaml
       - name: Build
         run: go build -trimpath -ldflags="-X unified-api-gateway/internal/server.BuildVersion=${GITHUB_SHA}" ./...
 
@@ -26,3 +39,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build --build-arg VERSION=${GITHUB_SHA} -t unified-api-gateway:ci .
+      - name: Run container readiness smoke
+        run: |
+          docker run --rm --name gateway-ci -d -p 127.0.0.1:18780:8780 -p 127.0.0.1:18781:8781 unified-api-gateway:ci
+          trap 'docker logs gateway-ci; docker rm -f gateway-ci >/dev/null 2>&1 || true' EXIT
+          for attempt in {1..20}; do
+            if curl -fsS http://127.0.0.1:18781/readyz; then exit 0; fi
+            sleep 1
+          done
+          exit 1

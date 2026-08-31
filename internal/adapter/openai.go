@@ -143,7 +143,7 @@ func (OpenAIChatToAnthropic) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 }
 
 func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envelope, error) {
-	if len(in.Body) == 0 || !strings.Contains(strings.ToLower(in.ContentType), "json") {
+	if len(in.Body) == 0 || !isJSONEnvelope(in) {
 		return in.Clone(), nil
 	}
 	body, err := decodeJSON(in.Body)
@@ -301,7 +301,7 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envelope, error) {
 	// The upstream answered in OpenAI Chat format; convert it into the
 	// Anthropic Messages contract the client speaks.
-	if len(in.Body) == 0 || !strings.Contains(strings.ToLower(in.ContentType), "json") {
+	if len(in.Body) == 0 || !isJSONEnvelope(in) {
 		return in.Clone(), nil
 	}
 	body, err := decodeJSON(in.Body)
@@ -444,12 +444,13 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 		return Envelope{}, err
 	}
 	choices := asSlice(body["choices"])
-	text := ""
+	text, reasoning := "", ""
 	var toolCalls []any
 	if len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
 			if msg, ok := choice["message"].(map[string]any); ok {
 				text = asString(msg["content"])
+				reasoning = asString(msg["reasoning_content"])
 				toolCalls = asSlice(msg["tool_calls"])
 			}
 		}
@@ -470,8 +471,11 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 	if createdAt == nil {
 		createdAt = time.Now().Unix()
 	}
-	output := make([]any, 0, 1+len(toolCalls))
-	if text != "" || len(toolCalls) == 0 {
+	output := make([]any, 0, 2+len(toolCalls))
+	if reasoning != "" {
+		output = append(output, map[string]any{"id": nextResponsesItemID(), "type": "reasoning", "status": "completed", "summary": []any{map[string]any{"type": "summary_text", "text": reasoning}}})
+	}
+	if text != "" || len(toolCalls) == 0 && reasoning == "" {
 		output = append(output, map[string]any{
 			"id": nextResponsesItemID(), "type": "message", "status": "completed", "role": "assistant",
 			"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
@@ -718,12 +722,21 @@ func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
 		}
 		return anthropicContentToOpenAI(rest), role, results
 	case "assistant":
-		// tool_use blocks become tool_calls on the assistant message.
+		// tool_use blocks become tool_calls; thinking blocks use the de-facto
+		// reasoning_content field rather than disappearing from history.
 		content := anthropicContentToOpenAI(m["content"])
+		var reasoning strings.Builder
 		var toolCalls []any
 		for _, raw := range asSlice(m["content"]) {
 			part, ok := raw.(map[string]any)
-			if !ok || asString(part["type"]) != "tool_use" {
+			if !ok {
+				continue
+			}
+			if typ := asString(part["type"]); typ == "thinking" || typ == "redacted_thinking" {
+				reasoning.WriteString(asString(part["thinking"]))
+				continue
+			}
+			if asString(part["type"]) != "tool_use" {
 				continue
 			}
 			args, _ := json.Marshal(part["input"])
@@ -736,11 +749,16 @@ func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
 				},
 			})
 		}
-		if len(toolCalls) == 0 {
+		if len(toolCalls) == 0 && reasoning.Len() == 0 {
 			return content, role, nil
 		}
 		message := map[string]any{"role": "assistant", "content": content}
-		message["tool_calls"] = toolCalls
+		if reasoning.Len() > 0 {
+			message["reasoning_content"] = reasoning.String()
+		}
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+		}
 		return message, role, nil
 	default:
 		return anthropicContentToOpenAI(m["content"]), role, nil

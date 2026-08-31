@@ -92,7 +92,9 @@ func TestWebSocketUpstreamFailureCountsAsFailure(t *testing.T) {
 	dead.Close()
 	cfg := &config.Config{Version: 1, Upstreams: map[string]config.Upstream{"u": {BaseURL: deadURL}}, Profiles: map[string]config.Profile{
 		"ws": {Name: "ws", Adapter: "transparent", TrafficMode: "live", Upstream: "u"},
-	}, Routes: []config.Route{{ID: "ws", Match: config.RouteMatch{PathPrefix: "/"}, Profile: "ws"}}}
+	}, Routes: []config.Route{{ID: "ws", Match: config.RouteMatch{PathPrefix: "/"}, Profile: "ws"}}, Policies: map[string]any{
+		"defaults": map[string]any{"circuit_breaker": map[string]any{"failure_threshold": 1, "reset_timeout_ms": 60000}},
+	}}
 	snapshot, err := config.NewSnapshot(cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +116,87 @@ func TestWebSocketUpstreamFailureCountsAsFailure(t *testing.T) {
 	metrics := gateway.Metrics()
 	if metrics.RequestsFailed != 1 || metrics.RequestsTotal != 1 {
 		t.Fatalf("metrics=%+v", metrics)
+	}
+}
+
+func TestWebSocketUpstreamClientHandshakeErrorDoesNotTripBreaker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:  map[string]config.Profile{"runtime-key": {Name: "Display Name", Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "runtime-key"}},
+		Policies:  map[string]any{"defaults": map[string]any{"circuit_breaker": map[string]any{"failure_threshold": 1, "reset_timeout_ms": 60000}}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServer := httptest.NewServer(http.HandlerFunc(gateway.ServeDataHTTP))
+	defer gatewayServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/socket"
+	for attempt := 0; attempt < 2; attempt++ {
+		_, response, dialErr := websocket.DefaultDialer.Dial(wsURL, nil)
+		if dialErr == nil {
+			t.Fatal("4xx upstream unexpectedly completed websocket handshake")
+		}
+		if response == nil || response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("attempt %d response=%v err=%v", attempt+1, response, dialErr)
+		}
+		response.Body.Close()
+	}
+	breaker := gateway.runtimeFor("runtime-key").breaker
+	breaker.mu.Lock()
+	failures, state := breaker.failures, breaker.state
+	breaker.mu.Unlock()
+	if failures != 0 || state == breakerOpen {
+		t.Fatalf("4xx handshake tripped breaker: failures=%d state=%d", failures, state)
+	}
+}
+
+func TestWebSocketUpstreamServerHandshakeErrorTripsBreaker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	cfg := &config.Config{
+		Version:   1,
+		Upstreams: map[string]config.Upstream{"u": {BaseURL: upstream.URL}},
+		Profiles:  map[string]config.Profile{"ws": {Name: "ws", Adapter: "transparent", TrafficMode: "live", Upstream: "u"}},
+		Routes:    []config.Route{{ID: "ws", Match: config.RouteMatch{Path: "/socket"}, Profile: "ws"}},
+		Policies:  map[string]any{"defaults": map[string]any{"circuit_breaker": map[string]any{"failure_threshold": 1, "reset_timeout_ms": 60000}}},
+	}
+	snapshot, err := config.NewSnapshot(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := New(Options{Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/socket", nil)
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	gateway.ServeDataHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	breaker := gateway.runtimeFor("ws").breaker
+	breaker.mu.Lock()
+	failures, state := breaker.failures, breaker.state
+	breaker.mu.Unlock()
+	if failures != 1 || state != breakerOpen {
+		t.Fatalf("5xx handshake did not trip breaker: failures=%d state=%d", failures, state)
 	}
 }
 
