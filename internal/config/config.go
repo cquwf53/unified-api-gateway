@@ -1040,6 +1040,133 @@ func routeLabel(r Route, i int) string {
 	return fmt.Sprintf("route-%d", i+1)
 }
 
+// ShadowedRoutes reports lower-priority routes that a higher-priority route
+// fully covers: every request matching the lower route also matches the
+// higher one, so route selection can never reach the lower route. Only
+// constraints whose coverage is syntactically decidable are compared, so the
+// result is conservative - a false negative is possible (regex, globs and
+// mixed path kinds are not related), a false positive is not. It is a
+// warning rather than a validation error because per-client profile
+// allowlists can still make a shadowed route reachable.
+func (c *Config) ShadowedRoutes() []string {
+	if c == nil || len(c.Routes) < 2 {
+		return nil
+	}
+	var out []string
+	for i, low := range c.Routes {
+		for j, high := range c.Routes {
+			if i == j || high.Priority <= low.Priority {
+				continue
+			}
+			if routeCovers(high.Match, low.Match) {
+				out = append(out, fmt.Sprintf(
+					"route %q (priority %d) is shadowed by route %q (priority %d): every request it matches selects the higher-priority route first",
+					routeLabel(low, i), low.Priority, routeLabel(high, j), high.Priority))
+				break
+			}
+		}
+	}
+	return out
+}
+
+// routeCovers reports whether every request matching narrow also matches
+// broad, comparing one constraint dimension at a time with the same
+// case-sensitivity the route package applies at runtime.
+func routeCovers(broad, narrow RouteMatch) bool {
+	if broad.Host != "" && !strings.EqualFold(broad.Host, narrow.Host) {
+		return false
+	}
+	if !pathCovers(broad, narrow) {
+		return false
+	}
+	if !methodsCover(broad, narrow) {
+		return false
+	}
+	for key, value := range broad.Headers {
+		if constrained, ok := constrainedValue(narrow.Headers, key); !ok || constrained != value {
+			return false
+		}
+	}
+	for key, value := range broad.Query {
+		if narrow.Query[key] != value {
+			return false
+		}
+	}
+	if broad.Client != "" && narrow.Client != broad.Client && narrow.ClientID != broad.Client {
+		return false
+	}
+	if broad.ClientID != "" && narrow.ClientID != broad.ClientID {
+		return false
+	}
+	if broad.Tenant != "" && narrow.Tenant != broad.Tenant {
+		return false
+	}
+	if broad.Model != "" && narrow.Model != broad.Model {
+		return false
+	}
+	return true
+}
+
+// pathCovers compares the path dimensions. Only identical path patterns and
+// plain prefix containment are provable; a broad glob does not subsume other
+// globs here.
+func pathCovers(broad, narrow RouteMatch) bool {
+	switch {
+	case broad.Path != "":
+		return narrow.Path == broad.Path
+	case broad.PathPrefix != "":
+		prefix := strings.TrimSuffix(broad.PathPrefix, "/") + "/"
+		if narrow.PathPrefix != "" {
+			return narrow.PathPrefix == broad.PathPrefix || strings.HasPrefix(narrow.PathPrefix, prefix)
+		}
+		if narrow.Path != "" {
+			return narrow.Path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(narrow.Path, prefix)
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func methodsCover(broad, narrow RouteMatch) bool {
+	broadSet := matchMethodSet(broad)
+	if len(broadSet) == 0 {
+		return true
+	}
+	for _, method := range matchMethodSet(narrow) {
+		found := false
+		for _, candidate := range broadSet {
+			if strings.EqualFold(candidate, method) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func matchMethodSet(match RouteMatch) []string {
+	methods := append([]string(nil), match.Methods...)
+	if match.Method != "" {
+		methods = append(methods, match.Method)
+	}
+	return methods
+}
+
+// constrainedValue finds a header constraint case-insensitively, matching
+// how the route package looks up incoming headers.
+func constrainedValue(headers map[string]string, key string) (string, bool) {
+	for name, value := range headers {
+		if strings.EqualFold(name, key) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
 func allowedScheme(s string) bool {
 	switch strings.ToLower(s) {
 	case "http", "https", "ws", "wss", "grpc", "grpcs":

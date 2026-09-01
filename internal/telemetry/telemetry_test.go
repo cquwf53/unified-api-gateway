@@ -36,3 +36,33 @@ func TestRecentRingIsBoundedAndNewestFirst(t *testing.T) {
 		t.Fatalf("recent=%+v", recent)
 	}
 }
+
+func TestLabeledRouteCounters(t *testing.T) {
+	metrics := New(4)
+	metrics.Observe(RequestRecord{Status: 200, Route: "chat", Profile: "p1"})
+	metrics.Observe(RequestRecord{Status: 200, Route: "chat", Profile: "p1"})
+	metrics.Observe(RequestRecord{Status: 404, Route: "chat", Profile: "p1"})
+	metrics.Observe(RequestRecord{Status: 500, Route: "other", Profile: "p2", ErrorCode: "x"})
+	// Requests observed before route selection carry no labels and must not
+	// create a bucket.
+	metrics.Observe(RequestRecord{Status: 200})
+
+	stats := metrics.LabeledRequests()
+	if len(stats) != 3 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if stats[0].Route != "chat" || stats[0].Profile != "p1" || stats[0].Class != "2xx" || stats[0].Total != 2 {
+		t.Fatalf("first stat=%+v", stats[0])
+	}
+	if stats[1].Class != "4xx" || stats[2].Route != "other" || stats[2].Class != "5xx" {
+		t.Fatalf("stats=%+v", stats)
+	}
+
+	prometheus := metrics.Prometheus()
+	if !strings.Contains(prometheus, "# TYPE gateway_requests_by_route_total counter") {
+		t.Fatalf("prometheus missing type line: %s", prometheus)
+	}
+	if !strings.Contains(prometheus, `gateway_requests_by_route_total{route="chat",profile="p1",status="2xx"} 2`) {
+		t.Fatalf("prometheus=%s", prometheus)
+	}
+}

@@ -58,6 +58,9 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		for _, warning := range cfg.ShadowedRoutes() {
+			fmt.Printf("warning: %s\n", warning)
+		}
 		fmt.Printf("valid: version=%d profiles=%d routes=%d upstreams=%d\n", cfg.Version, len(cfg.Profiles), len(cfg.Routes), len(cfg.Upstreams))
 		return nil
 	case "status":
@@ -109,9 +112,6 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	fileLoadFailed := err != nil
 	storeDB, err := store.Open(dbPath)
 	if err != nil {
-		if fileLoadFailed {
-			return err
-		}
 		return err
 	}
 	defer storeDB.Close()

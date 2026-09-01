@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,22 @@ type Snapshot struct {
 	Recent             []RequestRecord `json:"recent"`
 }
 
+// RouteStat is one observed route/profile/status-class combination. Route
+// and profile identifiers come from the pinned configuration, so label
+// cardinality is bounded by the active configuration rather than by traffic.
+type RouteStat struct {
+	Route   string
+	Profile string
+	Class   string
+	Total   uint64
+}
+
+type routeStatKey struct {
+	route   string
+	profile string
+	class   string
+}
+
 type Metrics struct {
 	total        atomic.Uint64
 	ok           atomic.Uint64
@@ -49,6 +66,9 @@ type Metrics struct {
 	head   int
 	count  int
 	limit  int
+
+	labeledMu sync.Mutex
+	labeled   map[routeStatKey]uint64
 }
 
 func New(limit int) *Metrics {
@@ -83,6 +103,35 @@ func (m *Metrics) Observe(record RequestRecord) {
 		m.count++
 	}
 	m.mu.Unlock()
+	if record.Route != "" || record.Profile != "" {
+		m.labeledMu.Lock()
+		if m.labeled == nil {
+			m.labeled = map[routeStatKey]uint64{}
+		}
+		m.labeled[routeStatKey{route: record.Route, profile: record.Profile, class: StatusClass(record.Status)}]++
+		m.labeledMu.Unlock()
+	}
+}
+
+// LabeledRequests returns the per-route/profile/status-class totals in
+// deterministic (sorted) order.
+func (m *Metrics) LabeledRequests() []RouteStat {
+	m.labeledMu.Lock()
+	out := make([]RouteStat, 0, len(m.labeled))
+	for key, total := range m.labeled {
+		out = append(out, RouteStat{Route: key.route, Profile: key.profile, Class: key.class, Total: total})
+	}
+	m.labeledMu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Route != out[j].Route {
+			return out[i].Route < out[j].Route
+		}
+		if out[i].Profile != out[j].Profile {
+			return out[i].Profile < out[j].Profile
+		}
+		return out[i].Class < out[j].Class
+	})
+	return out
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -105,7 +154,17 @@ func (m *Metrics) Snapshot() Snapshot {
 
 func (m *Metrics) Prometheus() string {
 	s := m.Snapshot()
-	return fmt.Sprintf("# TYPE gateway_requests_total counter\ngateway_requests_total %d\n# TYPE gateway_requests_ok counter\ngateway_requests_ok %d\n# TYPE gateway_requests_failed counter\ngateway_requests_failed %d\n# TYPE gateway_audit_events_dropped_total counter\ngateway_audit_events_dropped_total %d\n# TYPE gateway_active_requests gauge\ngateway_active_requests %d\n", s.RequestsTotal, s.RequestsOK, s.RequestsFailed, s.AuditEventsDropped, s.Active)
+	var out strings.Builder
+	fmt.Fprintf(&out, "# TYPE gateway_requests_total counter\ngateway_requests_total %d\n", s.RequestsTotal)
+	fmt.Fprintf(&out, "# TYPE gateway_requests_ok counter\ngateway_requests_ok %d\n", s.RequestsOK)
+	fmt.Fprintf(&out, "# TYPE gateway_requests_failed counter\ngateway_requests_failed %d\n", s.RequestsFailed)
+	fmt.Fprintf(&out, "# TYPE gateway_audit_events_dropped_total counter\ngateway_audit_events_dropped_total %d\n", s.AuditEventsDropped)
+	fmt.Fprintf(&out, "# TYPE gateway_active_requests gauge\ngateway_active_requests %d\n", s.Active)
+	out.WriteString("# TYPE gateway_requests_by_route_total counter\n")
+	for _, stat := range m.LabeledRequests() {
+		fmt.Fprintf(&out, "gateway_requests_by_route_total{route=%q,profile=%q,status=%q} %d\n", stat.Route, stat.Profile, stat.Class, stat.Total)
+	}
+	return out.String()
 }
 
 func (m *Metrics) SortRecentByDuration() []RequestRecord {

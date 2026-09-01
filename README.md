@@ -97,6 +97,8 @@ literal 值。
 - `credentials` / `clients`：上游密钥引用、客户端凭据和 profile 白名单；
 - `observability`：日志级别、请求 ID 头、指标和 trace 设置。`log_level` 与
   `request_id_header` 已生效；`metrics: false` 可关闭 `/metrics` 端点（默认开启）；
+  `/metrics` 在全局计数之外提供 `gateway_requests_by_route_total{route,profile,status}`
+  序列，label 取自激活配置中的 route/profile 与状态类（2xx/4xx/…），基数有界；
   `redact_prompts: true` 会隐藏 preview/dry-run 中的请求正文；`trace` 仍为预留字段。
 
 一个 profile 可以写成：
@@ -380,8 +382,11 @@ go run ./cmd/gateway version
   终结；需要部署在 HTTP/2/h2c 终结器之后；
 - **readyz 检查配置与 SQLite 可用性，但不做上游探活**；
 - `listeners` 地址与 `log_level` 不随热激活生效（需重启）；
-- route 校验拒绝完全相同的 matcher+priority 组合，但**包含关系**冲突（如同
-  path 前缀的宽窄规则叠加）仍不检测；
+- route 校验拒绝完全相同的 matcher+priority 组合；被高优先级路由完全遮蔽的路由
+  会在激活和 `make validate` 时打印 warning（因 client profile 白名单仍可能使其
+  可达，所以是警告而非错误）；glob/regex 等无法静态判定的包含关系不检测；
+- 限流、并发与熔断状态保存在进程内存，SQLite 只承载版本历史与审计；多实例部署
+  需要先把策略状态外置（共享限流/熔断层），当前版本按单机设计；
 - 客户端鉴权默认在未配置任何可解析密钥时保持关闭（fail-open）；生产部署应
   设置 `require_client_auth: true` 强制 fail-closed，见上文流量策略。
 
