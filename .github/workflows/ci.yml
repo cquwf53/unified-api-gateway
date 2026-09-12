@@ -13,6 +13,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Console interaction tests
+        run: node --test web/app.test.cjs
       - name: Vet
         run: go vet ./...
       - name: Test

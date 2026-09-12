@@ -3,11 +3,12 @@ SHELL := /bin/sh
 BINARY ?= unified-api-gateway
 CONFIG ?= configs/gateway.yaml
 GO ?= go
+NODE ?= node
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 ADMIN_URL ?= http://127.0.0.1:8781/readyz
 LDFLAGS := -s -w -X unified-api-gateway/internal/server.BuildVersion=$(VERSION)
 
-.PHONY: all build run validate test test-race coverage fuzz integration fmt vet clean docker docker-smoke health
+.PHONY: all build run validate test test-web test-race coverage fuzz integration fmt vet clean docker docker-smoke health
 
 all: test build
 
@@ -25,6 +26,10 @@ health:
 
 test:
 	$(GO) test ./...
+	$(NODE) --test web/app.test.cjs
+
+test-web:
+	$(NODE) --test web/app.test.cjs
 
 test-race:
 	$(GO) test -race ./...

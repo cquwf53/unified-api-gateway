@@ -103,25 +103,26 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	*c = Config(p)
+	var aux struct {
+		DefaultProfile string `yaml:"default_profile"`
+		HTTP           string `yaml:"http"`
+		Admin          string `yaml:"admin"`
+		GRPC           string `yaml:"grpc"`
+	}
+	if err := node.Decode(&aux); err != nil {
+		return err
+	}
 	if c.DefaultsProfile == "" {
-		var aux struct {
-			DefaultProfile string `yaml:"default_profile"`
-			HTTP           string `yaml:"http"`
-			Admin          string `yaml:"admin"`
-			GRPC           string `yaml:"grpc"`
-		}
-		if err := node.Decode(&aux); err == nil {
-			c.DefaultsProfile = aux.DefaultProfile
-			if c.Listeners.HTTP == "" {
-				c.Listeners.HTTP = aux.HTTP
-			}
-			if c.Listeners.Admin == "" {
-				c.Listeners.Admin = aux.Admin
-			}
-			if c.Listeners.GRPC == "" {
-				c.Listeners.GRPC = aux.GRPC
-			}
-		}
+		c.DefaultsProfile = aux.DefaultProfile
+	}
+	if c.Listeners.HTTP == "" {
+		c.Listeners.HTTP = aux.HTTP
+	}
+	if c.Listeners.Admin == "" {
+		c.Listeners.Admin = aux.Admin
+	}
+	if c.Listeners.GRPC == "" {
+		c.Listeners.GRPC = aux.GRPC
 	}
 	return nil
 }
@@ -311,7 +312,7 @@ func (c *Config) ValidatePersistable() error {
 		if strings.TrimSpace(credential.Value) != "" {
 			errs = append(errs, fmt.Sprintf("credential %q: value is a literal secret; use env/ref", id))
 		}
-		if ref := strings.TrimSpace(credential.Ref); ref != "" && !isSecretReference(ref) && strings.TrimSpace(credential.Env) == "" && (strings.EqualFold(credential.Type, "") || !strings.EqualFold(credential.Type, "env") && !strings.EqualFold(credential.Type, "api_key")) {
+		if ref := strings.TrimSpace(credential.Ref); ref != "" && !isSecretReference(ref) && !credentialUsesEnvironment(credential) {
 			errs = append(errs, fmt.Sprintf("credential %q: ref is a literal secret; use env:NAME or env", id))
 		}
 	}
@@ -330,6 +331,15 @@ func (c *Config) ValidatePersistable() error {
 			}
 		}
 	}
+	visitTransformHeaders(c, func(path string, headers map[string]string) {
+		for header, value := range headers {
+			// Transform header operations assign literal values; environment
+			// credentials belong in upstream auth_ref or upstream headers.
+			if persistSensitiveHeader(header) && strings.TrimSpace(value) != "" {
+				errs = append(errs, fmt.Sprintf("%s: sensitive header %q is literal; use upstream auth_ref or environment-referenced upstream headers", path, header))
+			}
+		}
+	})
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
@@ -493,6 +503,13 @@ func Parse(data []byte) (*Config, error) {
 			return &c, nil
 		}
 		return nil, fmt.Errorf("config YAML: %w", err)
+	}
+	var trailing yaml.Node
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, fmt.Errorf("config YAML: %w", err)
+		}
+		return nil, errors.New("config YAML: only one document is allowed")
 	}
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
@@ -706,9 +723,15 @@ func (c *Config) Validate() error {
 			if err := spec.Validate(); err != nil {
 				errs = append(errs, fmt.Sprintf("profile %q request transform %d: %v", name, i, err))
 			}
+			if err := validateTransformReferences(c.Transforms, spec, nil); err != nil {
+				errs = append(errs, fmt.Sprintf("profile %q request transform %d: %v", name, i, err))
+			}
 		}
 		for i, spec := range p.AllResponseTransforms() {
 			if err := spec.Validate(); err != nil {
+				errs = append(errs, fmt.Sprintf("profile %q response transform %d: %v", name, i, err))
+			}
+			if err := validateTransformReferences(c.Transforms, spec, nil); err != nil {
 				errs = append(errs, fmt.Sprintf("profile %q response transform %d: %v", name, i, err))
 			}
 		}
@@ -1088,7 +1111,7 @@ func routeCovers(broad, narrow RouteMatch) bool {
 		}
 	}
 	for key, value := range broad.Query {
-		if narrow.Query[key] != value {
+		if constrained, ok := narrow.Query[key]; !ok || constrained != value {
 			return false
 		}
 	}
@@ -1111,21 +1134,26 @@ func routeCovers(broad, narrow RouteMatch) bool {
 // plain prefix containment are provable; a broad glob does not subsume other
 // globs here.
 func pathCovers(broad, narrow RouteMatch) bool {
-	switch {
-	case broad.Path != "":
-		return narrow.Path == broad.Path
-	case broad.PathPrefix != "":
-		prefix := strings.TrimSuffix(broad.PathPrefix, "/") + "/"
-		if narrow.PathPrefix != "" {
-			return narrow.PathPrefix == broad.PathPrefix || strings.HasPrefix(narrow.PathPrefix, prefix)
-		}
-		if narrow.Path != "" {
-			return narrow.Path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(narrow.Path, prefix)
-		}
-		return true
-	default:
+	if broad.Path != "" && narrow.Path != broad.Path {
+		return false
+	}
+	if broad.PathPrefix == "" {
 		return true
 	}
+	prefix := strings.TrimSuffix(broad.PathPrefix, "/")
+	if prefix == "" {
+		return true
+	}
+	if narrow.PathPrefix != "" {
+		narrowPrefix := strings.TrimSuffix(narrow.PathPrefix, "/")
+		if narrowPrefix == prefix || strings.HasPrefix(narrowPrefix, prefix+"/") {
+			return true
+		}
+	}
+	if narrow.Path != "" {
+		return narrow.Path == prefix || strings.HasPrefix(narrow.Path, prefix+"/")
+	}
+	return false
 }
 
 func methodsCover(broad, narrow RouteMatch) bool {
@@ -1133,7 +1161,11 @@ func methodsCover(broad, narrow RouteMatch) bool {
 	if len(broadSet) == 0 {
 		return true
 	}
-	for _, method := range matchMethodSet(narrow) {
+	narrowSet := matchMethodSet(narrow)
+	if len(narrowSet) == 0 {
+		return false
+	}
+	for _, method := range narrowSet {
 		found := false
 		for _, candidate := range broadSet {
 			if strings.EqualFold(candidate, method) {

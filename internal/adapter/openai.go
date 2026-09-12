@@ -241,6 +241,9 @@ func (AnthropicToOpenAIChat) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 	if stream, ok := body["stream"]; ok {
 		out["stream"] = stream
 	}
+	if stop, ok := body["stop_sequences"]; ok {
+		out["stop"] = stop
+	}
 	for _, key := range []string{"temperature", "top_p"} {
 		if value, ok := body[key]; ok {
 			out[key] = value
@@ -415,7 +418,7 @@ func (OpenAIResponsesToAnthropic) AdaptRequest(in Envelope, p config.Profile) (E
 	if max, ok := body["max_output_tokens"]; ok {
 		chat["max_tokens"] = max
 	}
-	for _, key := range []string{"temperature", "top_p", "tools", "tool_choice"} {
+	for _, key := range []string{"temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls"} {
 		if value, ok := body[key]; ok {
 			chat[key] = value
 		}
@@ -696,6 +699,9 @@ func anthropicMessageToOpenAI(m map[string]any) (any, string, []any) {
 	role := asString(m["role"])
 	switch role {
 	case "user":
+		if text, ok := m["content"].(string); ok {
+			return text, role, nil
+		}
 		// tool_result blocks become their own tool-role messages. The caller
 		// emits them before any remaining user follow-up content.
 		var results []any

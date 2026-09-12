@@ -45,11 +45,11 @@ func resolveSpecs(cfg *config.Config, specs []transform.TransformSpec) ([]transf
 		if !ok {
 			return transform.TransformSpec{}, fmt.Errorf("named transform %q not found", name)
 		}
-		return resolve(reusable, append(stack, name))
+		return resolve(transform.CloneSpec(reusable), append(stack, name))
 	}
 	out := make([]transform.TransformSpec, 0, len(specs))
 	for _, spec := range specs {
-		resolved, err := resolve(spec, nil)
+		resolved, err := resolve(transform.CloneSpec(spec), nil)
 		if err != nil {
 			return nil, err
 		}

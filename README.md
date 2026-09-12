@@ -135,7 +135,8 @@ profiles:
 ```
 
 改写阶段按 `path -> query -> headers -> body` 的顺序执行。`body` 规则只在请求是
-JSON 且 profile 声明了 JSON 契约时解析；未知字段默认保留。profile 级的
+JSON 且 profile 声明了 JSON 契约时解析；未知字段默认保留。同一个规则映射内的
+键按字典序执行；存在先后依赖时请用 `steps` 列表明确顺序，不依赖 YAML 映射的书写顺序。profile 级的
 `max_body_bytes` 限制请求体大小（超限返回 413），同时约束上游响应的缓冲上限；
 `allowed_methods` 可将 profile 限制到指定方法（其余返回 405）。`stream_safe` 是
 三态：不写时按"是否有 body 改写规则"推导，显式写 `true`/`false` 时以配置为准
@@ -213,12 +214,12 @@ routes:
 ```
 
 同一请求在进入数据面时锁定配置版本；热切换不会改变已经开始的请求。发布前可用
-dry-run 预览每一阶段的 envelope diff，发布后可通过管理 API 回滚到上一版本。
+管理面 preview 查看最终改写后的请求（不提供逐阶段 diff），发布后可通过管理 API 回滚到上一版本。
 
 ## 运行模式
 
 - `live`：正常访问上游并返回转换后的响应；
-- `dry-run`：不建立上游连接，返回协议合法的模拟响应，并记录预览 diff；
+- `dry-run`：不建立上游连接，返回协议合法的模拟响应；管理面 preview 展示改写后的请求；
 - `shadow`：复制到影子上游，客户端只接收主请求的结果；
 - `mock`：使用 profile 中的固定/模板响应；
 - `record`：在脱敏后保存请求、响应和配置版本 fixture；
@@ -250,10 +251,10 @@ profile/method/path 最近的一条录制，并通过 `X-Gateway-Replay: exact|a
 ```text
 GET  /healthz                       存活检查
 GET  /readyz                        配置与存储就绪状态（不含上游探活）
-GET  /admin/v1/status               当前激活版本、监听器和指标摘要
+GET  /admin/v1/status               当前激活版本、构建版本和指标摘要
 GET  /admin/v1/config               当前配置（敏感字段已脱敏）
 POST /admin/v1/config/validate      校验 YAML，不改变 active 版本
-POST /admin/v1/preview              用样例请求执行 dry-run 并返回 diff
+POST /admin/v1/preview              用样例请求返回最终改写后的请求预览
 POST /admin/v1/config/activate      激活已校验版本
 POST /admin/v1/config/rollback      回滚到指定历史版本
 POST /admin/v1/routes/explain       解释一条请求会命中哪个 route/profile
@@ -273,12 +274,13 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/profile/switch `
 ```powershell
 curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
   -H "Content-Type: application/json" `
-  -d '{"method":"POST","path":"/v1/chat/completions","headers":{"X-Gateway-Profile":"canary"}}'
+  -d '{"method":"POST","path":"/v1/chat/completions","headers":{"X-Gateway-Profile":["canary"]}}'
 ```
 
 管理面和数据面使用不同的鉴权边界；生产部署不要把管理端口暴露到公网。
 管理面默认仅允许回环客户端；设置 `GATEWAY_ADMIN_TOKEN` 后，CLI 或 Web 控制台需通过
-`X-Admin-Token` 发送令牌。Web 控制台会在第一次收到 401 时提示输入并保存在当前浏览器。
+`X-Admin-Token` 发送令牌。控制台静态页面可直接加载，配置及操作 API 仍需认证。
+Web 控制台遇到 401 会提示输入或更换令牌并保存在当前浏览器；取消输入会清除原令牌。
 
 `/admin/v1/versions`、`/admin/v1/audit`、`/admin/v1/recordings` 支持 `?limit=` 参数
 （1–200，默认 100）。`/admin/v1/status` 返回 `gateway_version`（构建时通过
@@ -316,11 +318,15 @@ client 凭据能解析出密钥将直接拒绝启动，而不是退化成开放�
 将引用的环境变量以 `x-api-key` 头发送（Anthropic 的方案），`env` 则用
 `Authorization: Bearer`。
 
+Prometheus 分路由指标在每个进程中最多保留 1024 个 route/profile/status 组合。
+超过预算的新组合累计到 `gateway_requests_route_overflow_total{status="..."}`，
+已有序列持续累加；总请求计数不受影响。重启进程后计数与序列预算重新开始。
+
 ## 开发与测试
 
 ```powershell
 make fmt
-make test
+make test                # Go 测试与 Node.js 内置控制台交互测试（Node.js 22+）
 make validate
 ```
 

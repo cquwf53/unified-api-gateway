@@ -147,11 +147,11 @@
 
   <dialog id="activate-dialog">
     <form method="dialog" class="dialog-card" id="activate-form">
-      <div class="dialog-heading"><div><span class="eyebrow">HOT ACTIVATE</span><h2>激活 YAML 配置</h2></div><button value="cancel" class="close-button" aria-label="关闭">×</button></div>
+      <div class="dialog-heading"><div><span class="eyebrow">HOT ACTIVATE</span><h2>激活 YAML 配置</h2></div><button type="button" value="cancel" data-close-activate class="close-button" aria-label="关闭">×</button></div>
       <p>配置会先完成解析、引用检查和转换规则校验；失败时当前 active 快照保持不变。</p>
       <label>配置 YAML<textarea id="activate-yaml" class="code config-editor" spellcheck="false" placeholder="version: 1&#10;listeners: ..."></textarea></label>
       <label>版本说明<input id="activate-description" placeholder="例如：新增 OpenAI → Anthropic 适配"></label>
-      <div class="dialog-actions"><button value="cancel" class="button ghost">取消</button><button type="submit" value="default" class="button primary">校验并激活</button></div>
+      <div class="dialog-actions"><button type="button" value="cancel" data-close-activate class="button ghost">取消</button><button type="submit" value="default" class="button primary">校验并激活</button></div>
     </form>
   </dialog>
 

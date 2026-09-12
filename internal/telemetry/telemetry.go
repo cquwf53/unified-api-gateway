@@ -37,9 +37,10 @@ type Snapshot struct {
 	Recent             []RequestRecord `json:"recent"`
 }
 
-// RouteStat is one observed route/profile/status-class combination. Route
-// and profile identifiers come from the pinned configuration, so label
-// cardinality is bounded by the active configuration rather than by traffic.
+const routeSeriesLimit = 1024
+
+// RouteStat is one retained route/profile/status-class combination. New
+// combinations beyond routeSeriesLimit are counted in the overflow metric.
 type RouteStat struct {
 	Route   string
 	Profile string
@@ -69,6 +70,8 @@ type Metrics struct {
 
 	labeledMu sync.Mutex
 	labeled   map[routeStatKey]uint64
+	// Index zero is unknown; indexes one through five are HTTP status classes.
+	routeOverflow [6]uint64
 }
 
 func New(limit int) *Metrics {
@@ -108,7 +111,12 @@ func (m *Metrics) Observe(record RequestRecord) {
 		if m.labeled == nil {
 			m.labeled = map[routeStatKey]uint64{}
 		}
-		m.labeled[routeStatKey{route: record.Route, profile: record.Profile, class: StatusClass(record.Status)}]++
+		key := routeStatKey{route: record.Route, profile: record.Profile, class: StatusClass(record.Status)}
+		if total, exists := m.labeled[key]; exists || len(m.labeled) < routeSeriesLimit {
+			m.labeled[key] = total + 1
+		} else {
+			m.routeOverflow[statusClassIndex(record.Status)]++
+		}
 		m.labeledMu.Unlock()
 	}
 }
@@ -164,6 +172,16 @@ func (m *Metrics) Prometheus() string {
 	for _, stat := range m.LabeledRequests() {
 		fmt.Fprintf(&out, "gateway_requests_by_route_total{route=%q,profile=%q,status=%q} %d\n", stat.Route, stat.Profile, stat.Class, stat.Total)
 	}
+	m.labeledMu.Lock()
+	overflow := m.routeOverflow
+	m.labeledMu.Unlock()
+	out.WriteString("# HELP gateway_requests_route_overflow_total Requests for new route/profile/status combinations after the 1024-series budget is exhausted.\n")
+	out.WriteString("# TYPE gateway_requests_route_overflow_total counter\n")
+	for class, total := range overflow {
+		if total > 0 {
+			fmt.Fprintf(&out, "gateway_requests_route_overflow_total{status=%q} %d\n", StatusClass(class*100), total)
+		}
+	}
 	return out.String()
 }
 
@@ -173,8 +191,15 @@ func (m *Metrics) SortRecentByDuration() []RequestRecord {
 	return s
 }
 
+func statusClassIndex(status int) int {
+	if status < 100 || status >= 600 {
+		return 0
+	}
+	return status / 100
+}
+
 func StatusClass(status int) string {
-	if status < 100 {
+	if statusClassIndex(status) == 0 {
 		return "unknown"
 	}
 	return fmt.Sprintf("%dxx", status/100)

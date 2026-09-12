@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -275,12 +276,9 @@ func TestAggregateSSEResponsesStatuses(t *testing.T) {
 		t.Fatalf("aggregate=%v", value)
 	}
 	failed, _, err := AggregateSSE([]SSEEvent{{Event: "response.failed", Data: `{"type":"response.failed"}`}}, "openai-responses")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var failedValue map[string]any
-	if err := json.Unmarshal(failed, &failedValue); err != nil || failedValue["status"] != "failed" {
-		t.Fatalf("failed aggregate=%v err=%v", failedValue, err)
+	var failure *StreamError
+	if !errors.As(err, &failure) || len(failed) != 0 {
+		t.Fatalf("failed aggregate must return an explicit stream failure: body=%s err=%v", failed, err)
 	}
 }
 

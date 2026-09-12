@@ -43,6 +43,9 @@ type SSEEvent struct {
 const (
 	maxSSELine  = 4 << 20
 	maxSSEEvent = 16 << 20
+	// Bound per-line bookkeeping as well as payload bytes; empty data values
+	// still allocate a string slot and contribute a joining newline.
+	maxSSEDataLines = 64 << 10
 )
 
 // ReadSSEStream parses events as they arrive and hands each completed event
@@ -92,8 +95,8 @@ func ReadSSEStream(r io.Reader, emit func(SSEEvent) error) error {
 			case "event":
 				event = value
 			case "data":
-				dataBytes += len(value)
-				if dataBytes > maxSSEEvent {
+				dataBytes += len(value) + 1
+				if dataBytes > maxSSEEvent || len(data) >= maxSSEDataLines {
 					return errors.New("sse: event exceeds maximum accumulated size")
 				}
 				data = append(data, value)
@@ -186,14 +189,18 @@ type SSETranslator struct {
 
 	// responses-target state: the Responses stream protocol uses
 	// response.created/delta/completed events and no [DONE] sentinel.
-	respID        string
-	respModel     string
-	respStarted   bool
-	respCompleted bool
-	respUsage     map[string]any
-	respText      strings.Builder
-	respStop      string
-	respSeq       int
+	respID             string
+	respModel          string
+	respStarted        bool
+	respCompleted      bool
+	respUsage          map[string]any
+	respText           strings.Builder
+	respReasoning      strings.Builder
+	respReasoningID    string
+	respReasoningIndex int
+	respReasoningAdded bool
+	respStop           string
+	respSeq            int
 	// respToolItems holds the function_call output items assembled from
 	// Anthropic tool_use blocks, in output order.
 	respToolItems []map[string]any
@@ -443,6 +450,9 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 		})}
 	case "content_block_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
+			if asString(d["type"]) == "thinking_delta" {
+				return t.responsesReasoningDelta(asString(d["thinking"]))
+			}
 			if asString(d["type"]) == "input_json_delta" && len(t.respToolItems) > 0 {
 				item := t.respToolItems[len(t.respToolItems)-1]
 				item["arguments"] = asString(item["arguments"]) + asString(d["partial_json"])
@@ -470,11 +480,11 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 					}))
 					return append(opener, t.respEvent("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta", "item_id": t.itemID, "output_index": 0, "content_index": 0, "delta": text,
+						"type": "response.output_text.delta", "item_id": t.itemID, "output_index": t.respMessageIndex, "content_index": 0, "delta": text,
 					}))
 				}
 				return []SSEEvent{t.respEvent("response.output_text.delta", map[string]any{
-					"type": "response.output_text.delta", "item_id": t.itemID, "output_index": 0, "content_index": 0, "delta": text,
+					"type": "response.output_text.delta", "item_id": t.itemID, "output_index": t.respMessageIndex, "content_index": 0, "delta": text,
 				})}
 			}
 		}
@@ -524,12 +534,38 @@ func responsesResponseID(id string) string {
 // the completed response's output array.
 func (t *SSETranslator) responsesMessageItem(status string) map[string]any {
 	item := map[string]any{"id": t.itemID, "type": "message", "role": "assistant", "status": status}
-	if status == "completed" {
+	if status != "in_progress" {
 		item["content"] = []any{map[string]any{"type": "output_text", "text": t.respText.String(), "annotations": []any{}}}
 	} else {
 		item["content"] = []any{}
 	}
 	return item
+}
+
+func (t *SSETranslator) responsesReasoningItem(status string) map[string]any {
+	summary := []any{}
+	if status != "in_progress" {
+		summary = append(summary, map[string]any{"type": "summary_text", "text": t.respReasoning.String()})
+	}
+	return map[string]any{"id": t.respReasoningID, "type": "reasoning", "status": status, "summary": summary}
+}
+
+func (t *SSETranslator) responsesReasoningDelta(text string) []SSEEvent {
+	if text == "" {
+		return nil
+	}
+	var out []SSEEvent
+	if !t.respReasoningAdded {
+		t.respReasoningAdded = true
+		t.respReasoningID = "rs_" + t.itemID
+		t.respReasoningIndex = t.respNextOutputIndex
+		t.respNextOutputIndex++
+		out = append(out,
+			t.respEvent("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": t.respReasoningIndex, "item": t.responsesReasoningItem("in_progress")}),
+			t.respEvent("response.reasoning_summary_part.added", map[string]any{"type": "response.reasoning_summary_part.added", "item_id": t.respReasoningID, "output_index": t.respReasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}}))
+	}
+	t.respReasoning.WriteString(text)
+	return append(out, t.respEvent("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "item_id": t.respReasoningID, "output_index": t.respReasoningIndex, "summary_index": 0, "delta": text}))
 }
 
 // responsesFailed maps an upstream Anthropic error event onto the Responses
@@ -579,10 +615,19 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		response["usage"] = usage
 	}
 	var events []SSEEvent
-	output := []any{}
+	output := make([]any, t.respNextOutputIndex)
+	status := asString(response["status"])
+	if t.respReasoningAdded {
+		item := t.responsesReasoningItem(status)
+		output[t.respReasoningIndex] = item
+		events = append(events,
+			t.respEvent("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "item_id": t.respReasoningID, "output_index": t.respReasoningIndex, "summary_index": 0, "text": t.respReasoning.String()}),
+			t.respEvent("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "item_id": t.respReasoningID, "output_index": t.respReasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": t.respReasoning.String()}}),
+			t.respEvent("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": t.respReasoningIndex, "item": item}))
+	}
 	if t.respItemAdded {
-		item := t.responsesMessageItem("completed")
-		output = append(output, item)
+		item := t.responsesMessageItem(status)
+		output[t.respMessageIndex] = item
 		if t.respPartAdded {
 			events = append(events,
 				t.respEvent("response.output_text.done", map[string]any{
@@ -599,7 +644,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		}))
 	}
 	for index, toolItem := range t.respToolItems {
-		toolItem["status"] = "completed"
+		toolItem["status"] = status
 		outputIndex := t.respToolIndexes[index]
 		events = append(events,
 			t.respEvent("response.function_call_arguments.done", map[string]any{
@@ -609,7 +654,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 			t.respEvent("response.output_item.done", map[string]any{
 				"type": "response.output_item.done", "output_index": outputIndex, "item": toolItem,
 			}))
-		output = append(output, toolItem)
+		output[outputIndex] = toolItem
 	}
 	response["output"] = output
 	events = append(events, t.respEvent(finalEvent, map[string]any{"type": finalEvent, "response": response}))
@@ -631,6 +676,8 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 			chunk["model"] = response["model"]
 		}
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant"}}}
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": payload["delta"]}}}
 	case "response.output_text.delta":
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"content": payload["delta"]}}}
 	case "response.output_item.added":
@@ -668,23 +715,26 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 		chunk["choices"] = []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
 			"index": position, "function": map[string]any{"arguments": payload["arguments"]},
 		}}}}}
-	case "response.incomplete":
-		out := append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "length"}}}),
-			sseEvent("message_stop", map[string]any{"type": "message_stop"}))
-		t.doneSent = true
-		return out
-	case "response.completed":
+	case "response.incomplete", "response.completed":
 		if response, ok := payload["response"].(map[string]any); ok {
 			if usage, ok := response["usage"].(map[string]any); ok {
 				chunk["usage"] = map[string]any{"prompt_tokens": numberOrZero(usage["input_tokens"]), "completion_tokens": numberOrZero(usage["output_tokens"])}
 			}
 		}
 		finishReason := "stop"
-		if len(t.toolCallByItem) > 0 {
+		if eventType(event, payload) == "response.incomplete" {
+			finishReason = "length"
+		} else if len(t.toolCallByItem) > 0 {
 			finishReason = "tool_calls" // maps to Anthropic's tool_use
 		}
-		out := append(t.openAIEventToAnthropic(SSEEvent{Data: ""}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}}}),
-			t.openAIEventToAnthropic(SSEEvent{Data: ""}, chunk)...)
+		out := t.openAIEventToAnthropic(SSEEvent{}, map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}}})
+		if t.doneSent {
+			// Tool overflow already emitted a terminal error.
+			return out
+		}
+		if chunk["usage"] != nil {
+			out = append(out, t.openAIEventToAnthropic(SSEEvent{}, chunk)...)
+		}
 		out = append(out, sseEvent("message_stop", map[string]any{"type": "message_stop"}))
 		t.doneSent = true
 		return out
@@ -1196,6 +1246,39 @@ type aggregatedTool struct {
 	args strings.Builder
 }
 
+// StreamError preserves an upstream error encountered while buffering a stream.
+// Payload is a JSON error envelope suitable for conversion to the client contract.
+type StreamError struct {
+	Payload []byte
+	Message string
+}
+
+func (e *StreamError) Error() string { return e.Message }
+
+func streamFailure(event SSEEvent, payload map[string]any) *StreamError {
+	detail, failed := payload["error"].(map[string]any)
+	if response, ok := payload["response"].(map[string]any); ok {
+		if value, ok := response["error"].(map[string]any); ok {
+			detail, failed = value, true
+		}
+		failed = failed || asString(response["status"]) == "failed"
+	}
+	typ := eventType(event, payload)
+	if !failed && typ != "error" && typ != "response.failed" {
+		return nil
+	}
+	if detail == nil {
+		detail = map[string]any{"type": "upstream_error"}
+	}
+	message := asString(detail["message"])
+	if message == "" {
+		message = "upstream stream failed"
+		detail["message"] = message
+	}
+	body, _ := json.Marshal(map[string]any{"error": detail})
+	return &StreamError{Payload: body, Message: message}
+}
+
 // AggregateSSE reconstructs a non-streaming JSON response from translated
 // events. Text, tool calls and finish/usage metadata are retained, while
 // unknown event payloads are ignored rather than invented.
@@ -1204,6 +1287,7 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 	var text, reasoning strings.Builder
 	var id, model, finish string
 	var usage map[string]any
+	var responseOutput []any
 	responseStatus := "completed"
 	tools := map[int]*aggregatedTool{}
 	anthropicBlocks := map[int]*aggregatedTool{}
@@ -1217,6 +1301,9 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 		var payload map[string]any
 		if json.Unmarshal([]byte(event.Data), &payload) != nil {
 			continue
+		}
+		if failure := streamFailure(event, payload); failure != nil {
+			return nil, "", failure
 		}
 		if message, ok := payload["message"].(map[string]any); ok {
 			if id == "" {
@@ -1241,6 +1328,11 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 			}
 			if status := asString(response["status"]); status != "" {
 				responseStatus = status
+				if status != "in_progress" {
+					if output, ok := response["output"].([]any); ok {
+						responseOutput = output
+					}
+				}
 			}
 		}
 		if id == "" {
@@ -1304,11 +1396,11 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 	}
 	if strings.Contains(contract, "responses") {
 		output := []any{}
-		if text.Len() > 0 || reasoning.Len() > 0 || len(responseToolOrder) == 0 {
+		if reasoning.Len() > 0 {
+			output = append(output, map[string]any{"id": nextResponsesItemID(), "type": "reasoning", "status": responseStatus, "summary": []any{map[string]any{"type": "summary_text", "text": reasoning.String()}}})
+		}
+		if text.Len() > 0 || reasoning.Len() == 0 && len(responseToolOrder) == 0 {
 			content := []any{}
-			if reasoning.Len() > 0 {
-				content = append(content, map[string]any{"type": "reasoning_text", "text": reasoning.String()})
-			}
 			if text.Len() > 0 || len(content) == 0 {
 				content = append(content, map[string]any{"type": "output_text", "text": text.String(), "annotations": []any{}})
 			}
@@ -1317,6 +1409,11 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 		for _, itemID := range responseToolOrder {
 			tool := responseTools[itemID]
 			output = append(output, map[string]any{"id": itemID, "type": "function_call", "status": responseStatus, "call_id": tool.id, "name": tool.name, "arguments": tool.args.String()})
+		}
+		// Terminal output is the authoritative complete set of items, retaining
+		// original item IDs, ordering and content types across buffering.
+		if responseOutput != nil {
+			output = responseOutput
 		}
 		body := map[string]any{"id": id, "object": "response", "status": responseStatus, "model": model, "output": output, "usage": usage}
 		if responseStatus == "incomplete" {
@@ -1559,7 +1656,20 @@ func bufferedResponsesEvents(value map[string]any) []SSEEvent {
 		if !ok {
 			continue
 		}
-		events = append(events, makeEvent("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": item}))
+		announced := make(map[string]any, len(item))
+		for key, value := range item {
+			announced[key] = value
+		}
+		announced["status"] = "in_progress"
+		switch asString(item["type"]) {
+		case "message":
+			announced["content"] = []any{}
+		case "reasoning":
+			announced["summary"] = []any{}
+		case "function_call":
+			announced["arguments"] = ""
+		}
+		events = append(events, makeEvent("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": announced}))
 		switch asString(item["type"]) {
 		case "message":
 			for contentIndex, rawContent := range asSlice(item["content"]) {
@@ -1572,6 +1682,18 @@ func bufferedResponsesEvents(value map[string]any) []SSEEvent {
 					events = append(events, makeEvent("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": item["id"], "output_index": outputIndex, "content_index": contentIndex, "delta": part["text"]}), makeEvent("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": item["id"], "output_index": outputIndex, "content_index": contentIndex, "text": part["text"]}))
 				}
 				events = append(events, makeEvent("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": item["id"], "output_index": outputIndex, "content_index": contentIndex, "part": part}))
+			}
+		case "reasoning":
+			for summaryIndex, rawSummary := range asSlice(item["summary"]) {
+				part, ok := rawSummary.(map[string]any)
+				if !ok || asString(part["type"]) != "summary_text" {
+					continue
+				}
+				events = append(events,
+					makeEvent("response.reasoning_summary_part.added", map[string]any{"type": "response.reasoning_summary_part.added", "item_id": item["id"], "output_index": outputIndex, "summary_index": summaryIndex, "part": map[string]any{"type": "summary_text", "text": ""}}),
+					makeEvent("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "item_id": item["id"], "output_index": outputIndex, "summary_index": summaryIndex, "delta": part["text"]}),
+					makeEvent("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "item_id": item["id"], "output_index": outputIndex, "summary_index": summaryIndex, "text": part["text"]}),
+					makeEvent("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "item_id": item["id"], "output_index": outputIndex, "summary_index": summaryIndex, "part": part}))
 			}
 		case "function_call":
 			events = append(events, makeEvent("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": item["id"], "output_index": outputIndex, "delta": item["arguments"]}), makeEvent("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": outputIndex, "name": item["name"], "arguments": item["arguments"]}))

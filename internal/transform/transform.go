@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -103,8 +105,9 @@ type BodySpec struct {
 	Minimum map[string]float64 `yaml:"minimum,omitempty" json:"minimum,omitempty"`
 }
 
-// TransformSpec is intentionally declarative and serialisable.  Steps allows
-// a profile to express a sequence while retaining a single spec for the
+// TransformSpec is intentionally declarative and serialisable. Map operations
+// run in lexicographic key order; use Steps for a different order of dependent
+// rules. Steps lets a profile express a sequence while retaining one spec for the
 // common case.  A YAML sequence supplied where a spec is expected is decoded
 // into Steps by UnmarshalYAML.
 type TransformSpec struct {
@@ -431,25 +434,37 @@ func hasBodyOps(b BodySpec) bool {
 }
 
 func applyHeaders(headers http.Header, spec HeaderSpec) {
-	if headers == nil {
+	if headers == nil || len(spec.Rename)+len(spec.Delete)+len(spec.Set)+len(spec.Add) == 0 {
 		return
 	}
-	for from, to := range spec.Rename {
+	// Canonicalise hand-built headers before delete/set, including all case
+	// variants, so old credentials cannot survive a rewrite.
+	canonical := make(http.Header, len(headers))
+	for _, key := range sortedKeys(headers) {
+		name := textproto.CanonicalMIMEHeaderKey(key)
+		canonical[name] = append(canonical[name], headers[key]...)
+		delete(headers, key)
+	}
+	for key, values := range canonical {
+		headers[key] = values
+	}
+	for _, from := range sortedKeys(spec.Rename) {
+		to := spec.Rename[from]
 		vals := headerValues(headers, from)
 		if len(vals) == 0 || strings.EqualFold(from, to) {
 			continue
 		}
 		headers.Del(from)
-		headers[to] = append([]string(nil), vals...)
+		headers[textproto.CanonicalMIMEHeaderKey(to)] = append([]string(nil), vals...)
 	}
 	for _, key := range spec.Delete {
 		headers.Del(key)
 	}
-	for key, value := range spec.Set {
-		headers.Set(key, value)
+	for _, key := range sortedKeys(spec.Set) {
+		headers.Set(key, spec.Set[key])
 	}
-	for key, value := range spec.Add {
-		headers.Add(key, value)
+	for _, key := range sortedKeys(spec.Add) {
+		headers.Add(key, spec.Add[key])
 	}
 }
 
@@ -474,16 +489,17 @@ func applyQuery(q url.Values, spec QuerySpec) {
 	if q == nil {
 		return
 	}
-	for from, to := range spec.Rename {
+	for _, from := range sortedKeys(spec.Rename) {
+		to := spec.Rename[from]
 		if strings.EqualFold(from, to) {
 			continue
 		}
 		vals, ok := q[from]
 		if !ok {
 			// url.Values keys are case-sensitive; tolerate case variants.
-			for k, v := range q {
+			for _, k := range sortedKeys(q) {
 				if strings.EqualFold(k, from) {
-					vals, ok = v, true
+					vals, ok = q[k], true
 					delete(q, k)
 					break
 				}
@@ -503,11 +519,11 @@ func applyQuery(q url.Values, spec QuerySpec) {
 			}
 		}
 	}
-	for key, value := range spec.Set {
-		q.Set(key, value)
+	for _, key := range sortedKeys(spec.Set) {
+		q.Set(key, spec.Set[key])
 	}
-	for key, value := range spec.Add {
-		q.Add(key, value)
+	for _, key := range sortedKeys(spec.Add) {
+		q.Add(key, spec.Add[key])
 	}
 }
 
@@ -535,8 +551,8 @@ func applyBody(raw *[]byte, contentType string, spec BodySpec) error {
 	} else if !errors.Is(err, io.EOF) {
 		return &TransformError{Stage: "body", Code: "invalid_json", Err: err}
 	}
-	for path, v := range spec.Rename {
-		if err := renameAt(&value, path, v); err != nil {
+	for _, path := range sortedKeys(spec.Rename) {
+		if err := renameAt(&value, path, spec.Rename[path]); err != nil {
 			return &TransformError{Stage: "body", Code: "rename_failed", Path: path, Err: err}
 		}
 	}
@@ -545,18 +561,19 @@ func applyBody(raw *[]byte, contentType string, spec BodySpec) error {
 			return &TransformError{Stage: "body", Code: "delete_failed", Path: path, Err: err}
 		}
 	}
-	for path, v := range spec.Default {
-		if err := defaultAt(&value, path, v); err != nil {
+	for _, path := range sortedKeys(spec.Default) {
+		// Copy composite rule values before subsequent edits can reach them.
+		if err := defaultAt(&value, path, cloneValue(spec.Default[path])); err != nil {
 			return &TransformError{Stage: "body", Code: "default_failed", Path: path, Err: err}
 		}
 	}
-	for path, v := range spec.Set {
-		if err := setAt(&value, path, v); err != nil {
+	for _, path := range sortedKeys(spec.Set) {
+		if err := setAt(&value, path, cloneValue(spec.Set[path])); err != nil {
 			return &TransformError{Stage: "body", Code: "set_failed", Path: path, Err: err}
 		}
 	}
-	for path, minimum := range spec.Minimum {
-		if err := minimumAt(&value, path, minimum); err != nil {
+	for _, path := range sortedKeys(spec.Minimum) {
+		if err := minimumAt(&value, path, spec.Minimum[path]); err != nil {
 			return &TransformError{Stage: "body", Code: "minimum_failed", Path: path, Err: err}
 		}
 	}
@@ -860,18 +877,83 @@ func cloneValue(v any) any {
 	case map[string]any:
 		return cloneMap(x)
 	case []any:
+		if x == nil {
+			return []any(nil)
+		}
 		a := make([]any, len(x))
 		for i := range x {
 			a[i] = cloneValue(x[i])
 		}
 		return a
 	default:
-		return v
+		if v == nil {
+			return nil
+		}
+		return cloneJSONValue(reflect.ValueOf(v)).Interface()
+	}
+}
+
+// Programmatic rules may contain typed JSON-compatible containers, not just
+// the map[string]any / []any values produced by config decoding. Preserve their
+// types while separating any mutable exported state from callers and requests.
+func cloneJSONValue(value reflect.Value) reflect.Value {
+	switch value.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if value.IsNil() {
+			return value
+		}
+		out := reflect.New(value.Type()).Elem()
+		if value.Kind() == reflect.Pointer {
+			out.Set(reflect.New(value.Type().Elem()))
+			out.Elem().Set(cloneJSONValue(value.Elem()))
+		} else {
+			out.Set(cloneJSONValue(value.Elem()))
+		}
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return value
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), cloneJSONValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice, reflect.Array:
+		var out reflect.Value
+		if value.Kind() == reflect.Slice {
+			if value.IsNil() {
+				return value
+			}
+			out = reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		} else {
+			out = reflect.New(value.Type()).Elem()
+		}
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(cloneJSONValue(value.Index(i)))
+		}
+		return out
+	case reflect.Struct:
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).IsExported() {
+				out.Field(i).Set(cloneJSONValue(value.Field(i)))
+			}
+		}
+		return out
+	default:
+		return value
 	}
 }
 
 func cloneSpec(in TransformSpec) TransformSpec {
 	out := in
+	if in.Status != nil {
+		status := *in.Status
+		out.Status = &status
+	}
 	out.Query.Set = cloneStringMap(in.Query.Set)
 	out.Query.Add = cloneStringMap(in.Query.Add)
 	out.Query.Rename = cloneStringMap(in.Query.Rename)
@@ -896,6 +978,15 @@ func cloneSpec(in TransformSpec) TransformSpec {
 		out.Steps[i] = cloneSpec(in.Steps[i])
 	}
 	return out
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

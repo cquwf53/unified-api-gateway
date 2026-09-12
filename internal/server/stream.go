@@ -165,11 +165,7 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 	translator := adapter.NewSSETranslator(profile.UpstreamContract, profile.ClientContract)
 	max := responseLimit(cfg, profile)
 	var total int64
-	streamErr := adapter.ReadSSEStream(response.Body, func(event adapter.SSEEvent) error {
-		outEvents, translateErr := translator.Translate(event)
-		if translateErr != nil {
-			return translateErr
-		}
+	writeEvents := func(outEvents []adapter.SSEEvent) error {
 		if len(outEvents) == 0 {
 			return nil
 		}
@@ -185,13 +181,31 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 			flusher.Flush()
 		}
 		return nil
+	}
+	input := &boundedStreamReader{reader: response.Body, remaining: max}
+	streamErr := adapter.ReadSSEStream(input, func(event adapter.SSEEvent) error {
+		outEvents, translateErr := translator.Translate(event)
+		if translateErr != nil {
+			return translateErr
+		}
+		return writeEvents(outEvents)
 	})
+	if streamErr == nil {
+		streamErr = writeEvents(translator.Finish())
+	}
 	if streamErr != nil {
 		// A parser, translator, size, or upstream read failure is not a clean
 		// completion. Emit an explicit target-protocol failure when the client is
 		// still writable, but never call Finish and fabricate success.
 		if upstreamCode(streamErr) != "client_stream_write_failed" {
-			if failure := translator.Fail("upstream stream terminated unexpectedly"); len(failure) > 0 {
+			failure := translator.Fail("upstream stream terminated unexpectedly")
+			if len(failure) == 0 {
+				// Translate/Finish may already have marked a generated terminal
+				// event done before writeEvents rejected its size. The client has
+				// not received that event and still needs an explicit failure.
+				failure = adapter.NewSSETranslator(profile.UpstreamContract, profile.ClientContract).Fail("upstream stream terminated unexpectedly")
+			}
+			if len(failure) > 0 {
 				_, _ = w.Write(adapter.EncodeSSE(failure))
 				if flusher != nil {
 					flusher.Flush()
@@ -200,15 +214,27 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 		}
 		return status, headersSent, streamErr
 	}
-	if finishing := translator.Finish(); len(finishing) > 0 {
-		if _, writeErr := w.Write(adapter.EncodeSSE(finishing)); writeErr != nil {
-			return status, headersSent, upstreamError{status: status, code: "client_stream_write_failed", err: writeErr}
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 	return status, headersSent, nil
+}
+
+// boundedStreamReader caps raw upstream bytes even when frames are filtered or
+// have not yet reached an event separator. Unlike LimitReader, overflow is an
+// error rather than a clean EOF that the translator might complete successfully.
+type boundedStreamReader struct {
+	reader    io.Reader
+	remaining int64
+}
+
+func (r *boundedStreamReader) Read(p []byte) (int, error) {
+	if r.remaining < int64(len(p))-1 {
+		p = p[:r.remaining+1]
+	}
+	n, err := r.reader.Read(p)
+	if int64(n) > r.remaining {
+		return 0, upstreamError{status: http.StatusBadGateway, code: "upstream_stream_too_large", err: errors.New("upstream stream exceeded configured limit")}
+	}
+	r.remaining -= int64(n)
+	return n, err
 }
 
 func isEventStreamResponse(response *http.Response) bool {
@@ -281,7 +307,7 @@ func applyUpstreamAuth(header http.Header, cfg *config.Config, upstream config.U
 		return
 	}
 	if value := resolveCredential(credential); value != "" {
-		if strings.EqualFold(credential.Type, "api_key") {
+		if strings.EqualFold(strings.TrimSpace(credential.Type), "api_key") {
 			header.Set("X-API-Key", value)
 		} else {
 			header.Set("Authorization", "Bearer "+value)

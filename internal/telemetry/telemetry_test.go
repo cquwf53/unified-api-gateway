@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -64,5 +65,52 @@ func TestLabeledRouteCounters(t *testing.T) {
 	}
 	if !strings.Contains(prometheus, `gateway_requests_by_route_total{route="chat",profile="p1",status="2xx"} 2`) {
 		t.Fatalf("prometheus=%s", prometheus)
+	}
+}
+
+func TestRouteCountersBoundCardinalityAndPreserveTotals(t *testing.T) {
+	const budget = 1024
+	metrics := New(1)
+	for i := 0; i < budget+10; i++ {
+		metrics.Observe(RequestRecord{Status: 200, Route: fmt.Sprintf("route-%04d", i), Profile: "profile"})
+	}
+	// Existing counters must remain monotonic after the budget is exhausted.
+	metrics.Observe(RequestRecord{Status: 200, Route: "route-0000", Profile: "profile"})
+	metrics.Observe(RequestRecord{Status: 500, Route: "overflow", Profile: "profile"})
+	metrics.Observe(RequestRecord{Status: 999, Route: "overflow", Profile: "profile"})
+	stats := metrics.LabeledRequests()
+	if len(stats) != budget {
+		t.Fatalf("route series=%d, budget=%d", len(stats), budget)
+	}
+	if stats[0].Route != "route-0000" || stats[0].Total != 2 {
+		t.Fatalf("original counter changed identity or reset: %+v", stats[0])
+	}
+	var retained uint64
+	for _, stat := range stats {
+		retained += stat.Total
+	}
+	if retained != budget+1 {
+		t.Fatalf("retained requests=%d", retained)
+	}
+	prometheus := metrics.Prometheus()
+	for _, sample := range []string{
+		"gateway_requests_route_overflow_total{status=\"2xx\"} 10",
+		"gateway_requests_route_overflow_total{status=\"5xx\"} 1",
+		"gateway_requests_route_overflow_total{status=\"unknown\"} 1",
+	} {
+		if !strings.Contains(prometheus, sample) {
+			t.Errorf("missing overflow sample %s", sample)
+		}
+	}
+}
+
+func TestStatusClassHasBoundedValues(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   string
+	}{{0, "unknown"}, {99, "unknown"}, {101, "1xx"}, {200, "2xx"}, {599, "5xx"}, {600, "unknown"}, {9999, "unknown"}} {
+		if got := StatusClass(tc.status); got != tc.want {
+			t.Errorf("StatusClass(%d)=%q, want %q", tc.status, got, tc.want)
+		}
 	}
 }

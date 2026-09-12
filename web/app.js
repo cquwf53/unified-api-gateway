@@ -7,17 +7,37 @@
   const time = (value) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
   const short = (value, length = 12) => { const text = String(value ?? ""); return text.length > length ? `${text.slice(0, length)}…` : text; };
 
+  let authRevision = 0;
+  let tokenPrompt = null;
+
   async function api(path, options = {}) {
+    const revision = authRevision;
     const token = window.localStorage.getItem("gateway_admin_token");
-    const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-    if (token) headers["X-Admin-Token"] = token;
-    let response = await fetch(path, { headers, ...options });
-    if (response.status === 401 && !token) {
-      const entered = window.prompt("请输入管理面令牌（留空取消）");
-      if (entered) {
-        window.localStorage.setItem("gateway_admin_token", entered);
-        headers["X-Admin-Token"] = entered;
-        response = await fetch(path, { headers, ...options });
+    const request = (adminToken) => {
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      if (adminToken) headers["X-Admin-Token"] = adminToken;
+      return fetch(path, { ...options, headers });
+    };
+    let response = await request(token);
+    if (response.status === 401) {
+      // Requests from one refresh share the prompt, including late 401s from
+      // the old token. A canceled or rejected token is never left in storage.
+      if (revision === authRevision && !tokenPrompt) {
+        authRevision++;
+        window.localStorage.removeItem("gateway_admin_token");
+        tokenPrompt = Promise.resolve().then(() => {
+          const entered = window.prompt("请输入管理面令牌（留空取消并清除原令牌）")?.trim();
+          if (entered) window.localStorage.setItem("gateway_admin_token", entered);
+          return entered;
+        }).finally(() => { tokenPrompt = null; });
+      }
+      const replacement = tokenPrompt ? await tokenPrompt : window.localStorage.getItem("gateway_admin_token");
+      if (replacement) {
+        response = await request(replacement);
+        if (response.status === 401 && window.localStorage.getItem("gateway_admin_token") === replacement) {
+          window.localStorage.removeItem("gateway_admin_token");
+          authRevision++;
+        }
       }
     }
     const data = await response.json().catch(() => ({}));
@@ -60,7 +80,7 @@
     $("#recent-requests").innerHTML = recent.length ? recent.map((item) => `
       <tr><td><span class="request-method">${escapeHTML(item.method)}</span><span class="request-path">${escapeHTML(item.path)}</span></td>
       <td>${escapeHTML(item.profile || "—")}</td><td><span class="mode-tag ${escapeHTML(item.mode)}">${escapeHTML(item.mode || "live")}</span></td>
-      <td class="${item.status >= 200 && item.status < 400 ? "status-ok" : "status-fail"}">${escapeHTML(item.status || "—")}</td><td>${item.duration_ns ? `${(item.duration_ns / 1e6).toFixed(1)} ms` : "—"}</td></tr>`).join("") : '<tr><td colspan="5" class="empty">尚无请求</td></tr>';
+      <td class="${!item.error_code && ((item.status >= 200 && item.status < 400) || item.status === 101) ? "status-ok" : "status-fail"}">${escapeHTML(item.status || "—")}</td><td>${item.duration_ns ? `${(item.duration_ns / 1e6).toFixed(1)} ms` : "—"}</td></tr>`).join("") : '<tr><td colspan="5" class="empty">尚无请求</td></tr>';
   }
 
   function renderProfiles() {
@@ -94,7 +114,8 @@
       const [status, profiles, routes, versions, audit] = await Promise.all([api("/api/status"), api("/api/profiles"), api("/api/routes"), api("/api/versions"), api("/api/audit")]);
       state.status = status; state.profiles = profiles.profiles || []; state.routes = routes.routes || []; state.versions = versions.versions || []; state.audit = audit.events || [];
       setConnection(true); renderStatus(); renderProfiles(); renderRoutes(); renderVersions();
-    } catch (error) { setConnection(false); toast(error.message, true); }
+      return true;
+    } catch (error) { setConnection(false); toast(error.message, true); return false; }
   }
 
   function switchView(view) {
@@ -105,7 +126,7 @@
   }
 
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
-  $("#refresh-button").addEventListener("click", () => refresh().then(() => toast("状态已刷新")));
+  $("#refresh-button").addEventListener("click", async () => { if (await refresh()) toast("状态已刷新"); });
   $$("[data-profile-filter]").forEach((button) => button.addEventListener("click", () => { state.filter = button.dataset.profileFilter; $$("[data-profile-filter]").forEach((item) => item.classList.toggle("active", item === button)); renderProfiles(); }));
 
   $("#preview-form").addEventListener("submit", async (event) => {
@@ -124,8 +145,13 @@
   $("#explain-demo").addEventListener("click", async () => { try { const data = await api("/api/explain?path=/v1/chat/completions&method=POST"); toast(`命中 ${data.profile?.name || "默认规则"}`); } catch (error) { toast(error.message, true); } });
 
   const dialog = $("#activate-dialog");
-  $$("[data-open-activate]").forEach((button) => button.addEventListener("click", async () => { try { const config = await api("/api/config"); $("#activate-yaml").value = window.yamlHint || `# 当前 active 版本：${config.version || 1}\n# 请粘贴完整 YAML 配置后激活\n`; } catch { $("#activate-yaml").value = "# 请粘贴完整 YAML 配置后激活\n"; } dialog.showModal(); }));
-  $("#activate-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const yaml = $("#activate-yaml").value.trim(); if (!yaml) throw new Error("YAML 不能为空"); const result = await api("/api/activate", { method: "POST", body: JSON.stringify({ yaml, description: $("#activate-description").value }) }); dialog.close(); toast(`配置已激活：${result.id}`); await refresh(); } catch (error) { toast(error.message, true); } });
+  $$("[data-open-activate]").forEach((button) => button.addEventListener("click", () => {
+    $("#activate-yaml").value = "";
+    $("#activate-description").value = "";
+    dialog.showModal();
+  }));
+  $$("[data-close-activate]").forEach((button) => button.addEventListener("click", () => dialog.close()));
+  $("#activate-form").addEventListener("submit", async (event) => { event.preventDefault(); if (event.submitter?.value === "cancel") { dialog.close(); return; } try { const yaml = $("#activate-yaml").value.trim(); if (!yaml) throw new Error("YAML 不能为空"); const result = await api("/api/activate", { method: "POST", body: JSON.stringify({ yaml, description: $("#activate-description").value }) }); dialog.close(); toast(`配置已激活：${result.id}`); await refresh(); } catch (error) { toast(error.message, true); } });
   $("#version-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-rollback]"); if (!button) return; if (!window.confirm(`确认回滚到 ${button.dataset.rollback}？`)) return; try { await api("/api/rollback", { method: "POST", body: JSON.stringify({ id: button.dataset.rollback }) }); toast("已回滚配置"); await refresh(); } catch (error) { toast(error.message, true); } });
   $("#profile-grid").addEventListener("click", async (event) => { const button = event.target.closest("[data-switch-profile]"); if (!button) return; if (!window.confirm(`将 ${button.dataset.switchProfile} 设为默认 profile？`)) return; try { const result = await api("/api/switch", { method: "POST", body: JSON.stringify({ profile: button.dataset.switchProfile, description: `quick switch → ${button.dataset.switchProfile}` }) }); toast(`已切换：${result.profile}`); await refresh(); } catch (error) { toast(error.message, true); } });
   $("#route-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-switch-route]"); if (!button) return; const profile = window.prompt("输入要切换到的 profile ID：", state.routes.find((route) => (route.id || route.name) === button.dataset.switchRoute)?.profile || ""); if (!profile) return; try { await api("/api/switch", { method: "POST", body: JSON.stringify({ route_id: button.dataset.switchRoute, profile, description: `route switch → ${profile}` }) }); toast("路由 profile 已切换"); await refresh(); } catch (error) { toast(error.message, true); } });

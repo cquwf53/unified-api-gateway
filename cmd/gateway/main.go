@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -151,12 +152,9 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 	}
 	applyLogLevel(baseSnapshot.Config.Observability.LogLevel)
 	slog.Info("gateway starting", "version", server.BuildVersion, "config_id", baseSnapshot.ID)
-	if err := storeDB.SaveVersionAndActivate(context.Background(), store.Version{ID: baseSnapshot.ID, CreatedBy: "startup", SHA256: baseSnapshot.Hash, YAML: data}); err != nil {
-		slog.Warn("activate startup version in history", "error", err)
-	}
 	// Command-line listener overrides are re-applied after the restore so
 	// they survive a stored active configuration.
-	snapshot := baseSnapshot
+	snapshot := baseSnapshot.Clone()
 	if httpOverride != "" {
 		snapshot.Config.Listeners.HTTP = httpOverride
 	}
@@ -184,19 +182,44 @@ func serve(configPath, dbPath, httpOverride, adminOverride string, preferFile bo
 		grpcServer = &http.Server{Addr: snapshot.Config.Listeners.GRPC, Handler: http.HandlerFunc(gateway.ServeGRPCHTTP), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	}
 
+	// Build the runtime and bind every listener before changing restart state.
+	// A failed pipeline or occupied port must leave the previous active version
+	// available for the next startup.
+	dataListener, err := net.Listen("tcp", dataServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen data plane: %w", err)
+	}
+	defer dataListener.Close()
+	adminListener, err := net.Listen("tcp", adminServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen management plane: %w", err)
+	}
+	defer adminListener.Close()
+	var grpcListener net.Listener
+	if grpcServer != nil {
+		grpcListener, err = net.Listen("tcp", grpcServer.Addr)
+		if err != nil {
+			return fmt.Errorf("listen gRPC plane: %w", err)
+		}
+		defer grpcListener.Close()
+	}
+	if err := storeDB.SaveVersionAndActivate(context.Background(), store.Version{ID: baseSnapshot.ID, CreatedBy: "startup", SHA256: baseSnapshot.Hash, YAML: data}); err != nil {
+		return fmt.Errorf("activate startup version in history: %w", err)
+	}
+
 	errCh := make(chan error, 3)
 	go func() {
 		slog.Info("data plane listening", "address", dataServer.Addr)
-		errCh <- dataServer.ListenAndServe()
+		errCh <- dataServer.Serve(dataListener)
 	}()
 	go func() {
 		slog.Info("management plane listening", "address", adminServer.Addr)
-		errCh <- adminServer.ListenAndServe()
+		errCh <- adminServer.Serve(adminListener)
 	}()
 	if grpcServer != nil {
 		go func() {
 			slog.Info("gRPC transparent listener", "address", grpcServer.Addr)
-			errCh <- grpcServer.ListenAndServe()
+			errCh <- grpcServer.Serve(grpcListener)
 		}()
 	}
 
@@ -294,7 +317,7 @@ func rollback(dbPath, id string) error {
 	if err := db.Activate(context.Background(), id); err != nil {
 		return err
 	}
-	fmt.Printf("rolled back to %s (validated snapshot %s)\n", id, snapshot.ID)
+	fmt.Printf("rolled back to %s for next startup (validated snapshot %s; restart the running gateway to apply)\n", id, snapshot.ID)
 	return nil
 }
 
@@ -303,7 +326,11 @@ func preview(configPath string) error {
 	if err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(snapshot, "", "  ")
+	snapshot.Config = snapshot.Config.Redacted()
+	b, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal configuration preview: %w", err)
+	}
 	fmt.Println(string(b))
 	return nil
 }

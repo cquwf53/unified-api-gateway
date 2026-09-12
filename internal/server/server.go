@@ -109,12 +109,12 @@ func New(options Options) (*Server, error) {
 		shadowSem:  make(chan struct{}, maxInflightShadow),
 		auditCh:    make(chan store.AuditEvent, 256),
 	}
+	if err := s.publishState(options.Snapshot); err != nil {
+		return nil, err
+	}
 	if options.Store != nil {
 		s.auditWG.Add(1)
 		go s.drainAuditEvents()
-	}
-	if err := s.publishState(options.Snapshot); err != nil {
-		return nil, err
 	}
 	return s, nil
 }
@@ -667,19 +667,26 @@ func resolveCredential(c config.Credential) string {
 	// Both "env" and "api_key" (Anthropic-style X-API-Key) credentials name
 	// an environment variable in Env (or Ref); only the injected header
 	// differs, which the caller picks from the type.
-	if strings.EqualFold(c.Type, "env") || strings.EqualFold(c.Type, "api_key") {
+	credentialType := strings.ToLower(strings.TrimSpace(c.Type))
+	if credentialType == "env" || credentialType == "api_key" {
 		name := c.Env
 		if name == "" {
 			name = c.Ref
 		}
 		if name != "" {
-			return os.Getenv(strings.TrimPrefix(name, "env:"))
+			return resolveEnvironmentName(name)
 		}
 	}
 	if c.Ref != "" {
 		return resolveSecretValue(c.Ref)
 	}
-	return resolveSecretValue(c.Env)
+	return resolveEnvironmentName(c.Env)
+}
+
+func resolveEnvironmentName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(strings.TrimPrefix(name, "env:"), "$ENV:")
+	return os.Getenv(name)
 }
 
 func resolveSecretValue(value string) string {

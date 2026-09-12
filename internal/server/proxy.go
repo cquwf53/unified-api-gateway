@@ -474,6 +474,15 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 		// to SSE text would corrupt it (invalid_json).
 		body, contentType, aggregateErr := adapter.AggregateSSE(translated, profile.ClientContract)
 		if aggregateErr != nil {
+			var failure *adapter.StreamError
+			if errors.As(aggregateErr, &failure) {
+				response.StatusCode = http.StatusBadGateway
+				response.Body = failure.Payload
+				response.ContentType = "application/json"
+				response.Headers = response.Headers.Clone()
+				response.Headers.Set("Content-Type", response.ContentType)
+				return s.applyResponseTransforms(ctx, pinned, cfg, profile, errorEnvelope(profile.ClientContract, response))
+			}
 			return transform.Envelope{}, aggregateErr
 		}
 		response.Body = body

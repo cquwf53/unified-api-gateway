@@ -37,6 +37,15 @@ func (s *Server) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleReady(w, r)
 		return
 	}
+	// The embedded login shell contains no configuration or credentials. It
+	// must load before the browser can ask for an administrator token.
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		switch r.URL.Path {
+		case "/", "/index.html", "/app.js", "/styles.css":
+			s.writeStatic(w, r)
+			return
+		}
+	}
 	if !s.authorizeAdmin(r) {
 		s.writeError(w, http.StatusUnauthorized, "auth", "admin_auth_required", "administrator authentication is required", "")
 		return
@@ -409,6 +418,12 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	cfg := s.Snapshot().Config
 	req := route.FromHTTPRequest(r)
 	req.Profile = r.URL.Query().Get("profile")
+	if method := r.URL.Query().Get("method"); method != "" {
+		req.Method = method
+	}
+	if requestPath := r.URL.Query().Get("path"); requestPath != "" {
+		req.Path = requestPath
+	}
 	if r.Method == http.MethodPost {
 		var input struct {
 			Method  string              `json:"method"`
@@ -416,26 +431,30 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 			Headers map[string][]string `json:"headers"`
 			Profile string              `json:"profile"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err == nil {
-			if input.Method != "" {
-				req.Method = input.Method
-			}
-			if input.Path != "" {
-				req.Path = input.Path
-			}
-			if input.Headers != nil {
-				req.Headers = input.Headers
-			}
-			if input.Profile != "" {
-				req.Profile = input.Profile
-			}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
+			s.writeError(w, http.StatusBadRequest, "explain", "invalid_json", err.Error(), "")
+			return
+		}
+		if input.Method != "" {
+			req.Method = input.Method
+		}
+		if input.Path != "" {
+			req.Path = input.Path
+		}
+		if input.Headers != nil {
+			req.Headers = input.Headers
+		}
+		if input.Profile != "" {
+			req.Profile = input.Profile
 		}
 	}
 	matched := route.MatchRoutes(cfg, req)
 	profile, selected, err := route.SelectProfile(cfg, req)
 	payload := map[string]any{"matched_routes": matched, "selected_route": selected}
 	if profile != nil {
-		payload["profile"] = profile
+		safeProfile := cfg.Redacted().Profiles[profile.RuntimeID]
+		safeProfile.Name = profile.Name
+		payload["profile"] = safeProfile
 	}
 	if err != nil {
 		payload["error"] = err.Error()
@@ -535,32 +554,5 @@ func staticETag(data []byte) string {
 	return `"` + hex.EncodeToString(sum[:12]) + `"`
 }
 func redactConfig(c *config.Config) *config.Config {
-	clone := c.Clone()
-	extraRedactions := configuredRedactions(c)
-	for id, credential := range clone.Credentials {
-		credential.Value = "[REDACTED]"
-		// A Ref that is not an env:/$ENV: reference is a literal secret.
-		if credential.Ref != "" && !strings.HasPrefix(credential.Ref, "env:") && !strings.HasPrefix(credential.Ref, "$ENV:") {
-			credential.Ref = "[REDACTED]"
-		}
-		clone.Credentials[id] = credential
-	}
-	for id, client := range clone.Clients {
-		if client.Key != "" {
-			client.Key = "[REDACTED]"
-		}
-		if client.KeyRef != "" && !strings.HasPrefix(client.KeyRef, "env:") && !strings.HasPrefix(client.KeyRef, "$ENV:") {
-			client.KeyRef = "[REDACTED]"
-		}
-		clone.Clients[id] = client
-	}
-	for id, upstream := range clone.Upstreams {
-		for key := range upstream.Headers {
-			if isSensitiveHeader(key) || extraRedactions[strings.ToLower(key)] {
-				upstream.Headers[key] = "[REDACTED]"
-			}
-		}
-		clone.Upstreams[id] = upstream
-	}
-	return clone
+	return c.Redacted()
 }
