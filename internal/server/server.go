@@ -57,7 +57,10 @@ func (st *gatewayState) allowsAnonymousOverride() bool {
 }
 
 type Server struct {
-	state atomic.Pointer[gatewayState]
+	state         atomic.Pointer[gatewayState]
+	ingressActive atomic.Int64
+	admissionMu   sync.Mutex
+	admissions    map[string]*profileAdmission
 	// configMu serializes activation, rollback and quick-switch so two
 	// concurrent admin calls cannot interleave their store/memory phases.
 	configMu   sync.Mutex
@@ -109,7 +112,11 @@ func New(options Options) (*Server, error) {
 		shadowSem:  make(chan struct{}, maxInflightShadow),
 		auditCh:    make(chan store.AuditEvent, 256),
 	}
-	if err := s.publishState(options.Snapshot); err != nil {
+	snapshot, err := config.NewSnapshot(options.Snapshot.Config, options.Snapshot.Source)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.publishState(snapshot); err != nil {
 		return nil, err
 	}
 	if options.Store != nil {
@@ -215,7 +222,14 @@ func (s *Server) clonableTransport() *http.Transport {
 	return nil
 }
 
+// Snapshot returns an independent copy for callers to inspect or edit.
 func (s *Server) Snapshot() *config.ConfigSnapshot {
+	return s.currentSnapshot().Clone()
+}
+
+// currentSnapshot is for internal readers only. Published configuration must
+// never be mutated; edits start from a clone and go through activation.
+func (s *Server) currentSnapshot() *config.ConfigSnapshot {
 	if s == nil {
 		return nil
 	}
@@ -229,29 +243,40 @@ func (s *Server) Activate(snapshot *config.ConfigSnapshot) error {
 	if snapshot == nil || snapshot.Config == nil {
 		return errors.New("server: cannot activate an empty snapshot")
 	}
-	if err := snapshot.Config.Validate(); err != nil {
-		return err
-	}
-	if err := validateRuntimeRequirements(snapshot.Config); err != nil {
-		return err
-	}
+	// Reparse the persisted representation before assigning its content address
+	// so caller-edited metadata cannot corrupt version history or restart state.
+	// Config's YAML marshaler preserves numeric rule values and status-map keys.
 	data, err := yaml.Marshal(snapshot.Config)
 	if err != nil {
 		return fmt.Errorf("marshal activated configuration: %w", err)
 	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		return err
+	}
+	candidate, err := config.NewSnapshot(cfg, snapshot.Source)
+	if err != nil {
+		return err
+	}
+	if err := validateRuntimeRequirements(candidate.Config); err != nil {
+		return err
+	}
 	s.configMu.Lock()
-	err = s.commitConfig(snapshot.Clone(), data, "server-api", "programmatic activation")
+	err = s.commitConfig(candidate, data, "server-api", "programmatic activation")
 	s.configMu.Unlock()
 	if err != nil {
 		return err
 	}
 	if s.store != nil {
-		_ = s.store.AddAudit(context.Background(), store.AuditEvent{
+		if err := s.store.AddAudit(context.Background(), store.AuditEvent{
 			Action:    "config.activate",
 			Actor:     "admin",
-			VersionID: snapshot.ID,
-			Details:   map[string]any{"source": snapshot.Source},
-		})
+			VersionID: candidate.ID,
+			Details:   map[string]any{"source": candidate.Source},
+		}); err != nil {
+			s.metrics.AuditDropped()
+			slog.Warn("audit write failed", "action", "config.activate", "error", err)
+		}
 	}
 	return nil
 }
@@ -315,6 +340,7 @@ func (s *Server) commitConfig(snapshot *config.ConfigSnapshot, data []byte, crea
 			// version remains available for a later retry but is not active.
 			if previous != nil {
 				s.state.Store(previous)
+				s.restoreAdmissions(previous.snapshot.Config)
 				// buildRuntimes hot-updates shared breaker parameters. Restore
 				// those parameters without replacing the previous semaphores or
 				// token buckets used by in-flight requests.
@@ -451,6 +477,7 @@ func (s *Server) drainAuditEvents() {
 	for event := range s.auditCh {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := s.store.AddAudit(ctx, event); err != nil {
+			s.metrics.AuditDropped()
 			slog.Warn("audit write failed", "action", event.Action, "error", err)
 		}
 		cancel()

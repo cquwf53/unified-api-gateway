@@ -553,6 +553,20 @@ func NewSnapshot(c *Config, source string) (*ConfigSnapshot, error) {
 		return nil, errors.New("config: nil config")
 	}
 	clone := c.Clone()
+	// Policy readers decode this raw block independently of Config.MarshalYAML.
+	// Normalize numeric JSON scalars to YAML's numeric Go types first, without
+	// routing integer body rules through a float64 JSON decode.
+	if len(clone.Policies) > 0 {
+		node, err := jsonYAMLNode(clone.Policies)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot policies: %w", err)
+		}
+		var policies map[string]any
+		if err := node.Decode(&policies); err != nil {
+			return nil, fmt.Errorf("snapshot policies: %w", err)
+		}
+		clone.Policies = policies
+	}
 	// Snapshots are content-addressed; normalize defaults before hashing so a
 	// YAML marshal/parse round trip cannot manufacture a different ID merely
 	// because omitted fields were filled on the next load.
@@ -586,23 +600,13 @@ func (s *ConfigSnapshot) Clone() *ConfigSnapshot {
 	return &out
 }
 
-// Clone performs a deep copy through JSON.  All public config fields are JSON
-// compatible and this keeps map/slice aliasing out of hot-reload snapshots.
+// Clone copies the typed configuration without a serialization round trip.
+// Keeping integer types intact prevents body rules from losing precision.
 func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
 	}
-	b, err := json.Marshal(c)
-	if err != nil {
-		out := *c
-		return &out
-	}
-	var out Config
-	if err := json.Unmarshal(b, &out); err != nil {
-		copy := *c
-		return &copy
-	}
-	return &out
+	return transform.CloneValue(c).(*Config)
 }
 
 // Validate returns all discovered errors in one call where possible.

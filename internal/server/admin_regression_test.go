@@ -53,6 +53,7 @@ func TestExplainUsesSimulatedRequestAndRejectsMalformedJSON(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("X-Admin-Token", "test-admin")
 			response := httptest.NewRecorder()
 			gateway.ServeAdminHTTP(response, request)
@@ -88,6 +89,7 @@ func TestAdminResponsesRedactTransformHeaders(t *testing.T) {
 	t.Cleanup(gateway.Close)
 	for _, path := range []string{"/api/config", "/api/explain?path=/example&method=POST"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-Admin-Token", "test-admin")
 		response := httptest.NewRecorder()
 		gateway.ServeAdminHTTP(response, request)

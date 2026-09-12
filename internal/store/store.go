@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	_ "github.com/glebarez/sqlite"
 )
@@ -102,6 +101,9 @@ func (s *Store) pragmas(ctx context.Context) error {
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS store_migrations (
+  name TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS config_versions (
   id TEXT PRIMARY KEY,
   created_at TEXT NOT NULL,
@@ -164,6 +166,9 @@ ON recordings(config_id, profile_id, method, path, client_id, tenant, created_at
 	if err := s.ensureSingleActiveIndex(ctx); err != nil {
 		return fmt.Errorf("migrate sqlite store: %w", err)
 	}
+	if err := s.normalizeStoredTimestamps(ctx); err != nil {
+		return fmt.Errorf("migrate sqlite timestamps: %w", err)
+	}
 	return s.pragmas(ctx)
 }
 
@@ -211,16 +216,18 @@ func (s *Store) SaveVersion(ctx context.Context, version Version) error {
 	if version.ID == "" {
 		return fmt.Errorf("version id is required")
 	}
-	if version.CreatedAt == "" {
-		version.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	createdAt, err := normalizedTimestamp(version.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("version created_at: %w", err)
 	}
+	version.CreatedAt = createdAt
 	if version.CreatedBy == "" {
 		version.CreatedBy = "system"
 	}
 	if version.Active {
 		return s.SaveVersionAndActivate(ctx, version)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO config_versions
+	_, err = s.db.ExecContext(ctx, `INSERT INTO config_versions
  (id, created_at, created_by, active, sha256, description, yaml)
  VALUES (?, ?, ?, 0, ?, ?, ?)
  ON CONFLICT(id) DO UPDATE SET
@@ -240,9 +247,11 @@ func (s *Store) SaveVersionAndActivate(ctx context.Context, version Version) err
 	if version.ID == "" {
 		return fmt.Errorf("version id is required")
 	}
-	if version.CreatedAt == "" {
-		version.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	createdAt, err := normalizedTimestamp(version.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("version created_at: %w", err)
 	}
+	version.CreatedAt = createdAt
 	if version.CreatedBy == "" {
 		version.CreatedBy = "system"
 	}
@@ -365,9 +374,11 @@ FROM config_versions ORDER BY created_at DESC LIMIT ?`, limit)
 }
 
 func (s *Store) AddAudit(ctx context.Context, event AuditEvent) error {
-	if event.CreatedAt == "" {
-		event.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	createdAt, err := normalizedTimestamp(event.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("event created_at: %w", err)
 	}
+	event.CreatedAt = createdAt
 	if event.Actor == "" {
 		event.Actor = "system"
 	}
@@ -427,9 +438,11 @@ func (s *Store) SaveRecording(ctx context.Context, recording Recording) error {
 	if recording.Key == "" {
 		return fmt.Errorf("recording key is required")
 	}
-	if recording.CreatedAt == "" {
-		recording.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	createdAt, err := normalizedTimestamp(recording.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("recording created_at: %w", err)
 	}
+	recording.CreatedAt = createdAt
 	if recording.Headers == nil {
 		recording.Headers = map[string][]string{}
 	}

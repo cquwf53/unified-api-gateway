@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +77,10 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusNotImplemented, "grpc", "typed_adapter_required", "gRPC semantic transforms require a typed adapter")
 		return
 	}
+	if rejectionCode, message := transparentPlaneSupported(*profile); rejectionCode != "" {
+		fail(http.StatusNotImplemented, "grpc", rejectionCode, message)
+		return
+	}
 	upstream, ok := cfg.Upstreams[profile.Upstream]
 	if !ok {
 		fail(http.StatusBadGateway, "grpc", "upstream_not_found", "gRPC upstream is not configured")
@@ -101,7 +106,14 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	releaseIngress, ingressRejection := s.beginIngress(pinned)
+	if ingressRejection != nil {
+		fail(ingressRejection.status, "ingress", ingressRejection.code, "too many request bodies are being parsed")
+		return
+	}
+	defer releaseIngress()
 	body, err := io.ReadAll(io.LimitReader(r.Body, requestLimit+1))
+	releaseIngress()
 	if err != nil {
 		status, stage, code = http.StatusBadRequest, "grpc", "body_read_failed"
 		s.writeError(w, status, stage, code, "failed to read gRPC request body", "")
@@ -125,7 +137,13 @@ func (s *Server) ServeGRPCHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	base.Path = joinURLPath(base.Path, r.URL.Path)
 	base.RawQuery = joinRawQuery(base.RawQuery, r.URL.RawQuery)
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, base.String(), bytes.NewReader(body))
+	upstreamContext := r.Context()
+	if rt != nil && rt.policy.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		upstreamContext, cancel = context.WithTimeout(upstreamContext, rt.policy.requestTimeout)
+		defer cancel()
+	}
+	request, err := http.NewRequestWithContext(upstreamContext, r.Method, base.String(), bytes.NewReader(body))
 	if err != nil {
 		status, stage, code = http.StatusBadGateway, "grpc", "request_build_failed"
 		s.writeError(w, status, stage, code, "failed to build gRPC upstream request", "")

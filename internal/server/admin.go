@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,10 +31,16 @@ import (
 
 func (s *Server) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" || r.URL.Path == "/livez" {
+		if !s.allowAdminMethod(w, r, "GET, HEAD") {
+			return
+		}
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "started_at": s.started})
 		return
 	}
 	if r.URL.Path == "/readyz" {
+		if !s.allowAdminMethod(w, r, "GET, HEAD") {
+			return
+		}
 		s.handleReady(w, r)
 		return
 	}
@@ -50,30 +57,54 @@ func (s *Server) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "auth", "admin_auth_required", "administrator authentication is required", "")
 		return
 	}
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if r.URL.Path == "/" || r.URL.Path == "/index.html" || strings.HasSuffix(r.URL.Path, ".css") || strings.HasSuffix(r.URL.Path, ".js") || strings.HasSuffix(r.URL.Path, ".ico") {
+		if !s.allowAdminMethod(w, r, "GET, HEAD") {
+			return
+		}
 		s.writeStatic(w, r)
 		return
+	}
+	methods, bodyLimit := adminRequestPolicy(r.URL.Path)
+	if methods != "" && !s.allowAdminMethod(w, r, methods) {
+		return
+	}
+	if r.Method == http.MethodPost && bodyLimit > 0 {
+		allowed, err := adminOriginAllowed(r)
+		if err != nil {
+			s.writeError(w, http.StatusServiceUnavailable, "admin", "admin_origin_invalid", err.Error(), "")
+			return
+		}
+		if !allowed {
+			s.writeError(w, http.StatusForbidden, "admin", "cross_origin_forbidden", "management requests must use the same origin as the console", "")
+			return
+		}
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || !strings.EqualFold(mediaType, "application/json") {
+			s.writeError(w, http.StatusUnsupportedMediaType, "admin", "json_required", "Content-Type must be application/json", "")
+			return
+		}
+		if r.ContentLength > bodyLimit {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "admin", "body_too_large", "management request exceeds its byte limit", "")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 	}
 	switch r.URL.Path {
 	case "/api/status", "/admin/v1/status":
 		s.writeJSON(w, http.StatusOK, s.statusPayload())
 	case "/api/metrics", "/admin/v1/metrics":
-		if !s.Snapshot().Config.Observability.MetricsEnabled() {
+		if !s.currentSnapshot().Config.Observability.MetricsEnabled() {
 			s.writeError(w, http.StatusNotFound, "observability", "metrics_disabled", "metrics endpoints are disabled by configuration", "")
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = io.WriteString(w, s.metrics.Prometheus())
 	case "/api/config", "/admin/v1/config":
-		s.writeJSON(w, http.StatusOK, redactConfig(s.Snapshot().Config))
+		s.writeJSON(w, http.StatusOK, redactConfig(s.currentSnapshot().Config))
 	case "/api/profiles", "/admin/v1/profiles":
 		s.writeJSON(w, http.StatusOK, map[string]any{"profiles": s.profilePayload()})
 	case "/api/routes", "/admin/v1/routes":
-		s.writeJSON(w, http.StatusOK, map[string]any{"routes": s.Snapshot().Config.Routes})
+		s.writeJSON(w, http.StatusOK, map[string]any{"routes": s.currentSnapshot().Config.Routes})
 	case "/api/versions", "/admin/v1/versions":
 		s.handleVersions(w, r)
 	case "/api/audit", "/admin/v1/audit":
@@ -97,8 +128,110 @@ func (s *Server) ServeAdminHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// adminRequestPolicy keeps aliases on the same method and byte-limit contract.
+func adminRequestPolicy(requestPath string) (methods string, bodyLimit int64) {
+	switch requestPath {
+	case "/api/activate", "/admin/v1/config/activate", "/api/config/validate", "/admin/v1/config/validate":
+		return "POST", 16 << 20
+	case "/api/preview", "/api/config/preview", "/admin/v1/preview", "/admin/v1/config/preview":
+		return "POST", 4 << 20
+	case "/api/switch", "/admin/v1/profile/switch", "/api/rollback", "/admin/v1/config/rollback":
+		return "POST", 1 << 20
+	case "/api/explain", "/admin/v1/routes/explain":
+		return "GET, HEAD, POST", 1 << 20
+	case "/api/status", "/admin/v1/status", "/api/metrics", "/admin/v1/metrics", "/api/config", "/admin/v1/config",
+		"/api/profiles", "/admin/v1/profiles", "/api/routes", "/admin/v1/routes", "/api/versions", "/admin/v1/versions",
+		"/api/audit", "/admin/v1/audit", "/api/recordings", "/admin/v1/recordings":
+		return "GET, HEAD", 0
+	default:
+		return "", 0
+	}
+}
+
+func (s *Server) allowAdminMethod(w http.ResponseWriter, r *http.Request, methods string) bool {
+	for _, method := range strings.Split(methods, ", ") {
+		if r.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", methods)
+	s.writeError(w, http.StatusMethodNotAllowed, "admin", "method_not_allowed", "HTTP method is not allowed for this management endpoint", "")
+	return false
+}
+
+func parseAdminOrigin(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.User != nil || parsed.Path != "" || strings.ContainsAny(raw, "?#") ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, errors.New("origin must contain only an http/https scheme, host and optional port")
+	}
+	authority, valid := canonicalWebSocketAuthority(parsed.Host, parsed.Scheme)
+	if !valid || authority.port == 0 {
+		return nil, errors.New("origin must contain a valid host and port")
+	}
+	return parsed, nil
+}
+
+// A reverse proxy may declare one external origin explicitly. It must preserve
+// Host. Forwarded/X-Forwarded-* headers never establish a trusted origin.
+func adminOriginAllowed(r *http.Request) (bool, error) {
+	var configured *url.URL
+	if raw := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_ORIGIN")); raw != "" {
+		var err error
+		configured, err = parseAdminOrigin(raw)
+		if err != nil {
+			return false, fmt.Errorf("GATEWAY_ADMIN_ORIGIN: %w", err)
+		}
+	}
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		// CLI requests have no Origin. Fetch metadata can still identify an
+		// explicitly cross-site browser request with a missing Origin.
+		return !strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site"), nil
+	}
+	if len(origins) != 1 {
+		return false, nil
+	}
+	origin := strings.TrimSpace(origins[0])
+	if _, err := parseAdminOrigin(origin); err != nil {
+		return false, nil
+	}
+	if configured != nil {
+		return sameOrigin(origin, configured.Host, configured.Scheme) && sameOrigin(origin, r.Host, configured.Scheme), nil
+	}
+	return sameOrigin(origin, r.Host, requestScheme(r)), nil
+}
+
+// Read the complete bounded document before decoding or applying side effects.
+// This rejects a valid JSON prefix followed by form data, a second value, or an
+// oversized whitespace suffix, as well as null/unknown-field activation bodies.
+func (s *Server) decodeAdminJSON(w http.ResponseWriter, r *http.Request, input any, stage string) bool {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var oversized *http.MaxBytesError
+		if errors.As(err, &oversized) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, stage, "body_too_large", "management request exceeds its byte limit", "")
+		} else {
+			s.writeError(w, http.StatusBadRequest, stage, "invalid_json", "cannot read management JSON request", "")
+		}
+		return false
+	}
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || data[0] != '{' || !json.Valid(data) {
+		s.writeError(w, http.StatusBadRequest, stage, "invalid_json", "request body must be exactly one JSON object", "")
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(input); err != nil {
+		s.writeError(w, http.StatusBadRequest, stage, "invalid_json", err.Error(), "")
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-	snapshot := s.Snapshot()
+	snapshot := s.currentSnapshot()
 	if snapshot == nil || snapshot.Config == nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready"})
 		return
@@ -123,8 +256,7 @@ type PreviewRequest struct {
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	var input PreviewRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&input); err != nil {
-		s.writeError(w, http.StatusBadRequest, "preview", "invalid_json", err.Error(), "")
+	if !s.decodeAdminJSON(w, r, &input, "preview") {
 		return
 	}
 	pinned := s.state.Load()
@@ -179,8 +311,7 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		Description string `json:"description"`
 		Actor       string `json:"actor"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&input); err != nil {
-		s.writeError(w, http.StatusBadRequest, "config", "invalid_json", err.Error(), "")
+	if !s.decodeAdminJSON(w, r, &input, "config") {
 		return
 	}
 	data := []byte(input.YAML)
@@ -232,13 +363,12 @@ func (s *Server) handleQuickSwitch(w http.ResponseWriter, r *http.Request) {
 		RouteID     string `json:"route_id"`
 		Description string `json:"description"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
-		s.writeError(w, http.StatusBadRequest, "config", "invalid_json", err.Error(), "")
+	if !s.decodeAdminJSON(w, r, &input, "config") {
 		return
 	}
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
-	current := s.Snapshot()
+	current := s.currentSnapshot()
 	if current == nil || current.Config == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "config", "not_ready", "no active configuration", "")
 		return
@@ -294,8 +424,7 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		YAML string `json:"yaml"`
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&input); err != nil {
-		s.writeError(w, http.StatusBadRequest, "config", "invalid_json", err.Error(), "")
+	if !s.decodeAdminJSON(w, r, &input, "config") {
 		return
 	}
 	data := []byte(input.YAML)
@@ -328,7 +457,10 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.ID == "" {
+	if !s.decodeAdminJSON(w, r, &input, "config") {
+		return
+	}
+	if input.ID == "" {
 		s.writeError(w, http.StatusBadRequest, "config", "version_required", "version id is required", "")
 		return
 	}
@@ -415,7 +547,7 @@ func queryLimit(r *http.Request, fallback int) int {
 	return value
 }
 func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
-	cfg := s.Snapshot().Config
+	cfg := s.currentSnapshot().Config
 	req := route.FromHTTPRequest(r)
 	req.Profile = r.URL.Query().Get("profile")
 	if method := r.URL.Query().Get("method"); method != "" {
@@ -431,8 +563,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 			Headers map[string][]string `json:"headers"`
 			Profile string              `json:"profile"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
-			s.writeError(w, http.StatusBadRequest, "explain", "invalid_json", err.Error(), "")
+		if !s.decodeAdminJSON(w, r, &input, "explain") {
 			return
 		}
 		if input.Method != "" {
@@ -479,7 +610,7 @@ func (s *Server) authorizeAdmin(r *http.Request) bool {
 	return provided != "" && secureEqual(provided, token)
 }
 func (s *Server) statusPayload() map[string]any {
-	snapshot := s.Snapshot()
+	snapshot := s.currentSnapshot()
 	configInfo := map[string]any{}
 	if snapshot != nil {
 		configInfo = map[string]any{"id": snapshot.ID, "hash": snapshot.Hash, "version": snapshot.Version, "loaded_at": snapshot.LoadedAt, "source": snapshot.Source}
@@ -487,7 +618,7 @@ func (s *Server) statusPayload() map[string]any {
 	return map[string]any{"gateway_version": BuildVersion, "started_at": s.started, "config": configInfo, "metrics": s.metrics.Snapshot(), "adapters": s.registry.Names()}
 }
 func (s *Server) profilePayload() []map[string]any {
-	cfg := s.Snapshot().Config
+	cfg := s.currentSnapshot().Config
 	result := make([]map[string]any, 0, len(cfg.Profiles))
 	for _, id := range cfg.ProfileNames() {
 		p := cfg.Profiles[id]

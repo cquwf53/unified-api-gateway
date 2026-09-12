@@ -88,7 +88,7 @@ func (s *Server) streamUpstream(ctx context.Context, pinned *gatewayState, cfg *
 			return http.StatusBadGateway, false, limitErr
 		}
 		s.writeEnvelope(w, out)
-		return out.StatusCode, false, nil
+		return out.StatusCode, true, preparedStreamFailure(response.StatusCode, out)
 	}
 	copyResponseHeaders(w, response.Header)
 	status = response.StatusCode
@@ -96,6 +96,18 @@ func (s *Server) streamUpstream(ctx context.Context, pinned *gatewayState, cfg *
 	headersSent = true
 	flusher, _ := w.(http.Flusher)
 	max := responseLimit(cfg, profile)
+	if isLLMStreamContract(profile.UpstreamContract, profile.ClientContract) {
+		// Forward each read unchanged, then inspect its bounded SSE framing in
+		// the same goroutine. Comments and metadata remain byte-for-byte intact.
+		input := &forwardingStreamReader{reader: &boundedStreamReader{reader: response.Body, remaining: max}, writer: w, flusher: flusher, status: status}
+		streamErr := adapter.ReadSSEStream(input, func(event adapter.SSEEvent) error {
+			if failure := adapter.StreamEventError(event); failure != nil {
+				return upstreamError{status: http.StatusBadGateway, code: "upstream_stream_error", err: failure}
+			}
+			return nil
+		})
+		return status, headersSent, streamErr
+	}
 	var total int64
 	buffer := make([]byte, 32<<10)
 	for {
@@ -149,7 +161,7 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 			return http.StatusBadGateway, false, limitErr
 		}
 		s.writeEnvelope(w, out)
-		return out.StatusCode, false, nil
+		return out.StatusCode, true, preparedStreamFailure(response.StatusCode, out)
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -180,6 +192,11 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 		if flusher != nil {
 			flusher.Flush()
 		}
+		for _, event := range outEvents {
+			if failure := adapter.StreamEventError(event); failure != nil {
+				return upstreamError{status: http.StatusBadGateway, code: "upstream_stream_error", err: failure}
+			}
+		}
 		return nil
 	}
 	input := &boundedStreamReader{reader: response.Body, remaining: max}
@@ -188,7 +205,13 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 		if translateErr != nil {
 			return translateErr
 		}
-		return writeEvents(outEvents)
+		if err := writeEvents(outEvents); err != nil {
+			return err
+		}
+		if failure := adapter.StreamEventError(event); failure != nil {
+			return upstreamError{status: http.StatusBadGateway, code: "upstream_stream_error", err: failure}
+		}
+		return nil
 	})
 	if streamErr == nil {
 		streamErr = writeEvents(translator.Finish())
@@ -197,7 +220,7 @@ func (s *Server) streamTranslatedUpstream(ctx context.Context, pinned *gatewaySt
 		// A parser, translator, size, or upstream read failure is not a clean
 		// completion. Emit an explicit target-protocol failure when the client is
 		// still writable, but never call Finish and fabricate success.
-		if upstreamCode(streamErr) != "client_stream_write_failed" {
+		if upstreamCode(streamErr) != "client_stream_write_failed" && upstreamCode(streamErr) != "upstream_stream_error" {
 			failure := translator.Fail("upstream stream terminated unexpectedly")
 			if len(failure) == 0 {
 				// Translate/Finish may already have marked a generated terminal
@@ -234,6 +257,51 @@ func (r *boundedStreamReader) Read(p []byte) (int, error) {
 		return 0, upstreamError{status: http.StatusBadGateway, code: "upstream_stream_too_large", err: errors.New("upstream stream exceeded configured limit")}
 	}
 	r.remaining -= int64(n)
+	return n, err
+}
+
+func preparedStreamFailure(upstreamStatus int, response transform.Envelope) error {
+	semanticFailure, _ := response.Metadata["upstream_failed"].(bool)
+	if upstreamStatus >= 500 || response.StatusCode >= 500 || semanticFailure {
+		return upstreamError{status: http.StatusBadGateway, code: "upstream_response_failed", err: errors.New("upstream response failed before delivery")}
+	}
+	return nil
+}
+
+func isLLMStreamContract(upstreamContract, clientContract string) bool {
+	contract := strings.ToLower(strings.TrimSpace(upstreamContract))
+	if contract == "" {
+		contract = strings.ToLower(strings.TrimSpace(clientContract))
+	}
+	switch contract {
+	case "openai-chat", "openai-responses", "anthropic-messages":
+		return true
+	default:
+		return false
+	}
+}
+
+type forwardingStreamReader struct {
+	reader  io.Reader
+	writer  io.Writer
+	flusher http.Flusher
+	status  int
+}
+
+func (r *forwardingStreamReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		written, writeErr := r.writer.Write(p[:n])
+		if writeErr == nil && written != n {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr != nil {
+			return 0, upstreamError{status: r.status, code: "client_stream_write_failed", err: writeErr}
+		}
+		if r.flusher != nil {
+			r.flusher.Flush()
+		}
+	}
 	return n, err
 }
 

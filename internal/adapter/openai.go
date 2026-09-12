@@ -112,7 +112,7 @@ func (OpenAIChatToAnthropic) AdaptRequest(in Envelope, _ config.Profile) (Envelo
 					fn, _ := call["function"].(map[string]any)
 					input := map[string]any{}
 					if args := asString(fn["arguments"]); args != "" {
-						if json.Unmarshal([]byte(args), &input) != nil {
+						if decodeJSONValue([]byte(args), &input) != nil {
 							input = map[string]any{"raw": args}
 						}
 					}
@@ -198,17 +198,15 @@ func (OpenAIChatToAnthropic) AdaptResponse(in Envelope, _ config.Profile) (Envel
 		}
 		if len(toolCalls) > 0 {
 			message["tool_calls"] = toolCalls
-			choice["finish_reason"] = "tool_calls"
+			if asString(body["stop_reason"]) == "" {
+				choice["finish_reason"] = "tool_calls"
+			}
 		}
 	}
 	choice["message"] = message
 	out["choices"] = []any{choice}
 	if usage, ok := body["usage"].(map[string]any); ok {
-		out["usage"] = map[string]any{
-			"prompt_tokens":     usage["input_tokens"],
-			"completion_tokens": usage["output_tokens"],
-			"total_tokens":      sumNumbers(usage["input_tokens"], usage["output_tokens"]),
-		}
+		out["usage"] = anthropicUsageToOpenAI(usage)
 	}
 	b, contentType, err := encodeJSON(out)
 	if err != nil {
@@ -341,7 +339,7 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 					fn, _ := call["function"].(map[string]any)
 					input := map[string]any{}
 					if args := asString(fn["arguments"]); args != "" {
-						if json.Unmarshal([]byte(args), &input) != nil {
+						if decodeJSONValue([]byte(args), &input) != nil {
 							input = map[string]any{"raw": args}
 						}
 					}
@@ -355,7 +353,7 @@ func (AnthropicToOpenAIChat) AdaptResponse(in Envelope, _ config.Profile) (Envel
 	if usage, ok := body["usage"].(map[string]any); ok {
 		// Missing counters become zero, not JSON null: Messages clients
 		// expect numeric fields.
-		out["usage"] = map[string]any{"input_tokens": numberOrZero(usage["prompt_tokens"]), "output_tokens": numberOrZero(usage["completion_tokens"])}
+		out["usage"] = openAIUsageToAnthropic(usage)
 	}
 	b, contentType, err := encodeJSON(out)
 	if err != nil {
@@ -413,12 +411,11 @@ func (OpenAIResponsesToAnthropic) AdaptRequest(in Envelope, p config.Profile) (E
 	chat := map[string]any{
 		"model":    body["model"],
 		"messages": responsesInputToMessages(body["input"], body["instructions"]),
-		"stream":   body["stream"],
 	}
 	if max, ok := body["max_output_tokens"]; ok {
 		chat["max_tokens"] = max
 	}
-	for _, key := range []string{"temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls"} {
+	for _, key := range []string{"temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "stream"} {
 		if value, ok := body[key]; ok {
 			chat[key] = value
 		}
@@ -443,7 +440,7 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 		return Envelope{}, err
 	}
 	var body map[string]any
-	if err := json.Unmarshal(chat.Body, &body); err != nil {
+	if err := decodeJSONValue(chat.Body, &body); err != nil {
 		return Envelope{}, err
 	}
 	choices := asSlice(body["choices"])
@@ -503,13 +500,7 @@ func (OpenAIResponsesToAnthropic) AdaptResponse(in Envelope, p config.Profile) (
 	}
 	usage := body["usage"]
 	if chatUsage, ok := body["usage"].(map[string]any); ok {
-		inputTokens := numberOrZero(chatUsage["prompt_tokens"])
-		outputTokens := numberOrZero(chatUsage["completion_tokens"])
-		totalTokens, present := numberValueOK(chatUsage["total_tokens"])
-		if !present {
-			totalTokens = inputTokens + outputTokens
-		}
-		usage = map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": totalTokens}
+		usage = openAIUsageToResponses(chatUsage)
 	}
 	status := "completed"
 	response := map[string]any{
@@ -959,7 +950,7 @@ func decodeJSONObject(text string) any {
 		return map[string]any{}
 	}
 	var parsed any
-	if json.Unmarshal([]byte(text), &parsed) == nil {
+	if decodeJSONValue([]byte(text), &parsed) == nil {
 		return parsed
 	}
 	return map[string]any{"raw": text}
@@ -987,12 +978,15 @@ func asBool(value any) bool {
 	return ok && b
 }
 
-func sumNumbers(a, b any) float64 {
-	return numberValue(a) + numberValue(b)
+func sumNumbers(a, b any) any {
+	return exactNumberSum(a, b)
 }
 
 func numberValue(value any) float64 {
 	switch n := value.(type) {
+	case json.Number:
+		parsed, _ := n.Float64()
+		return parsed
 	case float64:
 		return n
 	case float32:

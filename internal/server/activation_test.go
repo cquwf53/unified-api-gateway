@@ -42,6 +42,7 @@ func TestHotActivationRejectsClientAuthWithoutKeysAndPreservesState(t *testing.T
 	candidate := "version: 1\npolicies:\n  defaults:\n    require_client_auth: true\nprofiles:\n  p:\n    adapter: transparent\n    traffic_mode: dry-run\nroutes:\n  - id: r\n    match:\n      path: /thing\n    profile: p\n"
 	payload, _ := json.Marshal(map[string]any{"yaml": candidate})
 	request := httptest.NewRequest(http.MethodPost, "/admin/v1/config/activate", strings.NewReader(string(payload)))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Admin-Token", "test-admin")
 	recorder := httptest.NewRecorder()
 	gateway.ServeAdminHTTP(recorder, request)
@@ -218,6 +219,7 @@ func TestConcurrentQuickSwitchesDoNotLoseUpdates(t *testing.T) {
 			<-start
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodPost, "/admin/v1/profile/switch", strings.NewReader(`{"route_id":"`+routeID+`","profile":"two"}`))
+			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("X-Admin-Token", "test-admin")
 			gateway.ServeAdminHTTP(recorder, request)
 			if recorder.Code != http.StatusOK {

@@ -179,8 +179,7 @@ type SSETranslator struct {
 
 	// anthropic -> openai state: message_start carries the prompt token count
 	// while usage totals only arrive with message_delta.
-	promptTokens    float64
-	promptTokensSet bool
+	anthropicUsage map[string]any
 	// toolCallIndexByBlock maps Anthropic block indexes (text and tool blocks
 	// share one sequence) onto OpenAI tool_calls array positions, which are a
 	// separate numbering space.
@@ -204,6 +203,7 @@ type SSETranslator struct {
 	// respToolItems holds the function_call output items assembled from
 	// Anthropic tool_use blocks, in output order.
 	respToolItems []map[string]any
+	respToolArgs  []*strings.Builder
 	// respPartAdded records whether the text content part was announced;
 	// pure-tool streams skip the part lifecycle entirely.
 	respPartAdded bool
@@ -268,7 +268,7 @@ func (t *SSETranslator) Translate(event SSEEvent) ([]SSEEvent, error) {
 		return t.translateDone(), nil
 	}
 	var payload map[string]any
-	if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+	if err := decodeJSONValue([]byte(event.Data), &payload); err != nil {
 		// A non-JSON event can still be safely forwarded as an opaque frame.
 		return []SSEEvent{event}, nil
 	}
@@ -414,7 +414,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 				t.respModel = model
 			}
 			if usage, ok := message["usage"].(map[string]any); ok {
-				t.respUsage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"])}
+				t.respUsage = mergeUsage(nil, usage)
 			}
 		}
 		if t.respStarted {
@@ -442,6 +442,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			"name": block["name"], "arguments": "", "status": "in_progress",
 		}
 		t.respToolItems = append(t.respToolItems, item)
+		t.respToolArgs = append(t.respToolArgs, &strings.Builder{})
 		outputIndex := t.respNextOutputIndex
 		t.respNextOutputIndex++
 		t.respToolIndexes = append(t.respToolIndexes, outputIndex)
@@ -455,7 +456,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 			}
 			if asString(d["type"]) == "input_json_delta" && len(t.respToolItems) > 0 {
 				item := t.respToolItems[len(t.respToolItems)-1]
-				item["arguments"] = asString(item["arguments"]) + asString(d["partial_json"])
+				t.respToolArgs[len(t.respToolArgs)-1].WriteString(asString(d["partial_json"]))
 				return []SSEEvent{t.respEvent("response.function_call_arguments.delta", map[string]any{
 					"type": "response.function_call_arguments.delta", "item_id": item["id"],
 					"output_index": t.respToolIndexes[len(t.respToolIndexes)-1], "delta": asString(d["partial_json"]),
@@ -498,17 +499,7 @@ func (t *SSETranslator) anthropicToResponses(event SSEEvent, payload map[string]
 		if usage, ok := payload["usage"].(map[string]any); ok {
 			// message_start carries the prompt tokens while message_delta
 			// only reports the completion side; merge instead of overwriting.
-			merged := map[string]any{}
-			for key, value := range t.respUsage {
-				merged[key] = value
-			}
-			if n, ok := numberValueOK(usage["input_tokens"]); ok {
-				merged["input_tokens"] = n
-			}
-			if n, ok := numberValueOK(usage["output_tokens"]); ok {
-				merged["output_tokens"] = n
-			}
-			t.respUsage = merged
+			t.respUsage = mergeUsage(t.respUsage, usage)
 		}
 		return nil
 	case "message_stop":
@@ -610,8 +601,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
 	if usage != nil {
-		total := numberOrZero(usage["input_tokens"]) + numberOrZero(usage["output_tokens"])
-		usage = map[string]any{"input_tokens": numberOrZero(usage["input_tokens"]), "output_tokens": numberOrZero(usage["output_tokens"]), "total_tokens": total}
+		usage = anthropicUsageToResponses(usage)
 		response["usage"] = usage
 	}
 	var events []SSEEvent
@@ -645,6 +635,7 @@ func (t *SSETranslator) responsesTerminal() []SSEEvent {
 	}
 	for index, toolItem := range t.respToolItems {
 		toolItem["status"] = status
+		toolItem["arguments"] = t.respToolArgs[index].String()
 		outputIndex := t.respToolIndexes[index]
 		events = append(events,
 			t.respEvent("response.function_call_arguments.done", map[string]any{
@@ -718,7 +709,7 @@ func (t *SSETranslator) responsesToAnthropic(event SSEEvent, payload map[string]
 	case "response.incomplete", "response.completed":
 		if response, ok := payload["response"].(map[string]any); ok {
 			if usage, ok := response["usage"].(map[string]any); ok {
-				chunk["usage"] = map[string]any{"prompt_tokens": numberOrZero(usage["input_tokens"]), "completion_tokens": numberOrZero(usage["output_tokens"])}
+				chunk["usage"] = responsesUsageToOpenAI(usage)
 			}
 		}
 		finishReason := "stop"
@@ -846,6 +837,10 @@ func (t *SSETranslator) openAIEventToAnthropic(event SSEEvent, payload map[strin
 			"delta": map[string]any{"stop_reason": mapFinishReason(asString(finish)), "stop_sequence": nil},
 		}))
 		t.finishSent = true
+	}
+	if usage, ok := payload["usage"].(map[string]any); ok {
+		out = append(out, t.ensureStarted(payload)...)
+		out = append(out, sseEvent("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{}, "usage": openAIUsageToAnthropic(usage)}))
 	}
 	return out
 }
@@ -1044,28 +1039,45 @@ func openAIStreamErrorEvent(payload map[string]any) SSEEvent {
 }
 
 func openAIUsageToAnthropic(usage map[string]any) map[string]any {
-	out := map[string]any{}
-	if v, ok := usage["prompt_tokens"]; ok {
-		out["input_tokens"] = v
-	}
-	if v, ok := usage["completion_tokens"]; ok {
-		out["output_tokens"] = v
+	input, output := numberOrZero(usage["prompt_tokens"]), numberOrZero(usage["completion_tokens"])
+	out := map[string]any{"input_tokens": input, "output_tokens": output}
+	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		cached, created := numberOrZero(details["cached_tokens"]), numberOrZero(details["cache_creation_tokens"])
+		out["input_tokens"] = subtractTokenCounts(input, sumNumbers(cached, created))
+		if value, ok := details["cached_tokens"]; ok {
+			out["cache_read_input_tokens"] = value
+		}
+		if value, ok := details["cache_creation_tokens"]; ok {
+			out["cache_creation_input_tokens"] = value
+		}
 	}
 	return out
 }
 
 func anthropicUsageToOpenAI(usage map[string]any) map[string]any {
-	out := map[string]any{
-		"prompt_tokens":     numberOrZero(usage["input_tokens"]),
-		"completion_tokens": numberOrZero(usage["output_tokens"]),
+	prompt := sumNumbers(sumNumbers(numberOrZero(usage["input_tokens"]), numberOrZero(usage["cache_creation_input_tokens"])), numberOrZero(usage["cache_read_input_tokens"]))
+	completion := numberOrZero(usage["output_tokens"])
+	out := map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": sumNumbers(prompt, completion)}
+	details := map[string]any{}
+	if value, ok := usage["cache_read_input_tokens"]; ok {
+		details["cached_tokens"] = value
 	}
-	out["total_tokens"] = sumNumbers(out["prompt_tokens"], out["completion_tokens"])
+	if value, ok := usage["cache_creation_input_tokens"]; ok {
+		details["cache_creation_tokens"] = value
+	}
+	if len(details) > 0 {
+		out["prompt_tokens_details"] = details
+	}
 	return out
 }
 
-func numberOrZero(value any) float64 {
-	n, _ := numberValueOK(value)
-	return n
+func numberOrZero(value any) any {
+	switch value.(type) {
+	case json.Number, float64, float32, int, int32, int64, uint, uint32, uint64:
+		return value
+	default:
+		return 0
+	}
 }
 
 // numberValueOK reports whether a decoded JSON value is numeric, unlike
@@ -1145,10 +1157,7 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 				chunk["model"] = streamModel
 			}
 			if usage, ok := message["usage"].(map[string]any); ok {
-				if n, ok := numberValueOK(usage["input_tokens"]); ok {
-					t.promptTokens = n
-					t.promptTokensSet = true
-				}
+				t.anthropicUsage = mergeUsage(nil, usage)
 			}
 		}
 		delta["role"] = "assistant"
@@ -1202,14 +1211,14 @@ func (t *SSETranslator) anthropicEventToOpenAI(event SSEEvent, payload map[strin
 		}
 	case "message_delta":
 		if d, ok := payload["delta"].(map[string]any); ok {
-			choice["finish_reason"] = openAIFinishReason(asString(d["stop_reason"]))
-			t.finishSent = true
+			if reason := asString(d["stop_reason"]); reason != "" {
+				choice["finish_reason"] = openAIFinishReason(reason)
+				t.finishSent = true
+			}
 		}
 		if usage, ok := payload["usage"].(map[string]any); ok {
-			if _, present := usage["input_tokens"]; !present && t.promptTokensSet {
-				usage["input_tokens"] = t.promptTokens
-			}
-			chunk["usage"] = anthropicUsageToOpenAI(usage)
+			t.anthropicUsage = mergeUsage(t.anthropicUsage, usage)
+			chunk["usage"] = anthropicUsageToOpenAI(t.anthropicUsage)
 		}
 	case "message_stop":
 		// The OpenAI protocol allows exactly one finish marker; message_delta
@@ -1255,6 +1264,19 @@ type StreamError struct {
 
 func (e *StreamError) Error() string { return e.Message }
 
+// StreamEventError identifies protocol-level failures even when the HTTP status
+// is 200. Callers can forward the original error event and still record failure.
+func StreamEventError(event SSEEvent) error {
+	var payload map[string]any
+	if decodeJSONValue([]byte(event.Data), &payload) != nil {
+		return nil
+	}
+	if failure := streamFailure(event, payload); failure != nil {
+		return failure
+	}
+	return nil
+}
+
 func streamFailure(event SSEEvent, payload map[string]any) *StreamError {
 	detail, failed := payload["error"].(map[string]any)
 	if response, ok := payload["response"].(map[string]any); ok {
@@ -1290,7 +1312,7 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 	var responseOutput []any
 	responseStatus := "completed"
 	tools := map[int]*aggregatedTool{}
-	anthropicBlocks := map[int]*aggregatedTool{}
+	anthropicBlocks := map[int]*aggregatedAnthropicBlock{}
 	responseTools := map[string]*aggregatedTool{}
 	responseToolOrder := []string{}
 
@@ -1299,7 +1321,7 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 			continue
 		}
 		var payload map[string]any
-		if json.Unmarshal([]byte(event.Data), &payload) != nil {
+		if decodeJSONValue([]byte(event.Data), &payload) != nil {
 			continue
 		}
 		if failure := streamFailure(event, payload); failure != nil {
@@ -1370,22 +1392,15 @@ func AggregateSSE(events []SSEEvent, contract string) ([]byte, string, error) {
 	}
 	toolCalls := orderedToolCalls(tools)
 	if strings.Contains(contract, "anthropic") {
-		content := []any{}
-		if reasoning.Len() > 0 {
-			content = append(content, map[string]any{"type": "thinking", "thinking": reasoning.String()})
-		}
-		if text.Len() > 0 {
-			content = append(content, map[string]any{"type": "text", "text": text.String()})
-		}
-		for _, tool := range orderedTools(anthropicBlocks) {
-			var input any = map[string]any{}
-			if args := tool.args.String(); args != "" {
-				decoded := json.Unmarshal([]byte(args), &input)
-				if decoded != nil {
-					input = map[string]any{"raw": args}
-				}
+		content := aggregatedAnthropicContent(anthropicBlocks)
+		// Retain compatibility for callers aggregating unframed text chunks.
+		if len(anthropicBlocks) == 0 {
+			if reasoning.Len() > 0 {
+				content = append(content, map[string]any{"type": "thinking", "thinking": reasoning.String()})
 			}
-			content = append(content, map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name, "input": input})
+			if text.Len() > 0 {
+				content = append(content, map[string]any{"type": "text", "text": text.String()})
+			}
 		}
 		if finish == "" && len(content) == 0 {
 			finish = "end_turn"
@@ -1487,44 +1502,6 @@ func aggregateOpenAIChunk(payload map[string]any, text, reasoning *strings.Build
 	}
 }
 
-func aggregateAnthropicEvent(payload map[string]any, text, reasoning *strings.Builder, blocks map[int]*aggregatedTool, finish *string) {
-	typ := asString(payload["type"])
-	switch typ {
-	case "content_block_start":
-		if block, ok := payload["content_block"].(map[string]any); ok && asString(block["type"]) == "tool_use" {
-			index := 0
-			if n, ok := numberValueOK(payload["index"]); ok {
-				index = int(n)
-			}
-			blocks[index] = &aggregatedTool{id: asString(block["id"]), name: asString(block["name"])}
-		}
-	case "content_block_delta":
-		if d, ok := payload["delta"].(map[string]any); ok {
-			if asString(d["type"]) == "text_delta" {
-				text.WriteString(asString(d["text"]))
-			}
-			if asString(d["type"]) == "thinking_delta" {
-				reasoning.WriteString(asString(d["thinking"]))
-			}
-			if asString(d["type"]) == "input_json_delta" {
-				index := 0
-				if n, ok := numberValueOK(payload["index"]); ok {
-					index = int(n)
-				}
-				if block := blocks[index]; block != nil {
-					block.args.WriteString(asString(d["partial_json"]))
-				}
-			}
-		}
-	case "message_delta":
-		if d, ok := payload["delta"].(map[string]any); ok {
-			if reason := asString(d["stop_reason"]); reason != "" {
-				*finish = reason
-			}
-		}
-	}
-}
-
 func aggregateResponsesEvent(event SSEEvent, payload map[string]any, text, reasoning *strings.Builder, tools map[string]*aggregatedTool, order *[]string, finish *string, status *string) {
 	switch eventType(event, payload) {
 	case "response.output_text.delta":
@@ -1568,7 +1545,7 @@ func aggregateResponsesEvent(event SSEEvent, payload map[string]any, text, reaso
 // Chat Completions uses the [DONE] sentinel.
 func EncodeBufferedSSE(body []byte, contract string) ([]byte, error) {
 	var value map[string]any
-	if err := json.Unmarshal(body, &value); err != nil {
+	if err := decodeJSONValue(body, &value); err != nil {
 		return nil, fmt.Errorf("encode buffered SSE: %w", err)
 	}
 	contract = strings.ToLower(strings.TrimSpace(contract))
@@ -1590,10 +1567,26 @@ func bufferedOpenAIEvents(value map[string]any) []SSEEvent {
 			if message, ok := source["message"].(map[string]any); ok {
 				delta := choice["delta"].(map[string]any)
 				delta["role"] = "assistant"
-				for _, key := range []string{"content", "reasoning_content", "tool_calls"} {
+				for _, key := range []string{"content", "reasoning_content"} {
 					if message[key] != nil {
 						delta[key] = message[key]
 					}
+				}
+				if calls := asSlice(message["tool_calls"]); len(calls) > 0 {
+					indexed := make([]any, 0, len(calls))
+					for index, raw := range calls {
+						call, ok := raw.(map[string]any)
+						if !ok {
+							continue
+						}
+						copyOf := make(map[string]any, len(call)+1)
+						for key, value := range call {
+							copyOf[key] = value
+						}
+						copyOf["index"] = index
+						indexed = append(indexed, copyOf)
+					}
+					delta["tool_calls"] = indexed
 				}
 			}
 		}

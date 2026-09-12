@@ -496,6 +496,7 @@ func TestPreviewHandlerShowsAdaptedBody(t *testing.T) {
 	payload := `{"profile":"openai-to-anthropic-dry-run","method":"POST","path":"/v1/chat/completions","headers":{"Content-Type":["application/json"]},"body":{"model":"m","messages":[{"role":"user","content":"hi"}]}}`
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/preview", strings.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Admin-Token", "test-admin")
 	gateway.ServeAdminHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
@@ -688,6 +689,7 @@ func TestQuickSwitchPersistsNewSnapshot(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/switch", strings.NewReader(`{"route_id":"chat","profile":"two"}`))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Admin-Token", "test-admin")
 	gateway.ServeAdminHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {

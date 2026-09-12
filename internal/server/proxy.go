@@ -44,7 +44,7 @@ func (s *Server) ServeDataHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleReady(w, r)
 		return
 	case "/metrics":
-		if !s.Snapshot().Config.Observability.MetricsEnabled() {
+		if !s.currentSnapshot().Config.Observability.MetricsEnabled() {
 			s.writeError(w, http.StatusNotFound, "observability", "metrics_disabled", "metrics endpoints are disabled by configuration", "")
 			return
 		}
@@ -106,6 +106,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.handleWebSocket(w, r, pinned, requestID)
 		return
 	}
+	clientID, tenant := s.authenticateClient(cfg, r)
+	if (requiresClientAuth(cfg) || pinned.policy.requireClientAuth) && clientID == "" {
+		fail(http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required")
+		return
+	}
+	releaseIngress, ingressRejection := s.beginIngress(pinned)
+	if ingressRejection != nil {
+		if ingressRejection.retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(ingressRejection.retryAfter.Seconds()+0.999)))
+		}
+		fail(ingressRejection.status, "ingress", ingressRejection.code, "request refused by ingress policy: "+ingressRejection.code)
+		return
+	}
+	defer releaseIngress()
 	maxBody := cfg.Limits.MaxBodyBytes
 	if maxBody <= 0 {
 		maxBody = defaultMaxBody
@@ -125,11 +139,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bodyModel, bodyWantsStream := inspectBody(body)
-	clientID, tenant := s.authenticateClient(cfg, r)
-	if (requiresClientAuth(cfg) || pinned.policy.requireClientAuth) && clientID == "" {
-		fail(http.StatusUnauthorized, "auth", "client_auth_required", "a valid X-API-Key or Bearer client key is required")
-		return
-	}
+	releaseIngress()
 	match := route.FromHTTPRequest(r)
 	match.ClientID = clientID
 	match.Client = clientID
@@ -327,12 +337,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := s.prepareResponse(r.Context(), pinned, cfg, *profile, upstreamEnvelope)
 	if err != nil {
+		if rt != nil {
+			rt.recordUpstreamResult(false)
+		}
 		fail(http.StatusBadGateway, "transform", "response_transform_failed", safeError(err))
 		return
 	}
 	if err := enforceResponseLimit(cfg, *profile, response); err != nil {
+		if rt != nil {
+			rt.recordUpstreamResult(false)
+		}
 		fail(http.StatusBadGateway, "egress", "response_too_large", safeError(err))
 		return
+	}
+	if rt != nil {
+		semanticFailure, _ := response.Metadata["upstream_failed"].(bool)
+		rt.recordUpstreamResult(upstreamEnvelope.StatusCode < 500 && response.StatusCode < 500 && !semanticFailure)
 	}
 	if mode == "record" && s.store != nil {
 		recordingClient, recordingTenant, recordingConfig := recordingDimensions(prepared)
@@ -476,6 +496,12 @@ func (s *Server) prepareResponse(ctx context.Context, pinned *gatewayState, cfg 
 		if aggregateErr != nil {
 			var failure *adapter.StreamError
 			if errors.As(aggregateErr, &failure) {
+				metadata := make(map[string]any, len(response.Metadata)+1)
+				for key, value := range response.Metadata {
+					metadata[key] = value
+				}
+				metadata["upstream_failed"] = true
+				response.Metadata = metadata
 				response.StatusCode = http.StatusBadGateway
 				response.Body = failure.Payload
 				response.ContentType = "application/json"
@@ -584,7 +610,7 @@ func errorEnvelope(clientContract string, response transform.Envelope) transform
 	if contentType != "" {
 		headers.Set("Content-Type", contentType)
 	}
-	return transform.Envelope{StatusCode: response.StatusCode, Headers: headers, Body: payload, ContentType: contentType}
+	return transform.Envelope{StatusCode: response.StatusCode, Headers: headers, Body: payload, ContentType: contentType, Metadata: response.Metadata}
 }
 
 // errorMatchesContract reports whether an upstream error body already uses
@@ -635,7 +661,7 @@ func (s *Server) callUpstream(ctx context.Context, cfg *config.Config, upstream 
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
-	cfg := s.Snapshot().Config
+	cfg := s.currentSnapshot().Config
 	models := make([]map[string]any, 0, len(cfg.Profiles))
 	for _, id := range cfg.ProfileNames() {
 		profile := cfg.Profiles[id]

@@ -148,6 +148,9 @@ func newTokenBucket(rate float64, burst int) *tokenBucket {
 func (b *tokenBucket) allow(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.rate <= 0 {
+		return true
+	}
 	elapsed := now.Sub(b.last).Seconds()
 	if elapsed > 0 {
 		b.tokens += elapsed * b.rate
@@ -324,7 +327,7 @@ func (b *breaker) recordFailure(now time.Time) {
 // the same upstream.
 type profileRuntime struct {
 	policy  policySet
-	sem     chan struct{}
+	sem     *concurrencyGate
 	bucket  *tokenBucket
 	breaker *breaker
 }
@@ -403,25 +406,24 @@ func (rt *profileRuntime) beginPolicy(ctx context.Context, method string, header
 		return func() {}, &policyRejection{status: http.StatusTooManyRequests, code: "rate_limited", retryAfter: time.Second}
 	}
 	if rt.sem != nil {
-		select {
-		case rt.sem <- struct{}{}:
-		default:
+		if !rt.sem.acquire(rt.policy.maxConcurrency) {
 			releaseProbe()
 			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_limit", retryAfter: time.Second}
 		}
-		select {
-		case <-ctx.Done():
-			<-rt.sem
+		if ctx.Err() != nil {
+			rt.sem.release()
 			releaseProbe()
-			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_wait_canceled", retryAfter: 0}
-		default:
+			return func() {}, &policyRejection{status: http.StatusServiceUnavailable, code: "concurrency_wait_canceled"}
 		}
 	}
+	var once sync.Once
 	return func() {
-		if rt.sem != nil {
-			<-rt.sem
-		}
-		releaseProbe()
+		once.Do(func() {
+			if rt.sem != nil {
+				rt.sem.release()
+			}
+			releaseProbe()
+		})
 	}, nil
 }
 
@@ -500,13 +502,8 @@ func (s *Server) buildRuntimes(cfg *config.Config) map[string]*profileRuntime {
 	activeBreakers := map[string]bool{}
 	for name := range cfg.Profiles {
 		profile := cfg.Profiles[name]
-		rt := &profileRuntime{policy: policy}
-		if policy.maxConcurrency > 0 {
-			rt.sem = make(chan struct{}, policy.maxConcurrency)
-		}
-		if policy.ratePerSecond > 0 {
-			rt.bucket = newTokenBucket(policy.ratePerSecond, policy.burst)
-		}
+		admission := s.admissionFor(name, policy)
+		rt := &profileRuntime{policy: policy, sem: admission.sem, bucket: admission.bucket}
 		identity := breakerIdentity(profile.Upstream, cfg.Upstreams[profile.Upstream])
 		activeBreakers[identity] = true
 		rt.breaker = s.breakerFor(identity, policy.breakerCfg)
@@ -570,13 +567,20 @@ func (s *Server) runtimeFor(profileName string) *profileRuntime {
 // executeUpstream performs the buffered upstream call with retry, request
 // timeout and circuit-breaker accounting. Streaming paths do their own I/O
 // but use the same runtime for admission control and breaker recording.
-func (s *Server) executeUpstream(ctx context.Context, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, rt *profileRuntime, method string, header http.Header) (transform.Envelope, error) {
+func (s *Server) executeUpstream(ctx context.Context, cfg *config.Config, upstream config.Upstream, profile config.Profile, in transform.Envelope, requestID string, rt *profileRuntime, _ string, _ http.Header) (transform.Envelope, error) {
 	if rt != nil && rt.policy.requestTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, rt.policy.requestTimeout)
 		defer cancel()
 	}
-	attempts := rt.retryAttempts(upstream, method, header)
+	// Build once so filtering, transforms and upstream headers/credentials
+	// determine both retry eligibility and the bytes actually sent each time.
+	prepared, err := buildUpstreamRequest(ctx, cfg, upstream, in, requestID)
+	if err != nil {
+		rt.recordUpstreamResult(false)
+		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "build_upstream_request", err: err}
+	}
+	attempts := rt.retryAttempts(upstream, prepared.Method, prepared.Header)
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
@@ -587,19 +591,37 @@ func (s *Server) executeUpstream(ctx context.Context, cfg *config.Config, upstre
 				return transform.Envelope{}, ctx.Err()
 			}
 		}
-		envelope, err := s.callUpstream(ctx, cfg, upstream, profile, in, requestID)
+		request := prepared.Clone(ctx)
+		if attempt > 0 && prepared.GetBody != nil {
+			request.Body, err = prepared.GetBody()
+			if err != nil {
+				lastErr = err
+				break
+			}
+		}
+		envelope, err := s.callPreparedUpstream(cfg, upstream, profile, request)
 		if err == nil {
 			if envelope.StatusCode >= 500 && attempt+1 < attempts {
 				lastErr = upstreamError{status: envelope.StatusCode, code: "upstream_retryable_status", err: errRetryableStatus(envelope.StatusCode)}
 				continue
 			}
-			rt.recordUpstreamResult(envelope.StatusCode < 500)
+			// The caller records exactly one outcome after protocol conversion:
+			// HTTP 200 may still contain an upstream SSE error event.
 			return envelope, nil
 		}
 		lastErr = err
 	}
 	rt.recordUpstreamResult(false)
 	return transform.Envelope{}, lastErr
+}
+
+func (s *Server) callPreparedUpstream(cfg *config.Config, upstream config.Upstream, profile config.Profile, request *http.Request) (transform.Envelope, error) {
+	response, err := s.upstreamClient(upstream, false).Do(request)
+	if err != nil {
+		return transform.Envelope{}, upstreamError{status: http.StatusBadGateway, code: "upstream_request_failed", err: err}
+	}
+	defer response.Body.Close()
+	return readUpstreamResponse(cfg, profile, response)
 }
 
 type retryableStatusError struct{ status int }

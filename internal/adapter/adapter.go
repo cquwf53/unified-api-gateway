@@ -112,7 +112,7 @@ func decodeJSON(body []byte) (map[string]any, error) {
 	if len(body) == 0 {
 		return map[string]any{}, nil
 	}
-	if err := json.Unmarshal(body, &value); err != nil {
+	if err := decodeJSONValue(body, &value); err != nil {
 		return nil, fmt.Errorf("decode JSON body: %w", err)
 	}
 	return value, nil

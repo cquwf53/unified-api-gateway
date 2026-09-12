@@ -197,6 +197,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 		s.writeError(w, status, "auth", "origin_rejected", "cross-origin WebSocket upgrades are not allowed", requestID)
 		return
 	}
+	if rejectionCode, message := transparentPlaneSupported(*profile); rejectionCode != "" {
+		status, stage, code = http.StatusNotImplemented, "websocket", rejectionCode
+		s.writeError(w, status, stage, code, message, requestID)
+		return
+	}
 	upstream, ok := cfg.Upstreams[profile.Upstream]
 	if !ok {
 		status = http.StatusBadGateway
@@ -233,7 +238,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	requestHeaders := filteredRequestHeaders(r.Header)
 	applyUpstreamAuth(requestHeaders, cfg, upstream)
 	requestHeaders.Set("X-Gateway-Request-Id", requestID)
-	dialer := websocket.Dialer{Subprotocols: requestedSubprotocols(r.Header)}
+	handshakeTimeout := upstream.EffectiveTimeout()
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = streamResponseHeaderTimeout
+	}
+	dialer := websocket.Dialer{Subprotocols: requestedSubprotocols(r.Header), HandshakeTimeout: handshakeTimeout}
 	if upstream.Insecure {
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in per upstream
 	}
@@ -277,7 +286,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, pinned 
 	// Resolve a half-open probe after both handshakes, but do not clear
 	// closed-state failure history until the connection itself ends cleanly.
 	rt.breaker.recordProbeSuccess()
-	const wsReadLimit = 8 << 20
+	wsReadLimit := defaultMaxBody
+	if cfg.Limits.MaxBodyBytes > 0 {
+		wsReadLimit = minPositiveLimit(wsReadLimit, cfg.Limits.MaxBodyBytes)
+	}
+	if profile.MaxBodyBytes > 0 {
+		wsReadLimit = minPositiveLimit(wsReadLimit, profile.MaxBodyBytes)
+	}
 	const wsIdleTimeout = 10 * time.Minute
 	clientConn.SetReadLimit(wsReadLimit)
 	upstreamConn.SetReadLimit(wsReadLimit)

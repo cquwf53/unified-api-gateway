@@ -872,6 +872,10 @@ func cloneMap(in map[string]any) map[string]any {
 	return out
 }
 
+// CloneValue copies mutable JSON-compatible values while retaining their Go
+// numeric types. Configuration snapshots use it to avoid float64 round trips.
+func CloneValue(value any) any { return cloneValue(value) }
+
 func cloneValue(v any) any {
 	switch x := v.(type) {
 	case map[string]any:

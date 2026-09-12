@@ -282,6 +282,19 @@ curl.exe -X POST http://127.0.0.1:8781/admin/v1/routes/explain `
 `X-Admin-Token` 发送令牌。控制台静态页面可直接加载，配置及操作 API 仍需认证。
 Web 控制台遇到 401 会提示输入或更换令牌并保存在当前浏览器；取消输入会清除原令牌。
 
+管理写入、校验和预览使用 POST，必须发送 `Content-Type: application/json`，正文必须是
+一个完整 JSON 对象；未知字段、第二个 JSON 值和表单尾缀会被拒绝。激活/校验请求上限
+16 MiB，预览上限 4 MiB，切换/回滚/路由解释 POST 上限 1 MiB，超限返回 413。
+只读接口支持 GET/HEAD；路由解释另支持 GET 查询参数。方法不符返回 405，并带 `Allow`。
+浏览器 POST 的 `Origin` 必须与管理面的 scheme、host 和有效端口一致；异站原生表单
+也会被拒绝。未发送 Origin 的正常 CLI 请求仍可使用管理凭据调用 API。
+
+若反向代理在外部终止 HTTPS、后端使用 HTTP，需保留原始 `Host`，并设置
+`GATEWAY_ADMIN_ORIGIN=https://gateway.example.com`（非默认端口须写入）。此值只能包含
+一个 HTTP/HTTPS origin，不能包含用户信息、路径、查询或片段；错误值会使管理 POST
+返回 503。网关同时核对浏览器 Origin 和请求 Host，不信任 `Forwarded` 或
+`X-Forwarded-*` 来推断来源。直接访问的本机 CLI 可以继续不带 Origin。
+
 `/admin/v1/versions`、`/admin/v1/audit`、`/admin/v1/recordings` 支持 `?limit=` 参数
 （1–200，默认 100）。`/admin/v1/status` 返回 `gateway_version`（构建时通过
 `-ldflags -X unified-api-gateway/internal/server.BuildVersion=...` 注入，`make build`
@@ -295,11 +308,12 @@ Web 控制台遇到 401 会提示输入或更换令牌并保存在当前浏览�
 - `requests_per_second` / `burst`（或 `limits.requests_per_second`）：令牌桶限流，
   超限返回 `429` 并带 `Retry-After`；
 - `max_concurrency`（或 `limits.concurrency`）：按 profile 的并发信号量，超限返回
-  `503`；
-- `retry.max_attempts` + `idempotent_only`：仅对幂等方法（GET/HEAD/PUT/DELETE 等）
-  或携带 `Idempotency-Key` 的请求在 5xx/网络错误时重试；上游的 `retries` 字段可以
-  提高重试次数上限，但幂等性判断始终生效（POST 不会被重放）；流式响应在首字节
-  发出后绝不重试；
+  `503`；请求体解析前另有进程级并发预算，默认 128，配置了 `max_concurrency` 时采用该值；
+- `retry.max_attempts` + `idempotent_only`：仅对实际出站的幂等方法（GET/HEAD/PUT/DELETE 等）
+  或携带出站 `Idempotency-Key` 的请求在 5xx/网络错误时重试。判断发生在 profile 改写、
+  hop-by-hop 头过滤、upstream headers 和凭据注入之后；客户端原始方法或已被删除的键
+  不会用于放行重试。各轮复用相同的出站方法与幂等键，并重新读取相同请求体。上游
+  `retries` 可以提高次数上限；流式响应在首字节发出后绝不重试；
 - `circuit_breaker.failure_threshold` / `reset_timeout_ms`：按 upstream 的熔断器，
   连续失败达到阈值后打开（`503 circuit_open`），静置期过后放行单个半开探测；熔断
   状态跨配置激活保留；
@@ -308,7 +322,8 @@ Web 控制台遇到 401 会提示输入或更换令牌并保存在当前浏览�
 
 `policies.audit.enabled: true` 时每个数据面请求写一条 `request` 审计事件（异步
 写入 SQLite，积压时丢弃并告警）；`policies.audit.redact` 列表中的头名称会在预览、
-dry-run 输出和 record 存档中额外脱敏。
+dry-run 输出和 record 存档中额外脱敏。`gateway_audit_events_dropped_total` 同时统计
+队列溢出和审计写入失败；失败日志保留具体原因。
 
 `policies.defaults.require_client_auth: true` 时网关以 fail-closed 运行：未携带
 有效客户端密钥的请求在三个平面（HTTP/WS/gRPC）一律 401，且启动时若没有任何
@@ -329,6 +344,10 @@ make fmt
 make test                # Go 测试与 Node.js 内置控制台交互测试（Node.js 22+）
 make validate
 ```
+
+可选的真实浏览器回归 `TestAdminBrowserOriginBoundary` 默认跳过，不会阻塞普通测试。
+设置 `UAG_BROWSER_TEST=1` 后单独运行该测试，并在隔离浏览器中打开输出的 URL；
+夹具使用随机回环端口和内存配置，验证跨源原生表单被拒绝、同源 JSON 操作成功。
 
 服务运行时可用 CLI 热激活（连接不到管理面时会保存到 SQLite，供下一次启动使用）：
 
@@ -384,6 +403,7 @@ go run ./cmd/gateway version
   summary/signature/redacted-thinking 语义仍可能降级；
 - Responses 适配当前聚焦文本、图片和自定义 function call；内置 tools、远程 MCP、
   audio/refusal 等专用 item 不做语义翻译；
+- WebSocket/gRPC 入口只支持 `live` + `transparent`，配置 request/response 改写规则或其他运行模式时明确返回 501，不会静默跳过；
 - gRPC 面当前是有界缓冲的 unary HTTP 透明代理，不实现 bidi 流，也不自带原生 h2c
   终结；需要部署在 HTTP/2/h2c 终结器之后；
 - **readyz 检查配置与 SQLite 可用性，但不做上游探活**；
