@@ -9,5 +9,12 @@ data/*.db-wal
 .run-cache/
 .gomodcache/
 .env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
 coverage.out
