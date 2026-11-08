@@ -37,6 +37,14 @@ upstreams:
     headers:
       User-Agent: "eve/0.27.8"
 
+  sensenova:
+    # SenseNova's OpenAI-compatible endpoint. The API key is resolved from
+    # SENSENOVA_API_KEY and is never persisted in configuration history.
+    base_url: "https://token.sensenova.cn/v1"
+    protocol: http
+    auth_ref: sensenova-api-key
+    timeout_ms: 120000
+
 credentials:
   # The server resolves this reference from the named environment variable.
   # Do not replace it with a real key in a checked-in file.
@@ -48,11 +56,14 @@ credentials:
   vercel-ai-gateway-key:
     type: env
     env: AI_GATEWAY_API_KEY
+  sensenova-api-key:
+    type: env
+    env: SENSENOVA_API_KEY
 
 clients:
   local:
     key_ref: env:GATEWAY_CLIENT_API_KEY
-    profiles: [user-v1-to-v2, openai-to-anthropic, openai-to-anthropic-dry-run, mock-chat, vercel-zai-glm-5-2]
+    profiles: [user-v1-to-v2, openai-to-anthropic, openai-to-anthropic-dry-run, mock-chat, vercel-zai-glm-5-2, sensenova-kimi-k3]
 
 profiles:
   # Generic JSON example: POST /api/v1/users becomes POST /v2/customers.
@@ -144,6 +155,26 @@ profiles:
           # so only undersized requests are raised to a usable floor.
           max_tokens: 128
 
+  # OpenAI-compatible client -> SenseNova Kimi K3. Kimi K3 requires
+  # temperature=1, so both the upstream model and temperature are pinned here.
+  sensenova-kimi-k3:
+    adapter: transparent
+    client_contract: openai-chat
+    upstream_contract: openai-chat
+    traffic_mode: live
+    upstream: sensenova
+    stream_safe: true
+    max_body_bytes: 2097152
+    request:
+      path: /chat/completions
+      headers:
+        set:
+          content-type: application/json
+      body:
+        set:
+          model: kimi-k3
+          temperature: 1
+
   # A deterministic profile for local UI and integration tests.
   mock-chat:
     adapter: transparent
@@ -219,6 +250,34 @@ routes:
       methods: [POST]
       model: vercel-zai-glm-5-2
     profile: vercel-zai-glm-5-2
+
+  - id: sensenova-kimi-k3-model
+    name: Model route · kimi-k3
+    priority: 240
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      model: kimi-k3
+    profile: sensenova-kimi-k3
+
+  - id: sensenova-kimi-k3-alias
+    name: Client alias route · sensenova-kimi-k3
+    priority: 241
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      model: sensenova-kimi-k3
+    profile: sensenova-kimi-k3
+
+  - id: sensenova-kimi-k3-profile
+    name: Explicit profile route · sensenova-kimi-k3
+    priority: 242
+    match:
+      path: /v1/chat/completions
+      methods: [POST]
+      headers:
+        X-Gateway-Profile: sensenova-kimi-k3
+    profile: sensenova-kimi-k3
 
   - id: mock-chat
     name: Local mock chat

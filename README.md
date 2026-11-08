@@ -193,6 +193,20 @@ profile 同样逐帧翻译、逐帧 flush：上游的每个 SSE 事件在被接�
 $env:AI_GATEWAY_API_KEY = "<your-key>"
 ```
 
+示例配置也包含 SenseNova 的 `sensenova-kimi-k3` profile。它将 OpenAI Chat
+Completions 请求转发到 `https://token.sensenova.cn/v1/chat/completions`，固定
+上游模型为 `kimi-k3`、`temperature` 为 `1`，密钥从 `SENSENOVA_API_KEY` 读取。
+客户端发送模型名 `kimi-k3` 或 `sensenova-kimi-k3` 即可命中该路由，也可以通过
+`X-Gateway-Profile: sensenova-kimi-k3` 显式选择。
+
+```powershell
+$env:SENSENOVA_API_KEY = "<your-key>"
+# 如需启用客户端鉴权，同时设置客户端连接网关时使用的密钥。
+$env:GATEWAY_CLIENT_API_KEY = "<your-client-key>"
+```
+
+以上变量需要在启动网关的 shell 中设置；项目不会自动读取 `.env` 文件。
+
 切换只需修改路由的 `profile`，或准备多个 profile 给不同租户使用：
 
 ```yaml
